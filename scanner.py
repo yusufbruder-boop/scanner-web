@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import yfinance as yf
 
 ctx = ssl.create_default_context()
-API = os.environ.get('POLYGON_API_KEY', 'xwPphlChrHFlmFPxSkod8WwMdwALipY5')
+API = os.environ.get('POLYGON_API_KEY', '')
 
 UNIVERSE = [
     'NVDA','AMD','META','AAPL','MSFT','AMZN','GOOGL','TSLA','NFLX',

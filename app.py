@@ -6,8 +6,8 @@ import urllib.request, ssl
 app = Flask(__name__)
 
 RESULTS_FILE  = 'results.json'
-TG_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8298160314:AAGa4X8RyMU6h8dRwTbmyHU53w_hIPgonGA')
-TG_CHAT  = os.environ.get('TELEGRAM_CHAT',  '5872959107')
+TG_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
+TG_CHAT  = os.environ.get('TELEGRAM_CHAT',  '')
 
 # Auto-Scan: täglich 09:30 ET = 13:30 UTC (Sommer) / 14:30 UTC (Winter)
 AUTO_SCAN_UTC_HOUR   = 13
