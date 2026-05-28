@@ -1,5 +1,6 @@
 import urllib.request, json, ssl, time, threading, os
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import yfinance as yf
 
 ctx = ssl.create_default_context()
@@ -22,22 +23,10 @@ NEG_KEYS = ['lawsuit','downgrade','miss','cut','investigation','fraud',
             'recall','ban','warning','below','probe','short seller','loss',
             'decline','disappoint','weak','concern','risk']
 
-# Rate-Limiter: Polygon Free = 5 calls/min
-_rl_lock = threading.Lock()
-_rl_last = [0.0]
-_rl_gap  = 13.0
-
-def _rate_limit():
-    with _rl_lock:
-        wait = _rl_gap - (time.time() - _rl_last[0])
-        if wait > 0:
-            time.sleep(wait)
-        _rl_last[0] = time.time()
-
+# Paid Polygon plan ($79) — kein Rate-Limit nötig
 def poly_fetch(url, retries=2):
     for attempt in range(retries + 1):
         try:
-            _rate_limit()
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req, context=ctx, timeout=12) as r:
                 data = json.loads(r.read())
@@ -46,7 +35,7 @@ def poly_fetch(url, retries=2):
             return data
         except Exception as e:
             if '429' in str(e) or 'Too Many' in str(e):
-                time.sleep(15)
+                time.sleep(5)
             if attempt >= retries:
                 raise
 
@@ -186,12 +175,24 @@ def run_scan(progress_cb=None):
 
     results = []
     total = len(UNIVERSE)
-    for i, ticker in enumerate(UNIVERSE):
-        if progress_cb:
-            progress_cb(i, total, ticker)
+    done  = [0]
+    lock  = threading.Lock()
+
+    def scan_one(args):
+        i, ticker = args
         r = scan_ticker(ticker, today, exp_cutoff, news_cutoff)
-        if r:
-            results.append(r)
+        with lock:
+            done[0] += 1
+            if progress_cb:
+                progress_cb(done[0], total, ticker)
+        return r
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(scan_one, (i, t)): t for i, t in enumerate(UNIVERSE)}
+        for fut in as_completed(futures):
+            r = fut.result()
+            if r:
+                results.append(r)
 
     longs  = sorted([r for r in results if r['signal'] == 'LONG'],  key=lambda x: x['score'], reverse=True)
     shorts = sorted([r for r in results if r['signal'] == 'SHORT'], key=lambda x: x['score'], reverse=True)
