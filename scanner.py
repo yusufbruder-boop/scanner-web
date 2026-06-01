@@ -95,6 +95,62 @@ def get_cached_social():
             _social_cache.update({'tickers': tickers, 'scores': scores, 'ts': time.time()})
         return _social_cache['tickers'], _social_cache['scores']
 
+# ── Influencer / Smart Money ─────────────────────────────────────────────────
+_INFLUENCER_FEEDS = [
+    ('https://situationalawareness.substack.com/feed', 'Leopold Aschenbrenner'),
+    ('https://www.astralcodexten.com/feed',            'Scott Alexander (ACX)'),
+    ('https://www.noahpinion.blog/feed',               'Noah Smith'),
+]
+_influencer_cache: list = []
+_influencer_ts: float   = 0.0
+_influencer_lock = threading.Lock()
+
+def get_influencer_signals() -> list:
+    """RSS-Feeds von Smart Money / AI-Influencern → Ticker-Erwähnungen extrahieren."""
+    import xml.etree.ElementTree as ET, re as _re, html as _html
+    PAT  = _re.compile(r'\b\$?([A-Z]{2,5})\b')
+    SKIP = {'I','A','THE','FOR','AND','BUT','NOT','ARE','YOU','HAS','ITS','WAS',
+            'ALL','AI','US','UN','EU','UK','OR','AT','IT','IS','BE','AS','BY',
+            'CEO','IPO','FED','GDP','EUR','USD','ETF','SEC','NYSE'}
+    results = []
+    for feed_url, author in _INFLUENCER_FEEDS:
+        try:
+            req = urllib.request.Request(feed_url, headers={'User-Agent': 'scanner/3.0'})
+            with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+                raw = r.read()
+            root = ET.fromstring(raw)
+            ns   = {'atom': 'http://www.w3.org/2005/Atom'}
+            items = root.findall('.//item') or root.findall('.//atom:entry', ns)
+            for item in items[:8]:
+                title_el = item.find('title') or item.find('atom:title', ns)
+                desc_el  = item.find('description') or item.find('atom:summary', ns) or item.find('atom:content', ns)
+                link_el  = item.find('link') or item.find('atom:link', ns)
+                title = _html.unescape(title_el.text or '') if title_el is not None else ''
+                desc  = _html.unescape(desc_el.text  or '') if desc_el  is not None else ''
+                link  = link_el.get('href', link_el.text or '') if link_el is not None else ''
+                if not isinstance(link, str):
+                    link = ''
+                text = (title + ' ' + desc[:300])
+                tickers = [m for m in PAT.findall(text) if m not in SKIP and 2 <= len(m) <= 5]
+                if tickers:
+                    results.append({
+                        'author': author,
+                        'title':  title[:80],
+                        'tickers': list(dict.fromkeys(tickers))[:6],
+                        'url':    link,
+                    })
+        except Exception:
+            pass
+    return results
+
+def get_cached_influencers() -> list:
+    global _influencer_cache, _influencer_ts
+    with _influencer_lock:
+        if time.time() - _influencer_ts > 3600:  # 1h Cache
+            _influencer_cache = get_influencer_signals()
+            _influencer_ts    = time.time()
+    return _influencer_cache
+
 UNIVERSE = [
     'NVDA','AMD','META','AAPL','MSFT','AMZN','GOOGL','TSLA','NFLX',
     'MU','INTC','AVGO','QCOM','MRVL','SMCI','ARM','AMAT',
@@ -287,6 +343,9 @@ def run_scan(progress_cb=None):
     exp_cutoff = (datetime.now() + timedelta(days=35)).strftime('%Y-%m-%d')
     news_cutoff= (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
 
+    # Influencer-Signale parallel laden
+    influencers = get_cached_influencers()
+
     # Social Trending vorab laden + dynamisch zur UNIVERSE hinzufügen
     social_tickers, social_scores = get_cached_social()
     extra_social = [t for t in social_tickers if t not in UNIVERSE]
@@ -337,6 +396,7 @@ def run_scan(progress_cb=None):
         'watch': watch,
         'movers': movers,
         'social': social_tickers[:10],
+        'influencers': influencers,
         'scanned': len(results),
         'total': len(universe),
         'time': datetime.now().strftime('%Y-%m-%d %H:%M'),

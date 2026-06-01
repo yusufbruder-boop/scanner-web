@@ -430,6 +430,27 @@ function renderResults(data, isNew) {
     html += '</div></div>';
   }
 
+  // Influencer / Smart Money
+  if (data.influencers && data.influencers.length > 0) {
+    html += '<div class="section"><div class="section-title" style="color:#ffa040;border-left:3px solid #ffa040">🧠 SMART MONEY — Leopold Aschenbrenner & Analysten</div>';
+    data.influencers.forEach(inf => {
+      let tBadges = inf.tickers.map(t => {
+        let inScan = (data.longs || []).concat(data.shorts || []).find(r => r.t === t);
+        let col = inScan ? (inScan.signal === 'LONG' ? '#4dff91' : '#ff4d6b') : '#ffa040';
+        return '<span style="background:#1a1200;border:1px solid #a06000;color:' + col + ';padding:3px 8px;border-radius:10px;font-size:11px;font-weight:bold">' + t + (inScan ? ' ' + inScan.signal : '') + '</span>';
+      }).join(' ');
+      let titleHtml = inf.url
+        ? '<a href="' + inf.url + '" target="_blank" style="color:#c0d4e8;text-decoration:none">' + inf.title + ' <span style="color:#ffa040;font-size:10px">↗</span></a>'
+        : inf.title;
+      html += '<div class="news-card" style="border-color:#2a1a00">'
+        + '<div class="news-ticker" style="color:#ffa040">' + inf.author + '</div>'
+        + '<div class="news-title">' + titleHtml + '</div>'
+        + '<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">' + tBadges + '</div>'
+        + '</div>';
+    });
+    html += '</div>';
+  }
+
   // 10:00 Follow-up
   if (data.followup && (data.followup.longs || data.followup.shorts)) {
     html += '<div class="section"><div class="section-title" style="color:#ffd700;border-left:3px solid #ffd700">📊 10:00 SIGNAL CHECK — Gewinner & Verlierer</div>';
