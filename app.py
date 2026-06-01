@@ -50,6 +50,7 @@ state = {
     'hermes_memory':       {},
     'auto_trade_enabled':  AUTO_TRADE_ENABLED,
     'auto_trades':         [],
+    'hermes_24h':          [],
     # Background threads: Social KI-Score + HF 13F
     'social_data':    [],
     'hf_data':        [],
@@ -1071,6 +1072,30 @@ function renderResults(data, isNew) {
     html += '</div>';
   }
 
+  // ── Hermes 24h Intelligence — Polygon Gainers/Losers + Vol/OI + Dark Pool ──
+  const h24 = data.hermes_24h || [];
+  if (h24.length > 0) {
+    html += '<div class="section"><div class="section-title" style="color:#ffd700;border-left:3px solid #ffd700">🔍 HERMES 24H INTELLIGENCE — Polygon Gainers/Losers + Smart Money</div>';
+    h24.slice(0,8).forEach(s => {
+      let chgCol = s.chg >= 0 ? '#4dff91' : '#ff4d6b';
+      let sc = s.score || 0;
+      let scCol = sc >= 8 ? '#4dff91' : sc >= 6 ? '#ffd700' : '#ffa040';
+      let r0 = (s.reasons||[])[0] || '';
+      let r1 = (s.reasons||[])[1] || '';
+      html += '<div style="padding:8px 14px;border-bottom:1px solid #111f30;display:flex;justify-content:space-between;align-items:center">'
+        + '<div>'
+        +   '<span style="font-size:15px;font-weight:bold;color:#fff">' + s.sym + '</span>'
+        +   ' <span style="font-size:12px;color:#94a3b8">$' + s.price.toFixed(2) + '</span>'
+        +   ' <span style="font-size:12px;color:' + chgCol + ';font-weight:bold">' + (s.chg>=0?'+':'') + s.chg + '%</span>'
+        +   (s.vol_ratio >= 3 ? ' <span style="font-size:10px;background:#1a1200;border:1px solid #ffd70066;color:#ffd700;padding:1px 5px;border-radius:6px">Vol ' + s.vol_ratio + 'x</span>' : '')
+        +   '<div style="font-size:10px;color:#94a3b8;margin-top:2px">' + r0 + (r1 ? ' | ' + r1 : '') + '</div>'
+        + '</div>'
+        + '<div style="font-size:20px;font-weight:bold;color:' + scCol + ';min-width:32px;text-align:right">' + sc + '</div>'
+        + '</div>';
+    });
+    html += '</div>';
+  }
+
   // ── Hauptziel: Mover + Long + Short ─────────────────────────────────────
   if (data.movers && data.movers.length > 0) {
     html += '<div class="section"><div class="section-title mover">🎯 NEXT MOVER — 10%+ Potenzial, Günstiger Call</div>';
@@ -1619,6 +1644,7 @@ def results():
             out['hermes_signal_evals'] = state.get('hermes_signal_evals', {})
             out['alpaca_portfolio']    = state.get('alpaca_portfolio', {})
             out['hermes_memory']       = state.get('hermes_memory', {})
+            out['hermes_24h']          = state.get('hermes_24h', [])
         return jsonify(_to_json_safe(out))
     except Exception as e:
         return jsonify({'error': f'Server Fehler: {str(e)[:120]}'})
@@ -1977,8 +2003,25 @@ def hermes_monitor():
                     state['hermes_running'] = True
                     state['hermes_running_since'] = datetime.now()
                 try:
-                    from scanner import hermes_hunt, scan_ticker, get_alpaca_market_news
+                    from scanner import hermes_hunt, scan_ticker, get_alpaca_market_news, hermes_24h_scan
                     POLY_KEY = os.environ.get('POLYGON_API_KEY', '')
+
+                    # 0) 24h Intelligence Scan — Polygon Gainers/Losers + Vol/OI + Dark Pool
+                    def _bg_24h():
+                        try:
+                            sigs_24h = hermes_24h_scan()
+                            state['hermes_24h'] = sigs_24h
+                            # Starke 24h Signale als Telegram Alert
+                            top = [s for s in sigs_24h if s['score'] >= 7]
+                            if top:
+                                lines = [f'<b>🔍 HERMES 24H INTELLIGENCE — {datetime.now().strftime("%H:%M")}</b>']
+                                for s in top[:5]:
+                                    lines.append(f'<b>{s["sym"]}</b> ${s["price"]:.2f} {s["chg"]:+.1f}% Score:{s["score"]}')
+                                    lines.append(f'  {s["reasons"][0] if s["reasons"] else ""}')
+                                tg_send('\n'.join(lines))
+                        except Exception:
+                            pass
+                    threading.Thread(target=_bg_24h, daemon=True).start()
 
                     # 1) Alpaca Portfolio + Memory P&L — im Hintergrund (nicht blockieren)
                     def _bg_alpaca_mem():

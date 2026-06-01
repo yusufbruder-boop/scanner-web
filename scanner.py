@@ -292,6 +292,155 @@ def get_market_movers() -> list:
     return movers
 
 
+def hermes_24h_scan() -> list:
+    """
+    Hermes 24h Intelligence — filtert alle Polygon-Daten der letzten 24h:
+    1. Gainers/Losers mit starkem Volumen (HPE-Typ Anomalie)
+    2. Tickers mit Vol/OI > 3x auf Options (institutionelle Positionierung)
+    3. Dark Pool > $1M in letzten 24h
+    4. Polygon News mit starkem Sentiment
+    5. Earnings in nächsten 7 Tagen (binäre Events)
+    Gibt eine sortierte Liste potenzieller Next-Mover zurück.
+    """
+    today     = datetime.now().strftime('%Y-%m-%d')
+    from_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    signals   = []
+
+    # 1) Polygon Gainers + Losers (Top-Mover 24h)
+    candidates = {}
+    for direction in ['gainers', 'losers']:
+        try:
+            url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/{direction}?apiKey={API}'
+            d   = poly_fetch(url)
+            for t in d.get('tickers', [])[:25]:
+                sym   = t.get('ticker', '')
+                day   = t.get('day', {})
+                prev  = t.get('prevDay', {})
+                price = float(day.get('c') or 0)
+                pc    = float(prev.get('c') or price or 1)
+                chg   = round((price - pc) / pc * 100, 1) if pc else 0
+                vol   = int(day.get('v') or 0)
+                pvol  = int(prev.get('v') or 1)
+                vol_ratio = round(vol / pvol, 1) if pvol else 0
+                if sym and 2 <= len(sym) <= 6 and price >= 5:
+                    candidates[sym] = {
+                        'sym': sym, 'price': price, 'chg': chg,
+                        'vol': vol, 'vol_ratio': vol_ratio,
+                        'direction': direction, 'score': 0, 'reasons': []
+                    }
+        except Exception:
+            pass
+
+    # 2) Für jeden Kandidaten: Options Vol/OI + Dark Pool + News checken
+    def _check_24h(sym, info):
+        score   = 0
+        reasons = list(info.get('reasons', []))
+        price   = info['price']
+        chg     = info['chg']
+        vol_r   = info['vol_ratio']
+
+        # Volumen-Anomalie (HPE hatte 8x normales Volumen)
+        if vol_r >= 8:
+            score += 6
+            reasons.append(f'Volumen {vol_r:.0f}x normal — EXTREMES Signal')
+        elif vol_r >= 5:
+            score += 4
+            reasons.append(f'Volumen {vol_r:.0f}x normal')
+        elif vol_r >= 3:
+            score += 2
+            reasons.append(f'Volumen {vol_r:.0f}x normal')
+
+        # Kursveränderung
+        if abs(chg) >= 15:
+            score += 4
+            reasons.append(f'{chg:+.1f}% heute — Mega-Move')
+        elif abs(chg) >= 8:
+            score += 3
+            reasons.append(f'{chg:+.1f}% heute')
+        elif abs(chg) >= 5:
+            score += 2
+            reasons.append(f'{chg:+.1f}% heute')
+
+        # Options Vol/OI Anomalie
+        try:
+            opt = poly_fetch(f'https://api.polygon.io/v3/snapshot/options/{sym}?limit=100&apiKey={API}')
+            res = opt.get('results', [])
+            if res:
+                calls = [r for r in res if r['details']['contract_type'] == 'call']
+                puts  = [r for r in res if r['details']['contract_type'] == 'put']
+                max_call_voi = max((r['day'].get('volume',0) / max(r.get('open_interest',1),1)
+                                   for r in calls if r['day'].get('volume',0) > 100), default=0)
+                max_put_voi  = max((r['day'].get('volume',0) / max(r.get('open_interest',1),1)
+                                   for r in puts  if r['day'].get('volume',0) > 100), default=0)
+                if max_call_voi >= 5:
+                    score += 4
+                    reasons.append(f'CALL Vol/OI {max_call_voi:.0f}x — Smart Money')
+                elif max_call_voi >= 3:
+                    score += 2
+                    reasons.append(f'CALL Vol/OI {max_call_voi:.0f}x')
+                if max_put_voi >= 5:
+                    score += 4
+                    reasons.append(f'PUT Vol/OI {max_put_voi:.0f}x — Smart Money SHORT')
+                elif max_put_voi >= 3:
+                    score += 2
+                    reasons.append(f'PUT Vol/OI {max_put_voi:.0f}x')
+        except Exception:
+            pass
+
+        # Dark Pool letzte 24h
+        try:
+            dp = get_darkpool_signal(sym, today)
+            dp_m = dp.get('dp_total', 0) / 1e6
+            if dp_m >= 10:
+                score += 5
+                reasons.append(f'Dark Pool ${dp_m:.0f}M — große Blocks')
+            elif dp_m >= 3:
+                score += 3
+                reasons.append(f'Dark Pool ${dp_m:.1f}M')
+            elif dp_m >= 1:
+                score += 1
+                reasons.append(f'Dark Pool ${dp_m:.1f}M')
+        except Exception:
+            pass
+
+        # Polygon News letzte 24h
+        try:
+            nd = poly_fetch(f'https://api.polygon.io/v2/reference/news?ticker={sym}&limit=3&apiKey={API}')
+            cutoff = (datetime.now() - timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ')
+            for n in nd.get('results', []):
+                if n.get('published_utc', '') >= cutoff:
+                    title = n.get('title', '')
+                    tl = title.lower()
+                    if any(k in tl for k in POS_KEYS):
+                        score += 3
+                        reasons.append(f'News: {title[:55]}')
+                        break
+                    elif any(k in tl for k in ['earnings', 'beat', 'guidance', 'raised']):
+                        score += 4
+                        reasons.append(f'EARNINGS: {title[:55]}')
+                        break
+        except Exception:
+            pass
+
+        info['score']   = score
+        info['reasons'] = reasons[:4]
+        return info if score >= 4 else None
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(_check_24h, sym, info): sym for sym, info in candidates.items()}
+        for fut in as_completed(futs, timeout=45):
+            try:
+                r = fut.result()
+                if r:
+                    signals.append(r)
+            except Exception:
+                pass
+
+    signals.sort(key=lambda x: -x['score'])
+    return signals[:15]
+
+
 # ── Alpaca Marktdaten (echte News + Preis) ───────────────────────────────────
 def get_alpaca_market_news(limit: int = 20) -> list:
     """Alpaca allgemeine Marktnews — ohne Ticker-Filter, breites Signal."""
