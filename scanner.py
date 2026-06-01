@@ -513,14 +513,15 @@ def best_option(contracts, is_call, price, today, exp_cutoff):
         pr  = c['day'].get('close') or c['day'].get('open') or 0
         vol = c['day'].get('volume', 0)
         oi  = c.get('open_interest', 0)
-        if 0.3 <= pct <= 12 and pr > 0:
-            not_0dte = 1 if exp >= tomorrow else 0
+        if exp <= today:          # 0-DTE komplett ignorieren
+            continue
+        if 0.3 <= pct <= 12 and pr >= 0.05:   # min $0.05 — kein Pennies-Junk
             candidates.append({
                 'strike': strike, 'pct': round(pct, 1), 'pr': pr,
                 'vol': vol, 'oi': oi, 'exp': exp,
-                'total': vol * pr * 100, 'not_0dte': not_0dte
+                'total': vol * pr * 100
             })
-    candidates.sort(key=lambda x: (-x['not_0dte'], x['pr']))
+    candidates.sort(key=lambda x: x['pr'])
     return next((c for c in candidates if c['vol'] > 30), candidates[0] if candidates else None)
 
 def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
