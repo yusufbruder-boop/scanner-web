@@ -661,10 +661,14 @@ body { background: #0a0e1a; color: #e0e6f0; font-family: -apple-system, BlinkMac
 <div class="header">
   <div class="header-top">
     <div><h1>OPTIONS SCANNER</h1><span class="live-dot" id="liveDot"></span></div>
-    <div class="header-info" style="margin:0">
-      <span id="lastScanInfo">Lade...</span>
-      <span id="nextScanInfo"></span>
+    <div id="hermes-badge" style="background:#0a2a1a;border:1px solid #2d9e57;border-radius:20px;padding:3px 10px;display:flex;align-items:center;gap:5px;font-size:11px;font-weight:700;color:#4dff91;cursor:default" title="Hermes Agent Status">
+      <span style="width:6px;height:6px;background:#4dff91;border-radius:50%;display:inline-block;animation:pulse 2s infinite"></span>
+      <span id="hermes-status-text">HERMES</span>
     </div>
+  </div>
+  <div class="header-info" style="padding:0 0 6px">
+    <span id="lastScanInfo">Lade...</span>
+    <span id="nextScanInfo"></span>
   </div>
   <div class="tabs">
     <button class="tab-btn active"      id="tab1Btn" onclick="showTab(1)">📊 SCANNER</button>
@@ -1068,7 +1072,27 @@ function updateHeader(d) {
   let scanInfo = d.last_scan ? 'Scan: ' + d.last_scan : 'Kein Scan';
   document.getElementById('lastScanInfo').textContent = scanInfo;
   if (d.next_scan) {
-    document.getElementById('nextScanInfo').textContent = 'Auto-Scan: ' + d.next_scan;
+    document.getElementById('nextScanInfo').textContent = 'Auto: ' + d.next_scan;
+  }
+  // Hermes Status Badge
+  let badge = document.getElementById('hermes-badge');
+  let txt   = document.getElementById('hermes-status-text');
+  let ht = d.hermes_ts || '';
+  if (d.hermes_running) {
+    badge.style.borderColor = '#ffd700';
+    badge.style.color = '#ffd700';
+    badge.querySelector('span').style.background = '#ffd700';
+    txt.textContent = 'HERMES läuft...';
+  } else if (ht) {
+    badge.style.borderColor = '#2d9e57';
+    badge.style.color = '#4dff91';
+    badge.querySelector('span').style.background = '#4dff91';
+    txt.textContent = 'HERMES ✓ ' + ht;
+  } else {
+    badge.style.borderColor = '#1e3a5f';
+    badge.style.color = '#4a6a8a';
+    badge.querySelector('span').style.background = '#4a6a8a';
+    txt.textContent = 'HERMES startet...';
   }
 }
 
@@ -1174,6 +1198,9 @@ def start():
 
 @app.route('/status')
 def status():
+    with _hermes_lock:
+        h_ts      = state.get('hermes_ts', '')
+        h_running = state.get('hermes_running', False)
     return jsonify({
         'running':      state['running'],
         'progress':     state['progress'],
@@ -1184,6 +1211,8 @@ def status():
         'has_results':  state['results'] is not None or os.path.exists(RESULTS_FILE),
         'results_hash': state['last_results_hash'],
         'error':        state['error'],
+        'hermes_ts':    h_ts,
+        'hermes_running': h_running,
     })
 
 def _to_json_safe(obj):
@@ -1411,6 +1440,35 @@ def hermes_monitor():
     time.sleep(60)
     while True:
         try:
+            # ── AUTO-REPAIR: Hermes prüft und repariert ───────────────────────
+            if not state['running']:
+                # 1) Kein Scan oder Scan > 6h alt → Rescan
+                last = state.get('last_scan') or ''
+                needs_scan = False
+                if not last:
+                    needs_scan = True
+                else:
+                    try:
+                        from datetime import datetime as _ddt
+                        age_h = (datetime.now() - _ddt.strptime(last, '%Y-%m-%d %H:%M')).total_seconds() / 3600
+                        if age_h > 6:
+                            needs_scan = True
+                    except Exception:
+                        pass
+                if needs_scan and _scan_lock.acquire(blocking=False):
+                    _scan_lock.release()
+                    t = threading.Thread(target=run_scan_thread, kwargs={'trigger': 'hermes-repair'}, daemon=True)
+                    t.start()
+                    tg_send('🔧 <b>HERMES REPAIR</b>: Scan war veraltet/fehlend — neuer Scan gestartet')
+                    time.sleep(120)
+                    continue
+
+                # 2) Scan ok aber social_data/hf_data leer → enrich_background nochmal
+                data = state['results'] or load_results()
+                if data and not state.get('social_data') and not state.get('hf_data'):
+                    t2 = threading.Thread(target=enrich_background, args=(data,), daemon=True)
+                    t2.start()
+
             if not state['running']:
                 data = state['results'] or load_results()
                 if data:
