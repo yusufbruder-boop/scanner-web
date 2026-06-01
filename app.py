@@ -1214,6 +1214,7 @@ def status():
         'error':        state['error'],
         'hermes_ts':    h_ts,
         'hermes_running': h_running,
+        'hermes_error': state.get('hermes_last_error'),
     })
 
 def _to_json_safe(obj):
@@ -1601,8 +1602,15 @@ def hermes_monitor():
                     tg_send('\n'.join(lines))
 
             time.sleep(300)   # immer 5 Min — 24/7
-        except Exception:
-            time.sleep(120)
+        except Exception as _he:
+            import traceback
+            _err = traceback.format_exc()
+            state['hermes_last_error'] = str(_he)
+            with _hermes_lock:
+                state['hermes_running'] = False
+                state['hermes_running_since'] = None
+            tg_send(f'⚠️ <b>HERMES FEHLER</b>: {str(_he)[:200]}')
+            time.sleep(60)
 
 
 @app.route('/hermes/trigger', methods=['POST'])
