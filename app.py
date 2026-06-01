@@ -2,13 +2,19 @@ import json, os, threading, time
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string, request
 import urllib.request, ssl
-# v2.1 — Tabs: Scanner / Intel
+# v3.0 — Hermes Full Agent: Alpaca + Polygon + Memory + P&L
 
 app = Flask(__name__)
 
-RESULTS_FILE  = 'results.json'
+RESULTS_FILE   = 'results.json'
+MEMORY_FILE    = 'hermes_memory.json'
 TG_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 TG_CHAT  = os.environ.get('TELEGRAM_CHAT',  '')
+
+# Alpaca Paper API
+ALPACA_KEY    = os.environ.get('ALPACA_KEY',    'PK5T6OU5ENWZQK5DVZ746MHHEF')
+ALPACA_SECRET = os.environ.get('ALPACA_SECRET', '3nngSp7NksYikEZvf5hLihWEBtFdnuG336KfeYvFb5D9')
+ALPACA_BASE   = 'https://paper-api.alpaca.markets'
 
 # Auto-Scan: täglich 09:30 ET = 13:30 UTC (Sommer) / 14:30 UTC (Winter)
 AUTO_SCAN_UTC_HOUR   = 13
@@ -35,6 +41,8 @@ state = {
     'hermes_running_since': None,
     'hermes_ai':           '',
     'hermes_signal_evals': {},
+    'alpaca_portfolio':    {},
+    'hermes_memory':       {},
     # Background threads: Social KI-Score + HF 13F
     'social_data':    [],
     'hf_data':        [],
@@ -48,6 +56,121 @@ FOLLOWUP_UTC_HOUR   = 14
 FOLLOWUP_UTC_MINUTE = 0
 FOLLOWUP2_UTC_HOUR  = 21   # 22:00 CET / 17:00 ET — Marktschluss Report
 FOLLOWUP2_UTC_MINUTE = 0
+
+# ── Alpaca API ───────────────────────────────────────────────────────────────
+
+def _alpaca(path, method='GET', body=None):
+    """Alpaca REST API Aufruf."""
+    try:
+        url = f'{ALPACA_BASE}{path}'
+        headers = {
+            'APCA-API-KEY-ID':     ALPACA_KEY,
+            'APCA-API-SECRET-KEY': ALPACA_SECRET,
+            'Content-Type':        'application/json',
+        }
+        data = json.dumps(body).encode() if body else None
+        req  = urllib.request.Request(url, data=data, headers=headers, method=method)
+        ctx  = ssl.create_default_context()
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        return {'error': str(e)}
+
+def get_alpaca_portfolio():
+    """Holt Alpaca Account + Positionen + Orders."""
+    acc  = _alpaca('/v2/account')
+    pos  = _alpaca('/v2/positions')
+    if not isinstance(pos, list):
+        pos = []
+    positions = []
+    for p in pos:
+        try:
+            positions.append({
+                'sym':      p['symbol'],
+                'side':     p['side'],
+                'qty':      float(p['qty']),
+                'entry':    round(float(p['avg_entry_price']), 2),
+                'price':    round(float(p['current_price']), 2),
+                'pl':       round(float(p['unrealized_pl']), 2),
+                'pl_pct':   round(float(p['unrealized_plpc']) * 100, 1),
+                'mkt_val':  round(float(p['market_value']), 2),
+            })
+        except Exception:
+            pass
+    return {
+        'equity':     round(float(acc.get('equity', 0)), 2),
+        'cash':       round(float(acc.get('cash', 0)), 2),
+        'pl_day':     round(float(acc.get('unrealized_pl', 0)), 2),
+        'positions':  positions,
+        'ts':         datetime.now().strftime('%H:%M'),
+    }
+
+def alpaca_order(sym, qty, side, reason='hermes-signal'):
+    """Platziert eine Market-Order auf Alpaca Paper."""
+    body = {'symbol': sym, 'qty': str(qty), 'side': side,
+            'type': 'market', 'time_in_force': 'day',
+            'client_order_id': f'hermes-{sym}-{int(time.time())}'}
+    result = _alpaca('/v2/orders', method='POST', body=body)
+    ok = 'id' in result
+    tg_send(f'🤖 <b>HERMES ORDER</b>: {side.upper()} {qty}x <b>{sym}</b> — {"✅ OK" if ok else "❌ " + str(result.get("message","?"))}')
+    return result
+
+# ── Hermes Memory (persistent) ────────────────────────────────────────────────
+
+def load_memory():
+    try:
+        if os.path.exists(MEMORY_FILE):
+            return json.load(open(MEMORY_FILE, encoding='utf-8'))
+    except Exception:
+        pass
+    return {'signals': {}, 'pl_history': [], 'market_closes': []}
+
+def save_memory(mem):
+    try:
+        json.dump(mem, open(MEMORY_FILE, 'w', encoding='utf-8'), indent=2)
+    except Exception:
+        pass
+
+def memory_track_signal(sym, price, signal, score, reasons):
+    """Merkt sich ein neues Signal mit Einstiegspreis."""
+    mem = load_memory()
+    if sym not in mem['signals']:
+        mem['signals'][sym] = {
+            'sym': sym, 'signal': signal, 'score': score,
+            'entry_price': price, 'entry_time': datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'reasons': reasons[:3], 'status': 'open',
+            'peak_pl_pct': 0.0, 'current_pl_pct': 0.0,
+        }
+        save_memory(mem)
+
+def memory_update_pl(poly_key):
+    """Aktualisiert P&L für alle offenen Signale via Polygon."""
+    mem = load_memory()
+    changed = False
+    for sym, sig in mem['signals'].items():
+        if sig.get('status') != 'open':
+            continue
+        try:
+            ctx = ssl.create_default_context()
+            url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{sym}?apiKey={poly_key}'
+            with urllib.request.urlopen(urllib.request.Request(url), context=ctx, timeout=6) as r:
+                d = json.loads(r.read())
+            t = d.get('ticker', {})
+            now_price = float(t.get('lastTrade', {}).get('p') or t.get('day', {}).get('c') or 0)
+            if now_price and sig['entry_price']:
+                if sig['signal'] == 'LONG':
+                    pl_pct = (now_price - sig['entry_price']) / sig['entry_price'] * 100
+                else:
+                    pl_pct = (sig['entry_price'] - now_price) / sig['entry_price'] * 100
+                sig['current_pl_pct'] = round(pl_pct, 1)
+                sig['current_price']  = round(now_price, 2)
+                sig['peak_pl_pct']    = round(max(sig.get('peak_pl_pct', 0), pl_pct), 1)
+                changed = True
+        except Exception:
+            pass
+    if changed:
+        save_memory(mem)
+    return mem
 
 # ── Hilfsfunktionen ──────────────────────────────────────────────────────────
 
@@ -954,6 +1077,55 @@ function renderResults(data, isNew) {
 function renderTab2(data) {
   let html = '';
 
+  // ── Alpaca Portfolio ─────────────────────────────────────────────────────────
+  const ap = data.alpaca_portfolio || {};
+  if (ap.equity) {
+    let totalPL = (ap.positions||[]).reduce((s,p) => s + p.pl, 0);
+    let plCol = totalPL >= 0 ? '#4dff91' : '#ff4d6b';
+    html += '<div style="margin:8px;background:linear-gradient(135deg,#0a1a0a,#0d2010);border:1px solid #2d9e5744;border-radius:10px;padding:12px 14px">'
+      + '<div style="font-size:10px;font-weight:bold;color:#4dff91;letter-spacing:2px;margin-bottom:8px">📈 ALPACA PAPER PORTFOLIO — ' + (ap.ts||'') + '</div>'
+      + '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px">'
+      +   '<div><div style="font-size:11px;color:#6b8cad">Portfolio</div><div style="font-size:18px;font-weight:bold;color:#fff">$' + ap.equity.toLocaleString() + '</div></div>'
+      +   '<div><div style="font-size:11px;color:#6b8cad">Cash</div><div style="font-size:16px;font-weight:bold;color:#94a3b8">$' + ap.cash.toLocaleString() + '</div></div>'
+      +   '<div><div style="font-size:11px;color:#6b8cad">P&L offen</div><div style="font-size:16px;font-weight:bold;color:' + plCol + '">' + (totalPL>=0?'+':'') + '$' + totalPL.toFixed(0) + '</div></div>'
+      + '</div>';
+    (ap.positions||[]).forEach(p => {
+      let pc = p.pl_pct >= 0 ? '#4dff91' : '#ff4d6b';
+      html += '<div style="display:flex;justify-content:space-between;padding:5px 0;border-top:1px solid #1a2a1a">'
+        + '<div><span style="font-size:14px;font-weight:bold;color:#fff">' + p.sym + '</span>'
+        +   ' <span style="font-size:10px;color:#6b8cad">' + p.side + ' ' + p.qty + 'x @ $' + p.entry + '</span></div>'
+        + '<div style="text-align:right">'
+        +   '<span style="color:#fff;font-size:13px">$' + p.price + '</span>'
+        +   ' <span style="color:' + pc + ';font-size:12px;font-weight:bold">' + (p.pl_pct>=0?'+':'') + p.pl_pct + '% ($' + p.pl.toFixed(0) + ')</span>'
+        + '</div></div>';
+    });
+    html += '</div>';
+  }
+
+  // ── Hermes Memory — Signal Tracking + P&L ───────────────────────────────────
+  const mem = data.hermes_memory || {};
+  const memSigs = Object.values(mem.signals || {}).filter(s => s.status === 'open').slice(0,8);
+  if (memSigs.length > 0) {
+    html += '<div class="section"><div class="section-title" style="color:#00e5ff;border-left:3px solid #00e5ff">🧠 HERMES MEMORY — Signal Tracking</div>';
+    memSigs.forEach(s => {
+      let pl = s.current_pl_pct || 0;
+      let plCol = pl >= 0 ? '#4dff91' : '#ff4d6b';
+      let sigCol = s.signal === 'LONG' ? '#4dff91' : '#ff4d6b';
+      html += '<div style="padding:7px 14px;border-bottom:1px solid #111f30;display:flex;justify-content:space-between;align-items:center">'
+        + '<div>'
+        +   '<span style="font-size:14px;font-weight:bold;color:#fff">' + s.sym + '</span>'
+        +   ' <span style="font-size:10px;color:' + sigCol + '">' + s.signal + '</span>'
+        +   '<div style="font-size:10px;color:#475569;margin-top:2px">Entry: $' + s.entry_price + ' — ' + (s.entry_time||'').slice(0,16) + '</div>'
+        + '</div>'
+        + '<div style="text-align:right">'
+        +   (s.current_price ? '<div style="color:#94a3b8;font-size:12px">$' + s.current_price + '</div>' : '')
+        +   '<div style="color:' + plCol + ';font-weight:bold;font-size:13px">' + (pl>=0?'+':'') + pl + '%</div>'
+        +   (s.peak_pl_pct ? '<div style="color:#4a6a8a;font-size:10px">Peak: +' + s.peak_pl_pct + '%</div>' : '')
+        + '</div></div>';
+    });
+    html += '</div>';
+  }
+
   // ── Reddit / Social Trending — KI Score + Heute % + Trend-Grund ────────────
   const socialData = data.social_data || [];
   html += '<div class="section"><div class="section-title" style="color:#b070ff;border-left:3px solid #b070ff">🔥 REDDIT / STOCKTWITS TRENDING</div>';
@@ -1291,6 +1463,8 @@ def results():
             out['hermes_news']         = state.get('hermes_news', [])
             out['hermes_universe']     = list(state.get('hermes_universe', set()))
             out['hermes_signal_evals'] = state.get('hermes_signal_evals', {})
+            out['alpaca_portfolio']    = state.get('alpaca_portfolio', {})
+            out['hermes_memory']       = state.get('hermes_memory', {})
         return jsonify(_to_json_safe(out))
     except Exception as e:
         return jsonify({'error': f'Server Fehler: {str(e)[:120]}'})
@@ -1609,37 +1783,51 @@ def hermes_monitor():
                     state['hermes_running_since'] = datetime.now()
                 try:
                     from scanner import hermes_hunt, scan_ticker, get_alpaca_market_news
+                    POLY_KEY = os.environ.get('POLYGON_API_KEY', '')
 
-                    # 1) Hermes Hunt — 24/7: Polygon Movers + Dark Pool + News
+                    # 1) Alpaca Portfolio — Positionen + P&L
+                    alpaca_data = get_alpaca_portfolio()
+                    state['alpaca_portfolio'] = alpaca_data
+
+                    # 2) Memory P&L Update — offene Signale aktualisieren
+                    mem = memory_update_pl(POLY_KEY)
+
+                    # 3) Hermes Hunt — Polygon Movers + Dark Pool + Options Sweep
                     alerts = hermes_hunt(
                         data.get('longs',  []),
                         data.get('shorts', [])
                     )
 
-                    # 2) Breaking News Check — Polygon News für alle aktuellen Positionen
+                    # 4) Neue starke Signale in Memory speichern
+                    for sig_r in data.get('longs', [])[:5] + data.get('shorts', [])[:3]:
+                        try:
+                            memory_track_signal(
+                                sig_r['t'], sig_r['price'], sig_r['signal'],
+                                sig_r['score'], [sig_r.get('kat_text','')[:60]]
+                            )
+                        except Exception:
+                            pass
+
+                    # 5) Nachrichten — Polygon News + Alpaca Breaking
                     news_alerts = []
                     all_tickers = list({r['t'] for r in
                                        data.get('longs',[]) + data.get('shorts',[]) +
                                        data.get('movers',[])})
                     news_cutoff_h = (datetime.now(timezone.utc) -
                                      timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%SZ')
-                    POLY_KEY = os.environ.get('POLYGON_API_KEY', '')
                     for sym in all_tickers[:10]:
                         try:
                             url = f'https://api.polygon.io/v2/reference/news?ticker={sym}&limit=2&apiKey={POLY_KEY}'
-                            req = urllib.request.Request(url)
-                            ctx_h = ssl.create_default_context()
-                            with urllib.request.urlopen(req, context=ctx_h, timeout=6) as r:
+                            with urllib.request.urlopen(urllib.request.Request(url),
+                                                        context=ssl.create_default_context(), timeout=6) as r:
                                 nd = json.loads(r.read())
                             for n in nd.get('results', []):
                                 if n.get('published_utc', '') >= news_cutoff_h:
-                                    title = n.get('title', '')
-                                    news_alerts.append(f'{sym}: {title[:60]}')
+                                    news_alerts.append(f'{sym}: {n.get("title","")[:60]}')
                                     break
                         except Exception:
                             pass
 
-                    # 3) Alpaca Breaking News — 24/7
                     al_news = get_alpaca_market_news(limit=10)
                     al_breaking = []
                     from scanner import POS_KEYS, NEG_KEYS
@@ -1650,7 +1838,7 @@ def hermes_monitor():
                             if syms:
                                 al_breaking.append(f'{",".join(syms[:2])}: {h[:55]}')
 
-                    # 4) Starke Funde direkt scannen (Score >= 6)
+                    # 6) Starke Hermes-Funde direkt scannen (Score >= 6)
                     today      = datetime.now().strftime('%Y-%m-%d')
                     exp_cutoff = (datetime.now() + timedelta(days=35)).strftime('%Y-%m-%d')
                     news_cutoff= (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
@@ -1663,14 +1851,44 @@ def hermes_monitor():
                                     r['hermes_score']   = int(a['score'])
                                     r['hermes_reasons'] = [str(x) for x in a.get('reasons', [])]
                                     picks.append(r)
+                                    memory_track_signal(r['t'], r['price'], r['signal'],
+                                                        r['score'], r.get('hermes_reasons',[]))
                             except Exception:
                                 pass
 
-                    # 5) Universe erweitern
+                    # 7) Universe erweitern
                     uni = state.get('hermes_universe', set())
                     state['hermes_universe'] = uni | {a['ticker'] for a in alerts if a['score'] >= 7}
 
-                    # 6) AI: Pro-Signal Tiefenbewertung (Top 3 — mehr dauert zu lang)
+                    # 8) Marktschluss-Analyse (16:00-16:15 ET = 20:00-20:15 UTC)
+                    now_utc = datetime.now(timezone.utc)
+                    is_close = (now_utc.hour == 20 and now_utc.minute < 15)
+                    close_analysis = ''
+                    if is_close:
+                        mem_sigs = list(mem.get('signals', {}).values())
+                        tracked = [s for s in mem_sigs if s.get('status') == 'open']
+                        ap = alpaca_data
+                        close_prompt = f"""Marktschluss-Analyse {datetime.now().strftime('%Y-%m-%d')}:
+
+ALPACA PORTFOLIO: ${ap.get('equity',0):,.0f} | Cash: ${ap.get('cash',0):,.0f}
+POSITIONEN: {[f"{p['sym']} {p['side']} P&L:{p['pl_pct']}%" for p in ap.get('positions',[])]}
+
+SCANNER SIGNALE HEUTE: {[(s['sym'],s['signal'],s.get('current_pl_pct',0)) for s in tracked[:8]]}
+
+Marktschluss-Zusammenfassung (Deutsch, max 150 Wörter):
+1. Portfolio Performance heute
+2. Beste und schlechteste Signale
+3. Was morgen beachten?"""
+                        close_analysis = _nous_call(close_prompt,
+                            system='Du bist Hermes Trading Agent. Analysiere den Handelstag.',
+                            max_tokens=400)
+                        if close_analysis:
+                            tg_send(f'📊 <b>HERMES MARKTSCHLUSS {datetime.now().strftime("%d.%m")}</b>\n\n{close_analysis}')
+                            mem['market_closes'].append({'date': today, 'analysis': close_analysis,
+                                                          'equity': ap.get('equity',0)})
+                            save_memory(mem)
+
+                    # 9) AI: Pro-Signal Tiefenbewertung (Top 3)
                     signal_evals = {}
                     top_signals = (data.get('longs',[])[:2] + data.get('shorts',[])[:1] + picks[:1])
                     for sig_r in top_signals[:3]:
@@ -1681,7 +1899,7 @@ def hermes_monitor():
                         except Exception:
                             pass
 
-                    # 7) AI Marktüberblick
+                    # 10) AI Marktüberblick (mit Alpaca-Kontext)
                     ai_text = hermes_ai_analysis(data, alerts)
 
                 finally:
@@ -1699,6 +1917,7 @@ def hermes_monitor():
                     state['hermes_ai']           = ai_text
                     state['hermes_news']         = (news_alerts + al_breaking)[:10]
                     state['hermes_signal_evals'] = signal_evals
+                    state['hermes_memory']       = load_memory()
 
                 # Telegram — neue Funde + Breaking News
                 if new_finds or news_alerts or ai_text:
@@ -1738,6 +1957,26 @@ def hermes_monitor():
             tg_send(f'⚠️ <b>HERMES FEHLER</b>: {str(_he)[:200]}')
             time.sleep(60)
 
+
+@app.route('/alpaca/order', methods=['POST'])
+def alpaca_order_api():
+    """Hermes platziert Order auf Alpaca Paper. Body: {sym, qty, side}"""
+    body = request.get_json(force=True) or {}
+    sym  = body.get('sym','').upper()
+    qty  = int(body.get('qty', 1))
+    side = body.get('side','buy').lower()
+    if not sym or side not in ('buy','sell'):
+        return jsonify({'ok': False, 'msg': 'sym + side (buy/sell) erforderlich'})
+    result = alpaca_order(sym, qty, side)
+    return jsonify({'ok': 'id' in result, 'result': result})
+
+@app.route('/alpaca/portfolio')
+def alpaca_portfolio_api():
+    return jsonify(get_alpaca_portfolio())
+
+@app.route('/hermes/memory')
+def hermes_memory_api():
+    return jsonify(load_memory())
 
 @app.route('/hermes/trigger', methods=['POST'])
 def hermes_trigger():
