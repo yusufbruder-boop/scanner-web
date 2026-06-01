@@ -1963,7 +1963,14 @@ Marktschluss-Zusammenfassung (Deutsch, max 150 Wörter):
                                 lines.append(f'  {p.get("otype")} ${b.get("strike")} @ ${b.get("pr")}  Exp:{b.get("exp")}')
                     tg_send('\n'.join(lines))
 
-            time.sleep(300)   # immer 5 Min — 24/7
+            # Wenn Scan läuft: alle 15s prüfen ob er fertig ist
+            if state['running']:
+                for _ in range(20):
+                    time.sleep(15)
+                    if not state['running']:
+                        break
+            else:
+                time.sleep(300)   # Normal: 5 Min warten
         except Exception as _he:
             import traceback
             _err = traceback.format_exc()
