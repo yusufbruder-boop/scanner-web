@@ -30,10 +30,11 @@ state = {
     'hermes_alerts':  [],
     'hermes_picks':   [],        # direkt gescannte Karten
     'hermes_universe': set(),    # dynamisch erweiterte Tickers
-    'hermes_ts':      None,
-    'hermes_running': False,
+    'hermes_ts':           None,
+    'hermes_running':      False,
     'hermes_running_since': None,
-    'hermes_ai':      '',
+    'hermes_ai':           '',
+    'hermes_signal_evals': {},
     # Background threads: Social KI-Score + HF 13F
     'social_data':    [],
     'hf_data':        [],
@@ -754,6 +755,16 @@ function renderCard(r, cls, isNew) {
   }
   let flash = isNew ? ' new-flash' : '';
 
+  // Hermes AI Signal-Bewertung wenn vorhanden
+  let _evals = (typeof lastData !== 'undefined' && lastData && lastData.hermes_signal_evals) ? lastData.hermes_signal_evals : {};
+  let aiEval = _evals[r.t] || '';
+  let aiBox = aiEval
+    ? '<div style="margin:0 14px 10px;background:#060e1a;border:1px solid #00e5ff33;border-radius:8px;padding:8px 10px">'
+      + '<div style="font-size:9px;font-weight:bold;color:#00e5ff;letter-spacing:2px;margin-bottom:4px">🤖 HERMES BEWERTUNG</div>'
+      + '<div style="font-size:11px;color:#94c8e0;line-height:1.5;white-space:pre-wrap">' + aiEval + '</div>'
+      + '</div>'
+    : '';
+
   return '<div class="card' + flash + '">'
     + '<div class="card-header">'
     +   '<div><span class="ticker">' + r.t + '</span>'
@@ -769,7 +780,9 @@ function renderCard(r, cls, isNew) {
     +     '<div class="stat"><span class="stat-label">Hoch-Abst.</span><span class="stat-value ' + (r.drop_high < -5 ? 'pct-neg' : '') + '">' + r.drop_high + '%</span></div>'
     +   '</div>'
     +   opt + kat
-    + '</div></div>';
+    + '</div>'
+    + aiBox
+    + '</div>';
 }
 
 function renderResults(data, isNew) {
@@ -1260,12 +1273,13 @@ def results():
         if state.get('followup'):
             out['followup'] = state['followup']
         with _hermes_lock:
-            out['hermes_alerts']   = state.get('hermes_alerts', [])
-            out['hermes_picks']    = state.get('hermes_picks', [])
-            out['hermes_ts']       = state.get('hermes_ts', '')
-            out['hermes_ai']       = state.get('hermes_ai', '')
-            out['hermes_news']     = state.get('hermes_news', [])
-            out['hermes_universe'] = list(state.get('hermes_universe', set()))
+            out['hermes_alerts']       = state.get('hermes_alerts', [])
+            out['hermes_picks']        = state.get('hermes_picks', [])
+            out['hermes_ts']           = state.get('hermes_ts', '')
+            out['hermes_ai']           = state.get('hermes_ai', '')
+            out['hermes_news']         = state.get('hermes_news', [])
+            out['hermes_universe']     = list(state.get('hermes_universe', set()))
+            out['hermes_signal_evals'] = state.get('hermes_signal_evals', {})
         return jsonify(_to_json_safe(out))
     except Exception as e:
         return jsonify({'error': f'Server Fehler: {str(e)[:120]}'})
@@ -1389,46 +1403,135 @@ def hermes_approve():
 
 NOUS_KEY = os.environ.get('NOUS_API_KEY', '')
 
-def hermes_ai_analysis(scan_data: dict, hunt_alerts: list) -> str:
-    """
-    Ruft NousResearch Hermes AI auf — analysiert Scanner-Ergebnisse + Hunt-Alerts.
-    Gibt kurze AI-Empfehlung zurück (max 300 Zeichen pro Signal).
-    """
+def _nous_call(prompt: str, system: str = '', max_tokens: int = 500, temperature: float = 0.2) -> str:
+    """Ruft NousResearch API auf. Gibt '' zurück bei Fehler."""
     if not NOUS_KEY:
         return ''
     try:
-        longs  = [(r['t'], r['score'], r.get('kat_text','')[:40]) for r in scan_data.get('longs',[])[:5]]
-        shorts = [(r['t'], r['score'], r.get('kat_text','')[:40]) for r in scan_data.get('shorts',[])[:5]]
-        hunts  = [(a['ticker'], a['score'], a['reasons'][:2]) for a in hunt_alerts[:5]]
-
-        prompt = f"""Du bist ein Trading-Analyst. Analysiere diese Options-Scanner Daten:
-
-LONG Signale: {longs}
-SHORT Signale: {shorts}
-HERMES gefunden (übersehen): {hunts}
-
-Antworte auf Deutsch, max 3 Sätze:
-1. Welches ist der stärkste Trade heute?
-2. Gibt es ein übersehenes Signal das wichtig sein könnte?
-3. Was ist das Marktrisiko heute?"""
-
+        messages = []
+        if system:
+            messages.append({'role': 'system', 'content': system})
+        messages.append({'role': 'user', 'content': prompt})
         body = json.dumps({
-            'model': 'mistralai/mistral-small-2603',
-            'messages': [
-                {'role': 'system', 'content': 'Du bist ein präziser Trading-Analyst. Antworte immer auf Deutsch, kurz und direkt.'},
-                {'role': 'user', 'content': prompt}
-            ],
-            'max_tokens': 200,
-            'temperature': 0.2,
+            'model': 'NousResearch/Hermes-3-Llama-3.1-70B',
+            'messages': messages,
+            'max_tokens': max_tokens,
+            'temperature': temperature,
         }).encode()
         req = urllib.request.Request(
             'https://inference-api.nousresearch.com/v1/chat/completions',
             data=body,
             headers={'Authorization': f'Bearer {NOUS_KEY}', 'Content-Type': 'application/json'},
         )
-        with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=20) as r:
+        with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=30) as r:
             resp = json.loads(r.read())
         return resp['choices'][0]['message']['content'].strip()
+    except Exception:
+        return ''
+
+
+def hermes_ai_signal_eval(signal: dict) -> str:
+    """Tiefe AI-Bewertung eines einzelnen Signals mit allen Polygon-Daten."""
+    t       = signal.get('t', '')
+    price   = signal.get('price', 0)
+    sig     = signal.get('signal', '')
+    score   = signal.get('score', 0)
+    trend   = signal.get('trend', 0)
+    prev_ch = signal.get('prev_chg', 0)
+    pc      = signal.get('pc', 1)
+    atr     = signal.get('atr', 0)
+    drop    = signal.get('drop_high', 0)
+    short_t = signal.get('short_trend', 0)
+    ls      = signal.get('long_score', 0)
+    ss      = signal.get('short_score', 0)
+    kat     = signal.get('katalysator', '')
+    kat_txt = signal.get('kat_text', '')[:120]
+    best    = signal.get('best') or {}
+    dp      = (signal.get('dp') or {})
+    sweep   = signal.get('sweep') or {}
+    h_score = signal.get('hermes_score', 0)
+    h_reas  = signal.get('hermes_reasons', [])
+
+    best_info = ''
+    if best:
+        best_info = f"Beste Option: {best.get('pct',0):+.1f}% OTM Strike ${best.get('strike')} @ ${best.get('pr')} Exp:{best.get('exp')} Vol:{best.get('vol')} OI:{best.get('oi')}"
+
+    dp_info = ''
+    if dp:
+        dp_info = f"Dark Pool: ${dp.get('dp_total',0):,.0f} Block-Trades ({dp.get('dp_count',0)} Trades)"
+
+    sweep_info = ''
+    if sweep:
+        sweep_info = f"Options Sweep: {sweep.get('direction','').upper()} ${sweep.get('total',0):,.0f} Premium, {sweep.get('count',0)} Sweeps"
+
+    prompt = f"""Analysiere dieses Trading-Signal vollständig:
+
+TICKER: {t} | SIGNAL: {sig} | SCORE: {score}/10
+PREIS: ${price} | HEUTE: {prev_ch:+.1f}% | TREND 10T: {trend:+.1f}% | TREND 3T: {short_t:+.1f}%
+ATR: ${atr:.2f} | ABST.HOCH: {drop:.1f}% | P/C-RATIO: {pc:.3f}
+LONG-SCORE: {ls} | SHORT-SCORE: {ss}
+KATALYSATOR: {kat} — {kat_txt}
+{best_info}
+{dp_info}
+{sweep_info}
+{f"HERMES SCORE: {h_score} | Gründe: {', '.join(str(r) for r in h_reas[:3])}" if h_score else ""}
+
+Bewerte auf Deutsch:
+1. STÄRKE: Wie stark ist dieses Signal? (1-10 mit Begründung)
+2. SETUP: Ist das Setup realistisch? (Strike erreichbar, Trend passt, Timing?)
+3. RISIKO: Was könnte schiefgehen?
+4. EMPFEHLUNG: Einsteigen, Warten, oder Finger weg? Warum?
+
+Antworte kompakt, max 150 Wörter."""
+
+    return _nous_call(prompt, system='Du bist ein erfahrener Options-Trader und Analyst. Analysiere präzise und ehrlich, auch wenn das Signal schwach ist.', max_tokens=300)
+
+
+def hermes_ai_analysis(scan_data: dict, hunt_alerts: list) -> str:
+    """
+    Marktüberblick + Bewertung aller Signale via NousResearch Hermes-3 70B.
+    """
+    if not NOUS_KEY:
+        return ''
+    try:
+        longs  = scan_data.get('longs',  [])[:6]
+        shorts = scan_data.get('shorts', [])[:4]
+        movers = scan_data.get('movers', [])[:3]
+        hunts  = hunt_alerts[:6]
+
+        long_lines  = [f"  {r['t']} Score:{r['score']} Trend:{r.get('trend',0):+.1f}% P/C:{r.get('pc',0):.2f} Kat:{r.get('katalysator','')} | {r.get('kat_text','')[:60]}" for r in longs]
+        short_lines = [f"  {r['t']} Score:{r['score']} Trend:{r.get('trend',0):+.1f}% P/C:{r.get('pc',0):.2f} Kat:{r.get('katalysator','')} | {r.get('kat_text','')[:60]}" for r in shorts]
+        hunt_lines  = [f"  {a['ticker']} Score:{a['score']} | {', '.join(str(x) for x in a.get('reasons',[])[:3])}" for a in hunts]
+        mover_lines = [f"  {r['t']} ${r['price']} Score:{r['score']} P/C:{r.get('pc',0):.2f}" for r in movers]
+
+        prompt = f"""Du bist Hermes, ein AI Trading-Agent. Analysiere den gesamten Markt heute:
+
+=== LONG SIGNALE ({len(longs)}) ===
+{chr(10).join(long_lines) or '  keine'}
+
+=== SHORT SIGNALE ({len(shorts)}) ===
+{chr(10).join(short_lines) or '  keine'}
+
+=== NEXT MOVERS ({len(movers)}) ===
+{chr(10).join(mover_lines) or '  keine'}
+
+=== HERMES ENTDECKT ({len(hunts)}) ===
+{chr(10).join(hunt_lines) or '  keine'}
+
+Erstelle eine Trading-Briefing auf Deutsch:
+1. MARKTLAGE: Bullish/Bearish/Neutral? Warum?
+2. TOP TRADE: Welches ist das beste Setup heute und warum?
+3. VERSTECKTES SIGNAL: Gibt es etwas Übersehenes das wichtig sein könnte?
+4. WARNUNG: Was sollte man heute vermeiden?
+5. ZUSAMMENFASSUNG: 1 Satz für den Tag.
+
+Max 200 Wörter, direkt und präzise."""
+
+        return _nous_call(
+            prompt,
+            system='Du bist Hermes, ein professioneller AI Trading-Agent mit Zugang zu Options-Flow, Dark Pool und Marktdaten. Analysiere objektiv und präzise.',
+            max_tokens=500
+        )
     except Exception:
         return ''
 
@@ -1556,7 +1659,18 @@ def hermes_monitor():
                     uni = state.get('hermes_universe', set())
                     state['hermes_universe'] = uni | {a['ticker'] for a in alerts if a['score'] >= 7}
 
-                    # 6) AI Analyse — 24/7 (auch nachts/Wochenende)
+                    # 6) AI: Pro-Signal Tiefenbewertung (Top 5 Signale + Picks)
+                    signal_evals = {}
+                    top_signals = (data.get('longs',[])[:3] + data.get('shorts',[])[:2] + picks[:3])
+                    for sig_r in top_signals:
+                        try:
+                            ev = hermes_ai_signal_eval(sig_r)
+                            if ev:
+                                signal_evals[sig_r['t']] = ev
+                        except Exception:
+                            pass
+
+                    # 7) AI Marktüberblick
                     ai_text = hermes_ai_analysis(data, alerts)
 
                 finally:
@@ -1568,11 +1682,12 @@ def hermes_monitor():
                 new_finds = [a for a in alerts if a['ticker'] not in prev_keys]
 
                 with _hermes_lock:
-                    state['hermes_alerts']  = alerts
-                    state['hermes_picks']   = picks
-                    state['hermes_ts']      = datetime.now().strftime('%H:%M')
-                    state['hermes_ai']      = ai_text
-                    state['hermes_news']    = (news_alerts + al_breaking)[:10]
+                    state['hermes_alerts']       = alerts
+                    state['hermes_picks']        = picks
+                    state['hermes_ts']           = datetime.now().strftime('%H:%M')
+                    state['hermes_ai']           = ai_text
+                    state['hermes_news']         = (news_alerts + al_breaking)[:10]
+                    state['hermes_signal_evals'] = signal_evals
 
                 # Telegram — neue Funde + Breaking News
                 if new_finds or news_alerts or ai_text:
@@ -1631,9 +1746,13 @@ def hermes_trigger():
 def hermes_alerts_api():
     with _hermes_lock:
         return jsonify({
-            'alerts':  state['hermes_alerts'],
-            'ts':      state['hermes_ts'],
-            'running': state['hermes_running'],
+            'alerts':       state['hermes_alerts'],
+            'ts':           state['hermes_ts'],
+            'running':      state['hermes_running'],
+            'ai':           state.get('hermes_ai', ''),
+            'signal_evals': state.get('hermes_signal_evals', {}),
+            'news':         state.get('hermes_news', []),
+            'picks':        _to_json_safe(state.get('hermes_picks', [])),
         })
 
 
