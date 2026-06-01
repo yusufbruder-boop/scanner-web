@@ -169,31 +169,43 @@ def enrich_background(scan_results: dict):
         _ctx2 = _ssl2.create_default_context()
         POLYGON_API = os.environ.get('POLYGON_API_KEY', '')
 
-        _CRYPTO = {'BTC', 'ETH', 'SOL', 'BTC.X', 'ETH.X', 'DOGE', 'XRP'}
+        _CRYPTO = {'BTC', 'ETH', 'SOL', 'BTC.X', 'ETH.X', 'DOGE', 'XRP', 'MSTR'}
 
-        def _yahoo_quote(sym):
-            """Preis + heute% + 7T% nur via Polygon Aggregates (stabiler als Snapshot)."""
+        def _poly_live(sym):
+            """Live-Preis + heute% via Polygon Snapshot, 7T% via Aggregates."""
             if sym in _CRYPTO:
                 return 0.0, 0.0, 0.0
             POLY2 = os.environ.get('POLYGON_API_KEY', '')
             if not POLY2:
                 return 0.0, 0.0, 0.0
+            price = today_chg = trend_7d = 0.0
             try:
+                # 1) Polygon Snapshot → Live-Preis + heutiges %
+                snap_url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{sym}?apiKey={POLY2}'
+                with _ur2.urlopen(_ur2.Request(snap_url), context=_ctx2, timeout=8) as r:
+                    sd = _json2.loads(r.read())
+                t = sd.get('ticker', {})
+                price      = float(t.get('lastTrade', {}).get('p') or t.get('day', {}).get('c') or 0)
+                today_chg  = round(float(t.get('todaysChangePerc') or 0), 1)
+                if not price:
+                    price = float(t.get('day', {}).get('c') or t.get('prevDay', {}).get('c') or 0)
+            except Exception:
+                pass
+            try:
+                # 2) Aggregates → 7T Trend
                 from_d = (datetime.now() - timedelta(days=12)).strftime('%Y-%m-%d')
                 to_d   = datetime.now().strftime('%Y-%m-%d')
-                url = f'https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/day/{from_d}/{to_d}?adjusted=true&sort=asc&limit=12&apiKey={POLY2}'
-                req = _ur2.Request(url)
-                with _ur2.urlopen(req, context=_ctx2, timeout=8) as r:
-                    d = _json2.loads(r.read())
-                bars = [b['c'] for b in d.get('results', []) if b.get('c')]
-                if len(bars) < 2:
-                    return 0.0, 0.0, 0.0
-                price     = round(bars[-1], 2)
-                today_chg = round((bars[-1] - bars[-2]) / bars[-2] * 100, 1) if bars[-2] else 0
-                trend_7d  = round((bars[-1] - bars[0])  / bars[0]  * 100, 1) if bars[0]  else 0
-                return price, today_chg, trend_7d
+                agg_url = f'https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/day/{from_d}/{to_d}?adjusted=true&sort=asc&limit=12&apiKey={POLY2}'
+                with _ur2.urlopen(_ur2.Request(agg_url), context=_ctx2, timeout=8) as r2:
+                    ad = _json2.loads(r2.read())
+                bars = [b['c'] for b in ad.get('results', []) if b.get('c')]
+                if len(bars) >= 2:
+                    if not price:
+                        price = round(bars[-1], 2)
+                    trend_7d = round((bars[-1] - bars[0]) / bars[0] * 100, 1)
             except Exception:
-                return 0.0, 0.0, 0.0
+                pass
+            return round(price, 2), today_chg, trend_7d
 
         def _poly_news_reason(sym):
             """Holt neueste Polygon-News-Headline als Trend-Grund."""
@@ -244,7 +256,7 @@ def enrich_background(scan_results: dict):
                 if dp_t >= 1_000_000: ki += 10
             else:
                 # Ticker nicht im Scan → Yahoo + Polygon News
-                price, today_chg, trend_7d = _yahoo_quote(sym)
+                price, today_chg, trend_7d = _poly_live(sym)
                 if today_chg > 3:  ki += 15
                 elif today_chg > 1: ki += 8
                 elif today_chg < -3: ki -= 5
