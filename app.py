@@ -157,23 +157,67 @@ def enrich_background(scan_results: dict):
                     scan_results.get('shorts', []) +
                     scan_results.get('watch', [])}
 
-        # ── Social KI-Score ──────────────────────────────────────────────────
+        # ── Social KI-Score + Preis + Heute% + Grund ────────────────────────
+        import urllib.request as _ur2, ssl as _ssl2, json as _json2
+        _ctx2 = _ssl2.create_default_context()
+        POLYGON_API = os.environ.get('POLYGON_API_KEY', '')
+
+        def _yahoo_quote(sym):
+            """Aktueller Preis + heute % + 7T % via Yahoo Finance."""
+            try:
+                url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=10d'
+                req = _ur2.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with _ur2.urlopen(req, context=_ctx2, timeout=6) as r:
+                    d = _json2.loads(r.read())
+                meta   = d['chart']['result'][0]['meta']
+                closes = d['chart']['result'][0]['indicators']['quote'][0]['close']
+                closes = [c for c in closes if c is not None]
+                price    = round(meta.get('regularMarketPrice') or closes[-1], 2)
+                prev     = meta.get('previousClose') or closes[-2] if len(closes) >= 2 else price
+                today_chg = round((price - prev) / prev * 100, 1) if prev else 0
+                trend_7d  = round((closes[-1] - closes[0]) / closes[0] * 100, 1) if len(closes) >= 2 else 0
+                return price, today_chg, trend_7d
+            except Exception:
+                return 0.0, 0.0, 0.0
+
+        def _poly_news_reason(sym):
+            """Holt neueste Polygon-News-Headline als Trend-Grund."""
+            if not POLYGON_API:
+                return ''
+            try:
+                url = f'https://api.polygon.io/v2/reference/news?ticker={sym}&limit=1&apiKey={POLYGON_API}'
+                req = _ur2.Request(url)
+                with _ur2.urlopen(req, context=_ctx2, timeout=6) as r:
+                    d = _json2.loads(r.read())
+                items = d.get('results', [])
+                if items:
+                    return items[0].get('title', '')[:70]
+            except Exception:
+                pass
+            return ''
+
         social_raw, social_scores_map = get_cached_social()
         social_data = []
         for sym in social_raw[:12]:
             src_sc = social_scores_map.get(sym, 0)
             ki = min(30, int(src_sc / 3))
-            price = trend_7d = 0.0
+            price = today_chg = trend_7d = 0.0
             pc_ratio = 1.0
-            news_kat = kat_text = ''
+            news_kat = kat_text = reason = ''
             best_opt = signal = None
 
             if sym in scan_map:
                 r = scan_map[sym]
-                price = r['price']; trend_7d = r['trend']
-                pc_ratio = r['pc']; news_kat = r['katalysator']
-                kat_text = r.get('kat_text', '')
-                best_opt = r.get('best'); signal = r['signal']
+                price    = r['price']
+                trend_7d = r['trend']
+                prev_chg = r.get('prev_chg', 0)
+                today_chg = prev_chg          # Vortag-% als Näherung für "heute"
+                pc_ratio  = r['pc']
+                news_kat  = r['katalysator']
+                kat_text  = r.get('kat_text', '')
+                best_opt  = r.get('best')
+                signal    = r['signal']
+                reason    = kat_text          # Aus Scan-Daten direkt
                 if r['pc'] < 0.3:  ki += 20
                 elif r['pc'] < 0.5: ki += 10
                 if trend_7d > 10: ki += 20
@@ -183,11 +227,31 @@ def enrich_background(scan_results: dict):
                 if news_kat == 'NEGATIV': ki -= 10
                 dp_t = (r.get('dp') or {}).get('dp_total', 0) or 0
                 if dp_t >= 1_000_000: ki += 10
+            else:
+                # Ticker nicht im Scan → Yahoo + Polygon News
+                price, today_chg, trend_7d = _yahoo_quote(sym)
+                if today_chg > 3:  ki += 15
+                elif today_chg > 1: ki += 8
+                elif today_chg < -3: ki -= 5
+                if trend_7d > 10: ki += 15
+                elif trend_7d > 5: ki += 8
+                reason = _poly_news_reason(sym)
+                if reason:
+                    ki += 10
+                    news_kat = 'POSITIV'
+
             social_data.append({
-                'sym': sym, 'price': price, 'trend_7d': trend_7d,
-                'pc': round(pc_ratio, 3), 'ki_score': max(0, min(99, ki)),
-                'mentions': src_sc, 'news_kat': news_kat,
-                'kat_text': kat_text[:60], 'best': best_opt, 'signal': signal or '─',
+                'sym':      sym,
+                'price':    price,
+                'today_chg': round(today_chg, 1),
+                'trend_7d': round(trend_7d, 1),
+                'pc':       round(pc_ratio, 3),
+                'ki_score': max(0, min(99, ki)),
+                'mentions': src_sc,
+                'news_kat': news_kat,
+                'reason':   reason[:70] if reason else (kat_text[:70] if kat_text else ''),
+                'best':     best_opt,
+                'signal':   signal or '─',
             })
         social_data.sort(key=lambda x: -x['ki_score'])
 
@@ -604,47 +668,50 @@ function renderResults(data, isNew) {
 
   // ══════════ EXTRA DATEN — am Ende ══════════════════════════════════════════
 
-  // ── Reddit / Social Trending mit KI-Score ──────────────────────────────────
+  // ── Reddit / Social Trending — KI Score + Heute % + Trend-Grund ────────────
   const socialData = data.social_data || [];
-  html += '<div class="section"><div class="section-title" style="color:#b070ff;border-left:3px solid #b070ff">🔥 REDDIT / STOCKTWITS — KI Score</div>';
+  html += '<div class="section"><div class="section-title" style="color:#b070ff;border-left:3px solid #b070ff">🔥 REDDIT / STOCKTWITS TRENDING</div>';
   if (socialData.length === 0) {
-    html += '<div style="padding:12px 16px;color:#4a6a8a;font-size:12px">Wird geladen... (Reddit + Stocktwits, alle 30 Min)</div>';
+    html += '<div style="padding:12px 16px;color:#4a6a8a;font-size:12px">Wird nach dem Scan geladen... (30-60s)</div>';
   } else {
     socialData.forEach(s => {
-      let kiColor = s.ki_score >= 70 ? '#4dff91' : s.ki_score >= 50 ? '#ffd700' : s.ki_score >= 30 ? '#ffa040' : '#6b8cad';
-      let bar = Math.round(s.ki_score);
-      let trendCol = (s.trend_7d||0) >= 0 ? '#4dff91' : '#ff4d6b';
+      let ki = s.ki_score || 0;
+      let kiCol = ki >= 70 ? '#4dff91' : ki >= 50 ? '#ffd700' : ki >= 30 ? '#ffa040' : '#6b8cad';
+      let todayC = s.today_chg || 0;
+      let weekC  = s.trend_7d  || 0;
+      let tCol = c => c >= 0 ? '#4dff91' : '#ff4d6b';
       let sigBadge = s.signal && s.signal !== '─'
-        ? '<span style="font-size:10px;font-weight:bold;padding:2px 6px;border-radius:8px;background:' + (s.signal==='LONG'?'#0d3a1f':'#3a0d1a') + ';color:' + (s.signal==='LONG'?'#4dff91':'#ff4d6b') + '">' + s.signal + '</span>' : '';
-      let newsBadge = s.news_kat === 'POSITIV'
-        ? '<span style="font-size:9px;padding:1px 5px;border-radius:6px;background:#0d3a1f;color:#4dff91">NEWS ▲</span>'
-        : s.news_kat === 'NEGATIV'
-        ? '<span style="font-size:9px;padding:1px 5px;border-radius:6px;background:#3a0d1a;color:#ff4d6b">NEWS ▼</span>' : '';
-      let bestOpt = '';
+        ? ' <span style="font-size:10px;font-weight:bold;padding:2px 5px;border-radius:6px;background:' + (s.signal==='LONG'?'#0d3a1f':'#3a0d1a') + ';color:' + (s.signal==='LONG'?'#4dff91':'#ff4d6b') + '">' + s.signal + '</span>' : '';
+      let reason = s.reason || '';
+      let reasonHtml = reason
+        ? '<div style="font-size:11px;color:#60a5fa;margin-top:4px;padding-left:2px">📰 ' + reason + '</div>'
+        : '<div style="font-size:11px;color:#475569;margin-top:3px">📈 Stocktwits — ' + (s.mentions||0).toLocaleString() + ' mentions</div>';
+      let bestHtml = '';
       if (s.best && s.signal && s.signal !== '─') {
+        let oCol = s.signal === 'LONG' ? '#4dff91' : '#ff4d6b';
         let oType = s.signal === 'LONG' ? 'CALL' : 'PUT';
-        let oCol  = s.signal === 'LONG' ? '#4dff91' : '#ff4d6b';
-        bestOpt = '<div style="background:#0d1628;border:1px solid #1e3a5f;border-radius:6px;padding:5px 8px;margin-top:5px;font-size:11px">'
+        bestHtml = '<div style="background:#0d1628;border:1px solid #1e3a5f;border-radius:6px;padding:4px 8px;margin-top:5px;font-size:11px">'
           + '<span style="color:' + oCol + ';font-weight:bold">' + oType + ' $' + s.best.strike + '</span>'
-          + ' @ <b>$' + s.best.pr + '</b>'
-          + ' &nbsp;Vol:' + (s.best.vol||0).toLocaleString()
-          + ' &nbsp;Exp:' + (s.best.exp||'') + '</div>';
+          + ' @ <b>$' + s.best.pr + '</b>  Exp: ' + (s.best.exp||'') + '</div>';
       }
-      html += '<div style="padding:10px 14px;border-bottom:1px solid #1a2a40">'
-        + '<div style="display:flex;justify-content:space-between;align-items:center">'
-        +   '<div style="display:flex;align-items:center;gap:8px">'
-        +     '<span style="font-size:17px;font-weight:bold;color:#fff">' + s.sym + '</span>'
-        +     (s.price > 0 ? '<span style="color:#94a3b8;font-size:13px">$' + s.price.toFixed(2) + '</span>' : '')
-        +     '<span style="color:' + trendCol + ';font-size:12px">' + (s.trend_7d >= 0 ? '+' : '') + (s.trend_7d||0).toFixed(1) + '% (7T)</span>'
-        +     sigBadge + ' ' + newsBadge
+      html += '<div style="padding:9px 14px;border-bottom:1px solid #111f30">'
+        + '<div style="display:flex;justify-content:space-between;align-items:flex-start">'
+        +   '<div>'
+        +     '<span style="font-size:16px;font-weight:bold;color:#fff">' + s.sym + '</span>'
+        +     sigBadge
+        +     (s.price > 0 ? ' <span style="color:#94a3b8;font-size:13px">$' + s.price.toFixed(2) + '</span>' : '')
+        +     '<div style="display:flex;gap:10px;margin-top:3px">'
+        +       '<span style="font-size:12px;color:' + tCol(todayC) + '">' + (todayC >= 0?'+':'') + todayC.toFixed(1) + '% heute</span>'
+        +       '<span style="font-size:12px;color:' + tCol(weekC)  + '">' + (weekC  >= 0?'+':'') + weekC.toFixed(1)  + '% (7T)</span>'
+        +     '</div>'
         +   '</div>'
-        +   '<div style="text-align:right">'
-        +     '<div style="font-size:18px;font-weight:bold;color:' + kiColor + '">' + bar + '</div>'
-        +     '<div style="font-size:9px;color:#4a6a8a">KI SCORE</div>'
+        +   '<div style="text-align:center;min-width:44px">'
+        +     '<div style="font-size:20px;font-weight:bold;color:' + kiCol + '">' + ki + '</div>'
+        +     '<div style="font-size:9px;color:#4a6a8a;letter-spacing:1px">KI</div>'
         +   '</div>'
         + '</div>'
-        + (s.kat_text ? '<div style="font-size:11px;color:#4db8ff;margin-top:4px">' + s.kat_text + '</div>' : '')
-        + bestOpt
+        + reasonHtml
+        + bestHtml
         + '</div>';
     });
   }
