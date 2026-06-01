@@ -1471,7 +1471,11 @@ def hermes_monitor():
                 t = threading.Thread(target=run_scan_thread, kwargs={'trigger': 'hermes-repair'}, daemon=True)
                 t.start()
                 tg_send('🔧 <b>HERMES REPAIR</b>: Scan war veraltet/fehlend — neuer Scan gestartet')
-                time.sleep(120)
+                # Warte auf Scan-Ende (max 3 Min, dann nochmal prüfen)
+                for _ in range(18):
+                    time.sleep(10)
+                    if not state['running']:
+                        break
                 continue
 
             # 2) Social-Daten fehlen → enrich_background nochmal
