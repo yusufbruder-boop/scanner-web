@@ -28,6 +28,8 @@ state = {
     'followup_date':  None,
     # Hermes Agent
     'hermes_alerts':  [],
+    'hermes_picks':   [],        # direkt gescannte Karten
+    'hermes_universe': set(),    # dynamisch erweiterte Tickers
     'hermes_ts':      None,
     'hermes_running': False,
     'hermes_ai':      '',
@@ -674,6 +676,18 @@ function renderResults(data, isNew) {
       + '</div>';
   }
 
+  // ── Hermes Picks — direkt gescannte Karten ───────────────────────────────
+  const hermPicks = data.hermes_picks || [];
+  if (hermPicks.length > 0) {
+    html += '<div class="section"><div class="section-title" style="color:#00e5ff;border-left:3px solid #00e5ff">🤖 HERMES PICKS — Selbst gefunden & gescannt (' + hermPicks.length + ')</div>';
+    hermPicks.forEach(r => {
+      let cls = r.signal === 'LONG' ? 'long' : 'short';
+      let extra = '<div style="font-size:10px;color:#00e5ff;padding:4px 14px 0">Hermes Score: ' + r.hermes_score + ' — ' + (r.hermes_reasons||[]).slice(0,2).join(' | ') + '</div>';
+      html += extra + renderCard(r, cls, true);
+    });
+    html += '</div>';
+  }
+
   // ── Hauptziel: Mover + Long + Short ─────────────────────────────────────
   if (data.movers && data.movers.length > 0) {
     html += '<div class="section"><div class="section-title mover">🎯 NEXT MOVER — 10%+ Potenzial, Günstiger Call</div>';
@@ -913,7 +927,7 @@ function startScan() {
 }
 
 function updateHeader(d) {
-  let scanInfo = d.last_scan ? 'Letzter Scan: ' + d.last_scan : 'Noch kein Scan';
+  let scanInfo = d.last_scan ? 'Scan: ' + d.last_scan : 'Kein Scan';
   document.getElementById('lastScanInfo').textContent = scanInfo;
   if (d.next_scan) {
     document.getElementById('nextScanInfo').textContent = 'Auto-Scan: ' + d.next_scan;
@@ -1077,9 +1091,11 @@ def results():
         if state.get('followup'):
             out['followup'] = state['followup']
         with _hermes_lock:
-            out['hermes_alerts'] = state.get('hermes_alerts', [])
-            out['hermes_ts']     = state.get('hermes_ts', '')
-            out['hermes_ai']     = state.get('hermes_ai', '')
+            out['hermes_alerts']  = state.get('hermes_alerts', [])
+            out['hermes_picks']   = state.get('hermes_picks', [])
+            out['hermes_ts']      = state.get('hermes_ts', '')
+            out['hermes_ai']      = state.get('hermes_ai', '')
+            out['hermes_universe'] = list(state.get('hermes_universe', set()))
         return jsonify(_to_json_safe(out))
     except Exception as e:
         return jsonify({'error': f'Server Fehler: {str(e)[:120]}'})
@@ -1249,10 +1265,11 @@ Antworte auf Deutsch, max 3 Sätze:
 
 def hermes_monitor():
     """
-    Hermes überwacht Scanner + Alpaca Bot + Markt alle 5 Min.
-    Volles Polygon + Alpaca + NousResearch AI.
+    Hermes Agent — läuft alle 5 Min (Markt) / 10 Min (off-market).
+    Findet übersehene Mover → scannt sie direkt → trägt sie als Hermes Picks ein.
+    Kann Universe erweitern und NousResearch AI aufrufen.
     """
-    time.sleep(180)
+    time.sleep(60)   # 1 Min nach Start (nicht 3 Min)
     while True:
         try:
             now_utc   = datetime.now(timezone.utc)
@@ -1265,13 +1282,38 @@ def hermes_monitor():
                     with _hermes_lock:
                         state['hermes_running'] = True
                     try:
-                        from scanner import hermes_hunt
+                        from scanner import hermes_hunt, scan_ticker
+
+                        # 1) Hermes sucht übersehene Mover
                         alerts = hermes_hunt(
                             data.get('longs',  []),
                             data.get('shorts', [])
                         )
-                        # AI Analyse (nur wenn Markt offen)
+
+                        # 2) Starke Funde (Score >= 6) direkt mit Polygon scannen
+                        today      = datetime.now().strftime('%Y-%m-%d')
+                        exp_cutoff = (datetime.now() + timedelta(days=35)).strftime('%Y-%m-%d')
+                        news_cutoff= (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
+                        picks = []
+                        for a in alerts:
+                            if a['score'] >= 6:
+                                try:
+                                    r = scan_ticker(a['ticker'], today, exp_cutoff, news_cutoff)
+                                    if r and r['signal'] in ('LONG', 'SHORT'):
+                                        r['hermes_score']   = a['score']
+                                        r['hermes_reasons'] = a.get('reasons', [])
+                                        picks.append(r)
+                                except Exception:
+                                    pass
+
+                        # 3) Universe dynamisch erweitern mit neuen Hermes-Funden
+                        current_universe = state.get('hermes_universe', set())
+                        new_tickers = {a['ticker'] for a in alerts if a['score'] >= 7}
+                        state['hermes_universe'] = current_universe | new_tickers
+
+                        # 4) AI Analyse
                         ai_text = hermes_ai_analysis(data, alerts) if is_market else ''
+
                     finally:
                         with _hermes_lock:
                             state['hermes_running'] = False
@@ -1281,24 +1323,32 @@ def hermes_monitor():
 
                     with _hermes_lock:
                         state['hermes_alerts']  = alerts
+                        state['hermes_picks']   = picks          # ← echte Scan-Karten
                         state['hermes_ts']      = datetime.now().strftime('%H:%M')
                         state['hermes_ai']      = ai_text
 
-                    # Telegram: neue Funde + AI
-                    if new_finds or ai_text:
-                        ts = state['hermes_ts']
+                    # Telegram
+                    if new_finds:
+                        ts = datetime.now().strftime('%H:%M')
                         lines = [f'<b>🤖 HERMES — {ts}</b>\n']
                         if ai_text:
                             lines.append(f'<i>{ai_text}</i>\n')
-                        if new_finds:
-                            lines.append(f'<b>Neue Signale ({len(new_finds)}):</b>')
-                            for a in new_finds[:5]:
-                                lines.append(f'<b>{a["ticker"]}</b> Score:{a["score"]}')
-                                for r_txt in a['reasons'][:2]:
-                                    lines.append(f'  • {r_txt}')
+                        lines.append(f'<b>{len(new_finds)} neue Funde:</b>')
+                        for a in new_finds[:5]:
+                            lines.append(f'<b>{a["ticker"]}</b>  Score:{a["score"]}')
+                            for r_txt in a['reasons'][:2]:
+                                lines.append(f'  • {r_txt}')
+                        # Picks mit Options
+                        if picks:
+                            lines.append(f'\n<b>Hermes Picks ({len(picks)} direkt gescannt):</b>')
+                            for p in picks[:3]:
+                                b = p.get('best') or {}
+                                lines.append(f'{p["signal"]} <b>{p["t"]}</b> ${p["price"]}  Score:{p["score"]}')
+                                if b:
+                                    lines.append(f'  {p.get("otype","?")} ${b.get("strike")} @ ${b.get("pr")}  Exp:{b.get("exp")}')
                         tg_send('\n'.join(lines))
 
-            time.sleep(300 if is_market else 900)
+            time.sleep(300 if is_market else 600)
         except Exception:
             time.sleep(300)
 
