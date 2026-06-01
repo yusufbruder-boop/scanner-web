@@ -438,7 +438,7 @@ def enrich_background(scan_results: dict):
         state['hf_data']     = hf_data
         state['extra_ts']    = datetime.now().strftime('%H:%M')
 
-        # Results mit extra Daten updaten
+        # Results mit extra Daten updaten + Hash ändern → Frontend bemerkt neue Daten
         if state['results']:
             merged = dict(state['results'])
             merged['social_data'] = social_data
@@ -446,6 +446,7 @@ def enrich_background(scan_results: dict):
             merged['influencers'] = influencers
             state['results'] = merged
             save_results(merged)
+            state['last_results_hash'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     except Exception as e:
         print(f'[enrich] Fehler: {e}')
