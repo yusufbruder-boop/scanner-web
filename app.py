@@ -517,20 +517,26 @@ def enrich_background(scan_results: dict):
                 pass
             time.sleep(0.5)
 
-        # ── Situational Awareness LP (Leopold Aschenbrenner) — bekannte AI-Holdings ──
-        # Kein öffentlicher RSS/13F — zeige bekannte Positionen mit Live-Preisen
-        leo_syms = ['NVDA', 'MSFT', 'GOOGL', 'META', 'AMD', 'PLTR', 'TSLA', 'AMZN']
+        # ── Situational Awareness LP (Leopold Aschenbrenner) — echte SEC-Positionen ──
+        # Quellen: 13D/13G SEC-Filings (stock-world.de, 2026)
+        # NBIS: $2.6 Mrd (5.6% Anteil), CoreWeave, IREN, Bloom Energy, SanDisk
+        leo_positions = [
+            ('NBIS',  2600, 'NBIS — 5.6% Anteil ($2.6 Mrd) — größte Position'),
+            ('CRWV',   800, 'CoreWeave — KI-Rechenzentren'),
+            ('IREN',   400, 'IREN — Bitcoin/KI Datacenter'),
+            ('BE',     300, 'Bloom Energy — KI Energieversorgung'),
+        ]
         leo_holdings = []
-        for sym in leo_syms[:6]:
+        for sym, val_m, reason in leo_positions:
             try:
                 price_now, price_then, since = _yahoo_price_change(sym, '2026-01-01')
                 if price_now > 0:
                     leo_holdings.append({
                         'sym':        sym,
-                        'action':     'AI FOCUS',
-                        'val_m':      0,
-                        'date':       '2026',
-                        'reason':     'Situational Awareness LP — KI-Infrastruktur',
+                        'action':     'KAUFT',
+                        'val_m':      val_m,
+                        'date':       '2026-Q1',
+                        'reason':     reason,
                         'price_now':  price_now,
                         'price_then': price_then,
                         'since_pct':  since,
@@ -540,9 +546,9 @@ def enrich_background(scan_results: dict):
         if leo_holdings:
             hf_data.append({
                 'manager':  'Situational Awareness LP (L. Aschenbrenner)',
-                'date':     '2026',
-                'form':     'AI FUND',
-                'url':      'https://situational-awareness.ai',
+                'date':     '2026-Q1',
+                'form':     '13D/13G',
+                'url':      'https://www.stock-world.de/nebius-aktie-aschenbrenner-fonds-mit-26-milliarden-dollar/',
                 'holdings': leo_holdings,
             })
 

@@ -165,6 +165,8 @@ UNIVERSE = [
     'SNOW','PANW','UBER','LYFT','RIVN','LCID','NIO','F','GM',
     'SHOP','SQ','PYPL','ROKU','SPOT','PINS','SNAP',
     'ENPH','SEDG','FSLR','NEE','HIMS','CELH','WOLF',
+    # Situational Awareness LP (Aschenbrenner) — echte Positionen aus 13D/13G
+    'NBIS','CRWV','BE',
 ]
 
 POS_KEYS = ['contract','government','deal','partnership','upgrade','raised','beat',
