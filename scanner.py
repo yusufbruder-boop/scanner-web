@@ -99,9 +99,8 @@ def get_cached_social():
 
 # ── Influencer / Smart Money ─────────────────────────────────────────────────
 _INFLUENCER_FEEDS = [
-    ('https://situationalawareness.substack.com/feed', 'Leopold Aschenbrenner'),
-    ('https://www.astralcodexten.com/feed',            'Scott Alexander (ACX)'),
-    ('https://www.noahpinion.blog/feed',               'Noah Smith'),
+    ('https://www.astralcodexten.com/feed', 'Scott Alexander (ACX)'),
+    ('https://www.noahpinion.blog/feed',    'Noah Smith'),
 ]
 _influencer_cache: list = []
 _influencer_ts: float   = 0.0
@@ -367,8 +366,8 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
     except Exception:
         pass
 
-    # Alpaca Snapshot für alle Kandidaten (Batch)
-    al_snap = get_alpaca_snapshot(candidates[:40])
+    # Alpaca Snapshot für alle Kandidaten (Batch) — max 20 um API-Rate-Limit zu vermeiden
+    al_snap = get_alpaca_snapshot(candidates[:20])
 
     alerts = []
 
@@ -471,9 +470,9 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
             }
         return None
 
-    with ThreadPoolExecutor(max_workers=10) as ex:
-        futs = [ex.submit(check_one, t) for t in candidates[:40]]
-        for fut in as_completed(futs, timeout=90):
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs = [ex.submit(check_one, t) for t in candidates[:20]]
+        for fut in as_completed(futs, timeout=60):
             try:
                 r = fut.result()
                 if r:

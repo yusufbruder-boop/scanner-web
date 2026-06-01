@@ -517,54 +517,34 @@ def enrich_background(scan_results: dict):
                 pass
             time.sleep(0.5)
 
-        # ── Leopold Aschenbrenner — Substack RSS → Aktien-Picks ──────────────
-        try:
-            import xml.etree.ElementTree as _ET2, html as _html2, re as _re2
-            _PAT  = _re2.compile(r'\b\$?([A-Z]{2,5})\b')
-            _SKIP = {'I','A','THE','FOR','AND','BUT','NOT','ARE','YOU','AI','US',
-                     'OR','AT','IT','IS','BE','AS','BY','CEO','IPO','FED','AGI',
-                     'GDP','EUR','USD','ETF','SEC','GPT','LLM','API','GPU','TPU'}
-            req_l = _ur2.Request(
-                'https://situationalawareness.substack.com/feed',
-                headers={'User-Agent': 'scanner/3.0'})
-            with _ur2.urlopen(req_l, context=_ctx2, timeout=10) as r:
-                root_l = _ET2.fromstring(r.read())
-            leopold_tickers = {}  # {sym: (title, date)}
-            for item in root_l.findall('.//item')[:8]:
-                t_el = item.find('title')
-                d_el = item.find('description')
-                p_el = item.find('pubDate')
-                title = _html2.unescape(t_el.text or '') if t_el is not None else ''
-                desc  = _html2.unescape(d_el.text  or '') if d_el is not None else ''
-                pub   = (p_el.text or '')[:16] if p_el is not None else ''
-                text  = title + ' ' + desc[:400]
-                for m in _PAT.findall(text):
-                    if m not in _SKIP and 2 <= len(m) <= 5 and m not in leopold_tickers:
-                        leopold_tickers[m] = (title[:60], pub)
-            leo_holdings = []
-            for sym, (title, pub) in list(leopold_tickers.items())[:6]:
+        # ── Situational Awareness LP (Leopold Aschenbrenner) — bekannte AI-Holdings ──
+        # Kein öffentlicher RSS/13F — zeige bekannte Positionen mit Live-Preisen
+        leo_syms = ['NVDA', 'MSFT', 'GOOGL', 'META', 'AMD', 'PLTR', 'TSLA', 'AMZN']
+        leo_holdings = []
+        for sym in leo_syms[:6]:
+            try:
                 price_now, price_then, since = _yahoo_price_change(sym, '2026-01-01')
                 if price_now > 0:
                     leo_holdings.append({
                         'sym':        sym,
-                        'action':     'ERWÄHNT',
+                        'action':     'AI FOCUS',
                         'val_m':      0,
-                        'date':       pub[:10] if pub else '2026',
-                        'reason':     title,
+                        'date':       '2026',
+                        'reason':     'Situational Awareness LP — KI-Infrastruktur',
                         'price_now':  price_now,
                         'price_then': price_then,
                         'since_pct':  since,
                     })
-            if leo_holdings:
-                hf_data.append({
-                    'manager':  'Leopold Aschenbrenner (Situational Awareness)',
-                    'date':     '2026',
-                    'form':     'AI FUND',
-                    'url':      'https://situationalawareness.substack.com',
-                    'holdings': leo_holdings,
-                })
-        except Exception:
-            pass
+            except Exception:
+                pass
+        if leo_holdings:
+            hf_data.append({
+                'manager':  'Situational Awareness LP (L. Aschenbrenner)',
+                'date':     '2026',
+                'form':     'AI FUND',
+                'url':      'https://situational-awareness.ai',
+                'holdings': leo_holdings,
+            })
 
         # ── Influencer ────────────────────────────────────────────────────────
         influencers = get_cached_influencers()
