@@ -895,6 +895,31 @@ function renderCard(r, cls, isNew) {
     +     '<div class="stat"><span class="stat-label">P/C</span><span class="stat-value">'       + r.pc + '</span></div>'
     +     '<div class="stat"><span class="stat-label">Hoch-Abst.</span><span class="stat-value ' + (r.drop_high < -5 ? 'pct-neg' : '') + '">' + r.drop_high + '%</span></div>'
     +   '</div>'
+    + (function() {
+        let sm = r.smart_money || {};
+        let smHtml = '';
+        let em = sm.expected_move || 0;
+        let maxVoi = Math.max(sm.max_call_voi||0, sm.max_put_voi||0);
+        let cp = sm.call_premium || 0;
+        let pp = sm.put_premium || 0;
+        if (em > 0 || maxVoi >= 3 || cp > 500000 || pp > 500000) {
+          smHtml += '<div style="display:flex;flex-wrap:wrap;gap:5px;padding:5px 14px 2px">';
+          if (em >= 5) smHtml += '<span style="font-size:10px;background:#1a1a0a;border:1px solid #ffd70066;color:#ffd700;padding:2px 7px;border-radius:8px">⚡ Erwartete Bewegung ±' + em + '%</span>';
+          if (sm.max_call_voi >= 3) smHtml += '<span style="font-size:10px;background:#0a2a0a;border:1px solid #4dff9166;color:#4dff91;padding:2px 7px;border-radius:8px">🐋 Call Vol/OI ' + sm.max_call_voi + 'x</span>';
+          if (sm.max_put_voi >= 3)  smHtml += '<span style="font-size:10px;background:#2a0a0a;border:1px solid #ff4d6b66;color:#ff4d6b;padding:2px 7px;border-radius:8px">🐋 Put Vol/OI ' + sm.max_put_voi + 'x</span>';
+          if (cp > 1000000) smHtml += '<span style="font-size:10px;background:#0a1a2a;border:1px solid #4db8ff66;color:#4db8ff;padding:2px 7px;border-radius:8px">💰 Call Flow $' + (cp/1e6).toFixed(1) + 'M</span>';
+          if (pp > 1000000) smHtml += '<span style="font-size:10px;background:#1a0a2a;border:1px solid #b070ff66;color:#b070ff;padding:2px 7px;border-radius:8px">💰 Put Flow $' + (pp/1e6).toFixed(1) + 'M</span>';
+          smHtml += '</div>';
+          // Größte Anomalie
+          let top = (sm.anomalies||[])[0];
+          if (top && top.ratio >= 5) {
+            smHtml += '<div style="margin:3px 14px 0;padding:4px 8px;background:#0a0e1a;border-left:3px solid #ffd700;font-size:10px;color:#ffd700">'
+              + '🔥 ' + top.type + ' $' + top.strike + ' Vol/OI: ' + top.ratio + 'x (' + top.vol.toLocaleString() + ' vol, OI:' + top.oi.toLocaleString() + ') @ $' + top.pr
+              + '</div>';
+          }
+        }
+        return smHtml;
+      })()
     +   opt + kat
     + '</div>'
     + aiBox

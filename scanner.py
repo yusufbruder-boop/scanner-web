@@ -500,6 +500,101 @@ def poly_fetch(url, retries=2):
             if attempt >= retries:
                 raise
 
+def get_earnings_soon(ticker):
+    """Prüft ob Earnings in den nächsten 10 Tagen. Gibt (datum, tage) zurück oder None."""
+    try:
+        url = f'https://api.polygon.io/vX/reference/financials?ticker={ticker}&limit=1&apiKey={API}'
+        d = poly_fetch(url)
+        for r in d.get('results', []):
+            fd = r.get('fiscal_period_description', '')
+            # Polygon hat kein direktes earnings date — nutze SEC filing date als Näherung
+            ed = r.get('end_date', '')
+            if ed:
+                days = (datetime.strptime(ed, '%Y-%m-%d') - datetime.now()).days
+                if -5 <= days <= 14:
+                    return ed, days
+    except Exception:
+        pass
+    return None, None
+
+def get_smart_money_signals(options, price, today):
+    """
+    Analysiert Options auf Smart Money Positionierung:
+    - Vol/OI Anomalien (> 3x = jemand weiß etwas)
+    - Expected Move (ATM Straddle Preis)
+    - Sweep Cluster (mehrere große Sweeps gleiche Richtung)
+    - OI Konzentration (auf welchen Strike sammelt sich OI?)
+    """
+    calls = [r for r in options if r['details']['contract_type'] == 'call']
+    puts  = [r for r in options if r['details']['contract_type'] == 'put']
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+
+    anomalies = []  # (ticker, type, vol, oi, ratio, strike, exp, premium)
+    call_premium = put_premium = 0
+    max_call_vol_oi = max_put_vol_oi = 0
+
+    for contracts, ctype in [(calls, 'CALL'), (puts, 'PUT')]:
+        for c in contracts:
+            exp = c['details']['expiration_date']
+            if exp <= today:
+                continue
+            vol = c['day'].get('volume', 0) or 0
+            oi  = c.get('open_interest', 0) or 1
+            pr  = c['day'].get('close') or c['day'].get('open') or 0
+            ratio = vol / oi
+            premium = vol * pr * 100
+            strike = c['details']['strike_price']
+            if ctype == 'CALL':
+                call_premium += premium
+                if ratio > max_call_vol_oi:
+                    max_call_vol_oi = ratio
+            else:
+                put_premium += premium
+                if ratio > max_put_vol_oi:
+                    max_put_vol_oi = ratio
+            # Anomalie: Vol/OI > 3x und echtes Volumen
+            if ratio >= 3.0 and vol >= 200 and pr >= 0.05:
+                anomalies.append({
+                    'type': ctype, 'vol': vol, 'oi': oi,
+                    'ratio': round(ratio, 1), 'strike': strike,
+                    'exp': exp, 'pr': round(pr, 2), 'premium': round(premium),
+                })
+
+    # Expected Move: ATM Straddle (nächste Expiry)
+    expected_move_pct = 0
+    try:
+        next_expiries = sorted({c['details']['expiration_date']
+                                for c in options if c['details']['expiration_date'] > today})[:2]
+        for exp in next_expiries:
+            exp_calls = [c for c in calls if c['details']['expiration_date'] == exp]
+            exp_puts  = [c for c in puts  if c['details']['expiration_date'] == exp]
+            # ATM = Strike am nächsten zum aktuellen Preis
+            atm_call = min(exp_calls, key=lambda x: abs(x['details']['strike_price'] - price), default=None)
+            atm_put  = min(exp_puts,  key=lambda x: abs(x['details']['strike_price'] - price), default=None)
+            if atm_call and atm_put:
+                c_pr = atm_call['day'].get('close') or 0
+                p_pr = atm_put['day'].get('close') or 0
+                straddle = c_pr + p_pr
+                if straddle > 0 and price > 0:
+                    expected_move_pct = round(straddle / price * 100, 1)
+                    break
+    except Exception:
+        pass
+
+    # Größte Anomalien nach Ratio sortieren
+    anomalies.sort(key=lambda x: -x['ratio'])
+
+    return {
+        'anomalies':       anomalies[:5],
+        'max_call_vol_oi': round(max_call_vol_oi, 1),
+        'max_put_vol_oi':  round(max_put_vol_oi, 1),
+        'call_premium':    round(call_premium),
+        'put_premium':     round(put_premium),
+        'expected_move':   expected_move_pct,
+        'bull_flow':       call_premium > put_premium * 1.5,
+        'bear_flow':       put_premium  > call_premium * 1.5,
+    }
+
 def best_option(contracts, is_call, price, today, exp_cutoff, atr=5.0):
     tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
     candidates = []
@@ -559,6 +654,9 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
 
         # Options Sweep Detection
         sweep = get_options_sweep(res)
+
+        # Smart Money Positionierung — Vol/OI Anomalien + Expected Move
+        sm = get_smart_money_signals(res, price, today)
 
         # Polygon Aggregates — immer aktuelle Tages-OHLCV Daten (kein yfinance)
         from_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
@@ -644,47 +742,106 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
                      1 if dp_dollar >= 500_000   else 0)
 
         long_score = short_score = 0
+        reasons_long = []
+        reasons_short = []
+
+        # ── TIER 1: Smart Money Signale (höchste Priorität) ──────────────────
+
+        # Vol/OI Anomalie (> 3x = institutionelle Positionierung)
+        max_call_voi = sm['max_call_vol_oi']
+        max_put_voi  = sm['max_put_vol_oi']
+        if max_call_voi >= 10:
+            long_score += 6
+            reasons_long.append(f'Vol/OI CALL {max_call_voi:.0f}x — massive Positionierung')
+        elif max_call_voi >= 5:
+            long_score += 4
+            reasons_long.append(f'Vol/OI CALL {max_call_voi:.0f}x — ungewöhnlich')
+        elif max_call_voi >= 3:
+            long_score += 2
+            reasons_long.append(f'Vol/OI CALL {max_call_voi:.0f}x')
+        if max_put_voi >= 10:
+            short_score += 6
+            reasons_short.append(f'Vol/OI PUT {max_put_voi:.0f}x — massive Positionierung')
+        elif max_put_voi >= 5:
+            short_score += 4
+            reasons_short.append(f'Vol/OI PUT {max_put_voi:.0f}x — ungewöhnlich')
+        elif max_put_voi >= 3:
+            short_score += 2
+            reasons_short.append(f'Vol/OI PUT {max_put_voi:.0f}x')
+
+        # Dark Pool (Block Trades = institutionelle Accumulation)
+        if dp_dollar >= 10_000_000:
+            long_score += 5
+            reasons_long.append(f'Dark Pool ${dp_dollar/1e6:.0f}M — großer Block')
+        elif dp_dollar >= 5_000_000:
+            long_score += 4
+            reasons_long.append(f'Dark Pool ${dp_dollar/1e6:.0f}M')
+        elif dp_dollar >= 1_000_000:
+            long_score += 2
+            reasons_long.append(f'Dark Pool ${dp_dollar/1e6:.1f}M')
+
+        # Options Sweep Cluster (koordiniertes Smart Money)
+        sc = sweep.get('sweeps_call', 0)
+        sp = sweep.get('sweeps_put', 0)
+        if sc >= 5:
+            long_score += 4
+            reasons_long.append(f'{sc} Call-Sweeps — koordiniert')
+        elif sc >= 2:
+            long_score += 2
+            reasons_long.append(f'{sc} Call-Sweeps')
+        if sp >= 5:
+            short_score += 4
+            reasons_short.append(f'{sp} Put-Sweeps — koordiniert')
+        elif sp >= 2:
+            short_score += 2
+            reasons_short.append(f'{sp} Put-Sweeps')
+
+        # Premium Flow (wohin fließt das Geld)
+        if sm['bull_flow']:
+            long_score += 2
+            reasons_long.append(f'Call Premium ${sm["call_premium"]/1e6:.1f}M dominiert')
+        if sm['bear_flow']:
+            short_score += 2
+            reasons_short.append(f'Put Premium ${sm["put_premium"]/1e6:.1f}M dominiert')
+
+        # ── TIER 2: Katalysatoren (binäre Events) ───────────────────────────
+
+        # News-Katalysator
+        if katalysator == 'POSITIV':
+            long_score  += 3
+            reasons_long.append(f'News: {kat_text[:50]}')
+        if katalysator == 'NEGATIV':
+            short_score += 3
+            reasons_short.append(f'Neg. News: {kat_text[:50]}')
+
+        # Expected Move (hoch = Markt erwartet großen Swing)
+        em = sm['expected_move']
+        if em >= 10:
+            long_score  += 2
+            short_score += 2  # Binary Event — beide Richtungen möglich
+        elif em >= 5:
+            long_score  += 1
+            short_score += 1
+
+        # ── TIER 3: Technische Bestätigung ──────────────────────────────────
+
+        # Trend (jetzt nur Bestätigung, nicht mehr Hauptsignal)
+        if trend_pct < -7:   short_score += 2
+        elif trend_pct < -3: short_score += 1
+        if trend_pct > 7:    long_score  += 2
+        elif trend_pct > 3:  long_score  += 1
 
         # P/C Ratio
-        if pc < 0.3:   long_score  += 3
+        if pc < 0.3:   long_score  += 2
         elif pc < 0.5: long_score  += 1
-        if pc > 0.8:   short_score += 3
+        if pc > 0.8:   short_score += 2
         elif pc > 0.6: short_score += 1
 
-        # Trend
-        if trend_pct < -7:   short_score += 4
-        elif trend_pct < -4: short_score += 2
-        elif trend_pct < -2: short_score += 1
-        if 5 < trend_pct < 25:                              long_score  += 2
-        if trend_pct >= 25 and short_trend > 0:             long_score  += 2
-        if trend_pct >= 25 and short_trend < -2:            short_score += 2
-
         # Abstand vom Hoch
-        if drop_from_high < -8:   short_score += 4
-        elif drop_from_high < -5: short_score += 2
-        elif drop_from_high < -3: short_score += 1
+        if drop_from_high < -10: short_score += 2
+        elif drop_from_high < -5: short_score += 1
 
-        # Kurzfrist-Trend
-        if short_trend < -3:   short_score += 2
-        elif short_trend < -1: short_score += 1
-        if short_trend > 3:    long_score  += 1
-
-        # News-Katalysator (+4 — wichtigstes Signal für 10%+ Moves)
-        if katalysator == 'POSITIV': long_score  += 4
-        if katalysator == 'NEGATIV': short_score += 4
-
-        # Dollar Flow
-        if cp > pp * 3: long_score  += 1
-        if pp > cp * 2: short_score += 1
-
-        # Options Sweep (+2 für institutionelle Käufe)
-        if sweep.get('sweeps_call', 0) >= 2: long_score  += 2
-        if sweep.get('sweeps_put',  0) >= 2: short_score += 2
-
-        # Dark Pool (+dp_score für große Block-Trades)
-        long_score  += dp_score
-
-        # Social Hype
+        # Social
         if social_boost > 0 and trend_pct > 0:
             long_score += social_boost
 
@@ -707,17 +864,32 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
             gain = max(0, ziel - best['strike']) if signal == 'LONG' else max(0, best['strike'] - ziel)
             mult = f"{gain / best['pr']:.0f}x" if best['pr'] > 0 and gain > 0 else None
 
+        # Haupt-Grund für das Signal
+        kat_text_full = al_news_text + kat_text
+        if signal == 'LONG' and reasons_long:
+            kat_text_full = reasons_long[0] + (' | ' + kat_text[:40] if kat_text else '')
+        elif signal == 'SHORT' and reasons_short:
+            kat_text_full = reasons_short[0] + (' | ' + kat_text[:40] if kat_text else '')
+
         return {
             't': ticker, 'price': round(price, 2), 'signal': signal, 'score': score,
             'pc': round(pc, 3), 'cp': round(cp), 'pp': round(pp),
             'trend': round(trend_pct, 1), 'prev_chg': round(prev_chg, 1),
             'drop_high': round(drop_from_high, 1), 'short_trend': round(short_trend, 1),
             'long_score': long_score, 'short_score': short_score,
-            'katalysator': katalysator, 'kat_text': (al_news_text + kat_text),
+            'katalysator': katalysator, 'kat_text': kat_text_full,
             'best': best, 'otype': otype, 'ziel': ziel, 'mult': mult,
             'atr': round(atr, 2), 'today': today, 'conflict': conflict,
             'kat_url': kat_url, 'social_score': social_score,
             'dp': dp, 'sweep': sweep,
+            'smart_money': {
+                'anomalies':     sm['anomalies'][:3],
+                'expected_move': sm['expected_move'],
+                'call_premium':  sm['call_premium'],
+                'put_premium':   sm['put_premium'],
+                'max_call_voi':  sm['max_call_vol_oi'],
+                'max_put_voi':   sm['max_put_vol_oi'],
+            },
         }
     except Exception:
         return None
