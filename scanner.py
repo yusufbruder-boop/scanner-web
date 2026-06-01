@@ -13,43 +13,75 @@ _SKIP_WORDS = {'THE','AND','FOR','ARE','YOU','NOT','BUT','HAS','WAS','ALL','CAN'
                'LOL','WSB','DD','YOLO','ATH','ATL','IMO','IMO','TBH','GBH'}
 
 def get_social_trending():
-    """Holt trending Tickers von Reddit WSB + Stocktwits."""
-    tickers = {}  # {sym: score}
+    """Holt trending Tickers von Reddit WSB, r/stocks, Stocktwits, Yahoo Trending."""
+    tickers = {}
+    sources = {}
 
-    # 1) Reddit WSB hot posts
-    try:
-        url = 'https://www.reddit.com/r/wallstreetbets/hot.json?limit=50'
-        req = urllib.request.Request(url, headers={'User-Agent': 'scanner/2.0'})
-        with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
-            data = json.loads(r.read())
-        posts = data.get('data', {}).get('children', [])
-        for post in posts:
-            d = post.get('data', {})
-            text = (d.get('title', '') + ' ' + d.get('selftext', ''))[:500]
-            score = d.get('score', 0)
-            upvote_ratio = d.get('upvote_ratio', 0.5)
-            for m in _TICKER_RE.findall(text):
-                if m not in _SKIP_WORDS and len(m) >= 2:
-                    tickers[m] = tickers.get(m, 0) + int(score * upvote_ratio / 100)
-    except Exception:
-        pass
+    # 1) Reddit WSB
+    for sub, weight in [('wallstreetbets', 1.0), ('stocks', 0.5), ('options', 0.6)]:
+        try:
+            url = f'https://www.reddit.com/r/{sub}/hot.json?limit=30'
+            req = urllib.request.Request(url, headers={'User-Agent': 'scanner/3.0'})
+            with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+                data = json.loads(r.read())
+            for post in data.get('data', {}).get('children', []):
+                d     = post.get('data', {})
+                text  = (d.get('title', '') + ' ' + d.get('selftext', ''))[:500]
+                score = d.get('score', 0)
+                ratio = d.get('upvote_ratio', 0.5)
+                for m in _TICKER_RE.findall(text):
+                    if m not in _SKIP_WORDS and len(m) >= 2:
+                        pts = int(score * ratio / 100 * weight)
+                        tickers[m] = tickers.get(m, 0) + pts
+                        sources.setdefault(m, set()).add(f'r/{sub}')
+        except Exception:
+            pass
 
     # 2) Stocktwits trending
     try:
         url2 = 'https://api.stocktwits.com/api/2/trending/symbols.json'
-        req2 = urllib.request.Request(url2, headers={'User-Agent': 'scanner/2.0'})
+        req2 = urllib.request.Request(url2, headers={'User-Agent': 'scanner/3.0'})
         with urllib.request.urlopen(req2, context=ctx, timeout=8) as r:
             d2 = json.loads(r.read())
-        for sym_data in d2.get('symbols', []):
+        for i, sym_data in enumerate(d2.get('symbols', [])[:15]):
             sym = sym_data.get('symbol', '')
-            if sym:
-                tickers[sym] = tickers.get(sym, 0) + 50
+            if sym and sym not in _SKIP_WORDS:
+                tickers[sym] = tickers.get(sym, 0) + max(1, 15-i) * 4
+                sources.setdefault(sym, set()).add('Stocktwits')
     except Exception:
         pass
 
-    # Top 10 nach Score, nur bekannte Aktien (Preis wird später geprüft)
+    # 3) Stocktwits Stream
+    try:
+        url3 = 'https://api.stocktwits.com/api/2/streams/trending.json?filter=all'
+        req3 = urllib.request.Request(url3, headers={'User-Agent': 'scanner/3.0'})
+        with urllib.request.urlopen(req3, context=ctx, timeout=8) as r:
+            d3 = json.loads(r.read())
+        for msg in d3.get('messages', [])[:30]:
+            sym = msg.get('symbols', [{}])[0].get('symbol', '') if msg.get('symbols') else ''
+            if sym and sym not in _SKIP_WORDS:
+                tickers[sym] = tickers.get(sym, 0) + 10
+                sources.setdefault(sym, set()).add('Stocktwits-Stream')
+    except Exception:
+        pass
+
+    # 4) Yahoo Finance Trending
+    try:
+        url4 = 'https://query1.finance.yahoo.com/v1/finance/trending/US?count=20'
+        req4 = urllib.request.Request(url4, headers={'User-Agent': 'scanner/3.0'})
+        with urllib.request.urlopen(req4, context=ctx, timeout=8) as r:
+            d4 = json.loads(r.read())
+        quotes = d4.get('finance', {}).get('result', [{}])[0].get('quotes', [])
+        for i, q in enumerate(quotes[:20]):
+            sym = q.get('symbol', '').split('.')[0].split('-')[0]
+            if sym and sym not in _SKIP_WORDS and len(sym) <= 5:
+                tickers[sym] = tickers.get(sym, 0) + max(1, 20-i) * 3
+                sources.setdefault(sym, set()).add('Yahoo-Trending')
+    except Exception:
+        pass
+
     sorted_tickers = sorted(tickers.items(), key=lambda x: -x[1])
-    top = [t for t, s in sorted_tickers if s >= 10][:12]
+    top = [t for t, s in sorted_tickers if s >= 8][:15]
     return top, {t: s for t, s in sorted_tickers if t in top}
 
 # Cached social data

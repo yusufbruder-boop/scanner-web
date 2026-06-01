@@ -609,8 +609,8 @@ def followup_api():
 @app.route('/social')
 def social_api():
     try:
-        from scanner import get_cached_social
-        tickers, scores = get_cached_social()
+        from scanner import get_social_trending
+        tickers, scores = get_social_trending()
         return jsonify({'tickers': tickers, 'scores': scores})
     except Exception as e:
         return jsonify({'error': str(e)})
