@@ -1222,16 +1222,20 @@ function renderTab2(data) {
         html += '<div style="padding:4px 14px 8px">';
         holdings.forEach(h => {
           let sc = h.since_pct || 0;
-          let scCol = sc >= 0 ? '#4dff91' : '#ff4d6b';
-          let actCol = h.action === 'REDUZIERT' ? '#ff4d6b' : h.action === 'GEHALTEN' ? '#94a3b8' : '#4dff91';
-          let actBg  = h.action === 'REDUZIERT' ? '#2a0a0a' : h.action === 'GEHALTEN' ? '#1a2a3a' : '#0a2a1a';
+          let isPut = (h.action||'').includes('PUT');
+          let isRed = h.action === 'REDUZIERT' || isPut;
+          let scCol = isPut ? (sc <= 0 ? '#4dff91' : '#ff4d6b') : (sc >= 0 ? '#4dff91' : '#ff4d6b');
+          let actCol = isRed ? '#ff4d6b' : h.action === 'GEHALTEN' ? '#94a3b8' : '#4dff91';
+          let actBg  = isRed ? '#2a0a0a' : h.action === 'GEHALTEN' ? '#1a2a3a' : '#0a2a1a';
           let pStr   = h.price_then > 0 ? ' $' + h.price_then + ' → $' + h.price_now : (h.price_now > 0 ? ' $' + h.price_now : '');
           let scStr  = sc !== 0 ? '<span style="color:' + scCol + ';font-weight:bold">' + (sc>=0?'+':'') + sc + '%</span>' : '';
+          let reasonStr = h.reason ? '<div style="font-size:10px;color:#475569;margin-top:1px">' + h.reason + '</div>' : '';
           html += '<div style="padding:5px 0;border-bottom:1px solid #0d1a28;display:flex;justify-content:space-between;align-items:center">'
             +   '<div>'
-            +     '<span style="font-size:14px;font-weight:bold;color:#e2e8f0">' + h.sym + '</span>'
+            +     '<span style="font-size:14px;font-weight:bold;color:' + (isPut?'#ff4d6b':'#e2e8f0') + '">' + h.sym + '</span>'
             +     ' <span style="font-size:10px;color:' + actCol + ';background:' + actBg + ';padding:1px 6px;border-radius:8px">' + h.action + '</span>'
             +     '<div style="font-size:11px;color:#64748b;margin-top:1px">' + pStr + '</div>'
+            +     reasonStr
             +   '</div>'
             +   '<div style="text-align:right">'
             +     '<div style="font-size:12px;color:#94a3b8">$' + h.val_m + 'M</div>'
@@ -1718,32 +1722,46 @@ def hermes_ai_analysis(scan_data: dict, hunt_alerts: list) -> str:
         hunt_lines  = [f"  {a['ticker']} Score:{a['score']} | {', '.join(str(x) for x in a.get('reasons',[])[:3])}" for a in hunts]
         mover_lines = [f"  {r['t']} ${r['price']} Score:{r['score']} P/C:{r.get('pc',0):.2f}" for r in movers]
 
-        prompt = f"""Du bist Hermes, ein AI Trading-Agent. Analysiere den gesamten Markt heute:
+        # Aschenbrenner Positionen für Context
+        asch_longs = ['NBIS','KEEL','CLSK','RIOT','BTDR','IREN','APLD']
+        asch_shorts = ['NVDA','AVGO','AMD','SMH','ORCL']
+        asch_in_scan_long  = [r for r in longs  + scan_data.get('watch',[]) if r['t'] in asch_longs]
+        asch_in_scan_short = [r for r in shorts + scan_data.get('watch',[]) if r['t'] in asch_shorts]
+        asch_long_str  = ', '.join(f"{r['t']} {r.get('prev_chg',0):+.1f}% Score:{r['score']}" for r in asch_in_scan_long[:5]) or 'nicht im Scan'
+        asch_short_str = ', '.join(f"{r['t']} {r.get('prev_chg',0):+.1f}% Score:{r['score']}" for r in asch_in_scan_short[:5]) or 'nicht im Scan'
 
-=== LONG SIGNALE ({len(longs)}) ===
+        prompt = f"""Du bist Hermes, ein professioneller AI Trading-Agent. Analysiere den Markt heute mit allen verfügbaren Daten:
+
+=== SITUATIONAL AWARENESS LP (Aschenbrenner 13F Q1 2026) ===
+LONG KI-Infrastruktur: NBIS(38%=$2.6B), KEEL, CLSK, RIOT, BTDR, IREN
+SHORT Semiconductors (PUT): SMH($2B), NVDA($1.57B), ORCL($1.07B), AVGO($1B), AMD($969M)
+→ Aschenbrenner Longs heute: {asch_long_str}
+→ Aschenbrenner Shorts heute: {asch_short_str}
+
+=== POLYGON SCANNER — LONG SIGNALE ({len(longs)}) ===
 {chr(10).join(long_lines) or '  keine'}
 
-=== SHORT SIGNALE ({len(shorts)}) ===
+=== POLYGON SCANNER — SHORT SIGNALE ({len(shorts)}) ===
 {chr(10).join(short_lines) or '  keine'}
 
 === NEXT MOVERS ({len(movers)}) ===
 {chr(10).join(mover_lines) or '  keine'}
 
-=== HERMES ENTDECKT ({len(hunts)}) ===
+=== HERMES HUNT — ÜBERSEHEN ({len(hunts)}) ===
 {chr(10).join(hunt_lines) or '  keine'}
 
-Erstelle eine Trading-Briefing auf Deutsch:
-1. MARKTLAGE: Bullish/Bearish/Neutral? Warum?
-2. TOP TRADE: Welches ist das beste Setup heute und warum?
-3. VERSTECKTES SIGNAL: Gibt es etwas Übersehenes das wichtig sein könnte?
-4. WARNUNG: Was sollte man heute vermeiden?
-5. ZUSAMMENFASSUNG: 1 Satz für den Tag.
+Trading-Briefing auf Deutsch:
+1. ASCHENBRENNER CHECK: Bestätigt Polygon heute seine Long- oder Short-These?
+2. TOP TRADE: Bestes Setup mit höchster Wahrscheinlichkeit (Polygon-Daten + Smart Money)
+3. NEXT MOVER: Welcher Ticker könnte heute noch 5-15% machen?
+4. WARNUNG: Was vermeiden? (besonders wenn Aschenbrenner dagegen positioniert ist)
+5. FAZIT: 1 klarer Satz.
 
-Max 200 Wörter, direkt und präzise."""
+Max 200 Wörter. Nur saubere Setups mit echten Polygon-Daten."""
 
         return _nous_call(
             prompt,
-            system='Du bist Hermes, ein professioneller AI Trading-Agent mit Zugang zu Options-Flow, Dark Pool und Marktdaten. Analysiere objektiv und präzise.',
+            system='Du bist Hermes, ein professioneller AI Trading-Agent. Du hast Zugang zu Polygon Options-Flow, Dark Pool, Smart Money Positionierung und dem kompletten Aschenbrenner 13F Portfolio. Analysiere nur mit echten Daten, keine Spekulationen.',
             max_tokens=500
         )
     except Exception:
@@ -1917,6 +1935,22 @@ def hermes_monitor():
                                     picks.append(r)
                                     memory_track_signal(r['t'], r['price'], r['signal'],
                                                         r['score'], r.get('hermes_reasons',[]))
+                            except Exception:
+                                pass
+
+                    # 6b) Aschenbrenner-Positionen gezielt scannen (nach picks=[])
+                    ASCH_LONGS  = ['NBIS','KEEL','CLSK','RIOT','BTDR','IREN','APLD']
+                    ASCH_SHORTS = ['NVDA','AVGO','AMD','SMH','ORCL']
+                    scan_map_t  = {r['t'] for r in data.get('longs',[]) + data.get('shorts',[]) + data.get('watch',[])}
+                    for sym in (ASCH_LONGS + ASCH_SHORTS)[:8]:  # max 8 um Zeit zu sparen
+                        if sym not in scan_map_t:
+                            try:
+                                r = scan_ticker(sym, today, exp_cutoff, news_cutoff)
+                                if r and r['score'] >= 3:
+                                    side = 'LONG' if sym in ASCH_LONGS else 'SHORT'
+                                    r['hermes_score']   = r['score']
+                                    r['hermes_reasons'] = [f'Aschenbrenner {side} ${["$2.6B","$450M","$380M","$320M","$180M","$150M","$120M","$2B","$1.57B","$1B","$969M","$1.07B"].pop(0) if ASCH_LONGS+ASCH_SHORTS else ""} Position']
+                                    picks.append(r)
                             except Exception:
                                 pass
 
