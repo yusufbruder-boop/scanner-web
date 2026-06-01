@@ -1034,13 +1034,32 @@ def status():
         'error':        state['error'],
     })
 
+def _to_json_safe(obj):
+    """Konvertiert numpy/pandas Typen → Python Standard-Typen für JSON."""
+    if isinstance(obj, dict):
+        return {k: _to_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_json_safe(v) for v in obj]
+    if isinstance(obj, bool):
+        return bool(obj)
+    try:
+        import numpy as np
+        if isinstance(obj, (np.integer,)):  return int(obj)
+        if isinstance(obj, (np.floating,)): return float(obj)
+        if isinstance(obj, (np.bool_,)):    return bool(obj)
+        if isinstance(obj, np.ndarray):     return obj.tolist()
+    except ImportError:
+        pass
+    if obj is None or isinstance(obj, (int, float, str)):
+        return obj
+    return str(obj)
+
 @app.route('/results')
 def results():
     try:
         data = state['results'] or load_results()
         if not data:
             return jsonify({'error': 'Noch kein Scan. Drücke SCAN STARTEN.'})
-        # Nur JSON-sichere Felder übergeben
         out = {
             'time':    data.get('time'),
             'today':   data.get('today'),
@@ -1061,9 +1080,9 @@ def results():
             out['hermes_alerts'] = state.get('hermes_alerts', [])
             out['hermes_ts']     = state.get('hermes_ts', '')
             out['hermes_ai']     = state.get('hermes_ai', '')
-        return jsonify(out)
+        return jsonify(_to_json_safe(out))
     except Exception as e:
-        return jsonify({'error': f'Server Fehler: {str(e)[:100]}'})
+        return jsonify({'error': f'Server Fehler: {str(e)[:120]}'})
 
 @app.route('/followup')
 def followup_api():
