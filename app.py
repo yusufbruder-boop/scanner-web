@@ -551,11 +551,19 @@ HTML = '''<!DOCTYPE html>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { background: #0a0e1a; color: #e0e6f0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
-.header { background: linear-gradient(135deg, #1a2540 0%, #0d1628 100%); padding: 14px 16px 10px; border-bottom: 1px solid #1e3a5f; position: sticky; top: 0; z-index: 100; }
-.header h1 { font-size: 18px; color: #4db8ff; letter-spacing: 1px; display:inline; }
+.header { background: linear-gradient(135deg, #1a2540 0%, #0d1628 100%); padding: 12px 16px 0; border-bottom: 1px solid #1e3a5f; position: sticky; top: 0; z-index: 100; }
+.header-top { display:flex; align-items:center; justify-content:space-between; padding-bottom:8px; }
+.header h1 { font-size: 17px; color: #4db8ff; letter-spacing: 1px; display:inline; }
 .live-dot { display:inline-block; width:8px; height:8px; background:#4dff91; border-radius:50%; margin-left:8px; animation: pulse 2s infinite; vertical-align:middle; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
-.header-info { font-size: 11px; color: #6b8cad; margin-top: 5px; display:flex; gap:12px; flex-wrap:wrap; }
+.header-info { font-size: 11px; color: #6b8cad; display:flex; gap:12px; flex-wrap:wrap; padding-bottom:8px; }
+/* Tabs */
+.tabs { display:flex; border-top:1px solid #1e3a5f; }
+.tab-btn { flex:1; padding:9px 0; font-size:12px; font-weight:700; letter-spacing:1px; border:none; background:transparent; cursor:pointer; color:#4a6a8a; border-bottom:2px solid transparent; transition:all 0.2s; }
+.tab-btn.active { color:#4db8ff; border-bottom-color:#4db8ff; background:rgba(77,184,255,0.06); }
+.tab-btn.intel.active { color:#b070ff; border-bottom-color:#b070ff; background:rgba(176,112,255,0.06); }
+.tab-pane { display:none; }
+.tab-pane.active { display:block; }
 .scan-btn { display: block; width: calc(100% - 32px); margin: 14px 16px 0; padding: 13px; background: linear-gradient(135deg, #1a6b3c, #0d4a28); color: #4dff91; font-size: 15px; font-weight: bold; border: 1px solid #2d9e57; border-radius: 10px; cursor: pointer; text-align: center; letter-spacing: 1px; }
 .scan-btn:disabled { background: #1a2540; color: #4a6a8a; border-color: #2a3a5a; cursor:default; }
 .refresh-bar { display:flex; align-items:center; gap:8px; margin: 8px 16px 0; font-size:11px; color:#4a6a8a; }
@@ -612,13 +620,20 @@ body { background: #0a0e1a; color: #e0e6f0; font-family: -apple-system, BlinkMac
 <body>
 
 <div class="header">
-  <h1>OPTIONS SCANNER</h1><span class="live-dot" id="liveDot"></span>
-  <div class="header-info">
-    <span id="lastScanInfo">Lade...</span>
-    <span id="nextScanInfo"></span>
+  <div class="header-top">
+    <div><h1>OPTIONS SCANNER</h1><span class="live-dot" id="liveDot"></span></div>
+    <div class="header-info" style="margin:0">
+      <span id="lastScanInfo">Lade...</span>
+      <span id="nextScanInfo"></span>
+    </div>
+  </div>
+  <div class="tabs">
+    <button class="tab-btn active"      id="tab1Btn" onclick="showTab(1)">📊 SCANNER</button>
+    <button class="tab-btn intel"       id="tab2Btn" onclick="showTab(2)">🔍 INTEL</button>
   </div>
 </div>
 
+<div id="tab1">
 <button class="scan-btn" id="scanBtn" onclick="startScan()">SCAN STARTEN</button>
 
 <div class="refresh-bar">
@@ -632,9 +647,17 @@ body { background: #0a0e1a; color: #e0e6f0; font-family: -apple-system, BlinkMac
 </div>
 
 <div id="content">
-  <div class="empty">Klicke <b>SCAN STARTEN</b> oder warte auf den täglichen Auto-Scan.<br><br>
-  Der Scanner startet automatisch täglich um <b>09:30 Uhr ET</b>.<br>
-  Ergebnisse erscheinen automatisch auf dieser Seite.</div>
+  <div class="empty">Klicke <b>SCAN STARTEN</b> oder warte auf den täglichen Auto-Scan (09:30 ET).</div>
+</div>
+</div><!-- end tab1 -->
+
+<div id="tab2" style="display:none">
+  <div id="intel-content">
+    <div class="empty" style="padding:20px 16px">
+      Intel-Daten werden nach dem Scan geladen...<br>
+      <span style="color:#4a6a8a;font-size:12px">Reddit/Stocktwits KI-Score, Hedge Fund 13F, Leopold Aschenbrenner</span>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -809,7 +832,11 @@ function renderResults(data, isNew) {
     html += '</div></div>';
   }
 
-  // ══════════ EXTRA DATEN — am Ende ══════════════════════════════════════════
+  return html;
+}
+
+function renderTab2(data) {
+  let html = '';
 
   // ── Reddit / Social Trending — KI Score + Heute % + Trend-Grund ────────────
   const socialData = data.social_data || [];
@@ -954,6 +981,18 @@ function renderResults(data, isNew) {
   return html;
 }
 
+// Tab-Steuerung
+let _lastData = null;
+function showTab(n) {
+  document.getElementById('tab1').style.display = n === 1 ? 'block' : 'none';
+  document.getElementById('tab2').style.display = n === 2 ? 'block' : 'none';
+  document.getElementById('tab1Btn').classList.toggle('active', n === 1);
+  document.getElementById('tab2Btn').classList.toggle('active', n === 2);
+  if (n === 2 && _lastData) {
+    document.getElementById('intel-content').innerHTML = renderTab2(_lastData) || '<div class="empty">Wird nach Scan geladen...</div>';
+  }
+}
+
 function startScan() {
   fetch('/start', {method:'POST'}).then(r => r.json()).then(d => {
     if (d.ok) {
@@ -1010,7 +1049,13 @@ function loadResults(isNew) {
       return;
     }
     lastHash = data.time;
+    _lastData = data;
+    // Tab 1: Scanner
     document.getElementById('content').innerHTML = renderResults(data, isNew);
+    // Tab 2: Intel (nur wenn aktiv)
+    if (document.getElementById('tab2').style.display !== 'none') {
+      document.getElementById('intel-content').innerHTML = renderTab2(data) || '<div class="empty">Keine Intel-Daten.</div>';
+    }
   });
 }
 
