@@ -41,9 +41,11 @@ state = {
 _hermes_lock = threading.Lock()
 _scan_lock   = threading.Lock()   # verhindert gleichzeitige Scans
 
-# Follow-up: 10:00 ET = 14:00 UTC täglich
+# Follow-up: 10:00 ET (14:00 UTC) + 22:00 CET (21:00 UTC) — Tagesabschluss
 FOLLOWUP_UTC_HOUR   = 14
 FOLLOWUP_UTC_MINUTE = 0
+FOLLOWUP2_UTC_HOUR  = 21   # 22:00 CET / 17:00 ET — Marktschluss Report
+FOLLOWUP2_UTC_MINUTE = 0
 
 # ── Hilfsfunktionen ──────────────────────────────────────────────────────────
 
@@ -477,6 +479,31 @@ def run_followup():
     shorts = data.get('shorts', [])[:5]
     followup_results = {'longs': [], 'shorts': [], 'time': datetime.now().strftime('%H:%M')}
 
+    INVEST = 100   # $100 Basis-Investment
+
+    def _calc_pnl(chg_pct, won, mult_str, best, signal):
+        """Berechnet P&L bei $100 Investition in die empfohlene Option."""
+        try:
+            opt_pr = float((best or {}).get('pr') or 0)
+            if opt_pr <= 0:
+                return 0, 0
+            # Multiplier aus Scan (z.B. "5x" → 5)
+            mult = float(mult_str.replace('x','')) if mult_str and mult_str != 'None' else 3.0
+            if won:
+                # Ziel erreicht → Gewinn = mult * Investment
+                profit = round(INVEST * mult, 0)
+                total  = INVEST + profit
+            else:
+                # Ziel nicht erreicht → Option verliert proportional zum Stock-Move
+                # Grobe Schätzung: Option bewegt sich 3x der Aktie
+                opt_chg = chg_pct * 3
+                opt_chg = max(-90, min(opt_chg, 200))  # realistisch begrenzen
+                profit = round(INVEST * opt_chg / 100, 0)
+                total  = INVEST + profit
+            return round(profit, 0), round(total, 0)
+        except Exception:
+            return 0, INVEST
+
     for r in longs:
         try:
             current = _poly_current_price(r['t'])
@@ -485,9 +512,11 @@ def run_followup():
                 ziel    = r.get('ziel') or (entry * 1.02)
                 chg_pct = (current - entry) / entry * 100
                 won     = current >= ziel
+                profit, total = _calc_pnl(chg_pct, won, r.get('mult'), r.get('best'), 'LONG')
                 followup_results['longs'].append({'t': r['t'], 'signal': 'LONG', 'entry': entry,
                     'current': round(current, 2), 'ziel': round(ziel, 2),
-                    'chg_pct': round(chg_pct, 1), 'won': bool(won)})
+                    'chg_pct': round(chg_pct, 1), 'won': bool(won),
+                    'invest': INVEST, 'profit': profit, 'total': total})
         except Exception:
             pass
 
@@ -499,9 +528,11 @@ def run_followup():
                 ziel    = r.get('ziel') or (entry * 0.98)
                 chg_pct = (current - entry) / entry * 100
                 won     = current <= ziel
+                profit, total = _calc_pnl(-chg_pct, won, r.get('mult'), r.get('best'), 'SHORT')
                 followup_results['shorts'].append({'t': r['t'], 'signal': 'SHORT', 'entry': entry,
                     'current': round(current, 2), 'ziel': round(ziel, 2),
-                    'chg_pct': round(chg_pct, 1), 'won': bool(won)})
+                    'chg_pct': round(chg_pct, 1), 'won': bool(won),
+                    'invest': INVEST, 'profit': profit, 'total': total})
         except Exception:
             pass
 
@@ -509,46 +540,44 @@ def run_followup():
     state['followup_date'] = today
 
     # Telegram Report
-    lines = [f'<b>📊 10:00 SIGNAL CHECK — {today}</b>\n']
+    label = state.get('followup_label', '10:00')
+    lines = [f'<b>📊 {label} SIGNAL REPORT — {today}</b>\n']
     all_res = followup_results['longs'] + followup_results['shorts']
     winners = sum(1 for r in all_res if r['won'])
     losers  = len(all_res) - winners
-    lines.append(f'✅ Gewinner: {winners} | ❌ Verlierer: {losers}\n')
+    lines.append(f'{"✅" if winners > losers else "❌"} Gewinner: {winners} | Verlierer: {losers}\n')
     for r in all_res:
         icon = '✅' if r['won'] else '❌'
         lines.append(f'{icon} <b>{r["t"]}</b> {r["signal"]}: {r["chg_pct"]:+.1f}% '
-                     f'(Entry: ${r["entry"]} → Jetzt: ${r["current"]} | Ziel: ${r["ziel"]})')
+                     f'(Entry: ${r["entry"]} → ${r["current"]} | Ziel: ${r["ziel"]})')
     tg_send('\n'.join(lines))
 
-# ── Auto-Scheduler: jeden Tag 09:30 ET ───────────────────────────────────────
+# ── Auto-Scheduler: Scan 09:30 ET + Report 10:00 ET + Report 22:00 CET ──────
 
 def auto_scheduler():
     while True:
         now = datetime.now(timezone.utc)
-        # Nächsten Scan-Zeitpunkt berechnen
-        target_scan = now.replace(hour=AUTO_SCAN_UTC_HOUR, minute=AUTO_SCAN_UTC_MINUTE,
-                                  second=0, microsecond=0)
-        if target_scan <= now:
-            target_scan += timedelta(days=1)
-        # Nächsten Follow-up Zeitpunkt
-        target_fu = now.replace(hour=FOLLOWUP_UTC_HOUR, minute=FOLLOWUP_UTC_MINUTE,
-                                second=0, microsecond=0)
-        if target_fu <= now:
-            target_fu += timedelta(days=1)
-        # Das frühere Event abwarten
-        next_event = min(target_scan, target_fu)
+        targets = []
+        for h, m, label in [
+            (AUTO_SCAN_UTC_HOUR, AUTO_SCAN_UTC_MINUTE, 'scan'),
+            (FOLLOWUP_UTC_HOUR,  FOLLOWUP_UTC_MINUTE,  'followup_10'),
+            (FOLLOWUP2_UTC_HOUR, FOLLOWUP2_UTC_MINUTE, 'followup_22'),
+        ]:
+            t = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            if t <= now:
+                t += timedelta(days=1)
+            targets.append((t, label))
+        next_event, next_label = min(targets, key=lambda x: x[0])
         wait_sec = (next_event - now).total_seconds()
         state['next_scan'] = next_scan_time()
         time.sleep(max(wait_sec, 1))
         now2 = datetime.now(timezone.utc)
-        # Scan starten?
-        if not state['running'] and abs((now2 - target_scan).total_seconds()) < 120:
-            t = threading.Thread(target=run_scan_thread, kwargs={'trigger': 'auto'}, daemon=True)
-            t.start()
-        # Follow-up starten?
-        if abs((now2 - target_fu).total_seconds()) < 120:
-            tf = threading.Thread(target=run_followup, daemon=True)
-            tf.start()
+        if abs((now2 - next_event).total_seconds()) < 120:
+            if next_label == 'scan' and not state['running']:
+                threading.Thread(target=run_scan_thread, kwargs={'trigger': 'auto'}, daemon=True).start()
+            elif next_label in ('followup_10', 'followup_22'):
+                state['followup_label'] = '10:00 ET' if next_label == 'followup_10' else '22:00 CET'
+                threading.Thread(target=run_followup, daemon=True).start()
 
 # ── HTML ─────────────────────────────────────────────────────────────────────
 
@@ -835,18 +864,43 @@ function renderResults(data, isNew) {
     html += '</div>';
   }
 
-  // ── 10:00 Follow-up ──────────────────────────────────────────────────────
+  // ── Signal Report (10:00 ET + 22:00 CET) — $100 Investment Ergebnis ────────
   if (data.followup && (data.followup.longs || data.followup.shorts)) {
-    html += '<div class="section"><div class="section-title" style="color:#ffd700;border-left:3px solid #ffd700">📊 10:00 SIGNAL CHECK — Gewinner & Verlierer</div>';
-    html += '<div style="background:#111827;border:1px solid #2a2000;margin:8px;border-radius:10px;overflow:hidden">';
     let allFu = (data.followup.longs || []).concat(data.followup.shorts || []);
+    let totalProfit = allFu.reduce((s, f) => s + (f.profit || 0), 0);
+    let totalInvest = allFu.reduce((s, f) => s + (f.invest || 100), 0);
+    let winners = allFu.filter(f => f.won).length;
+    let pfCol = totalProfit >= 0 ? '#4dff91' : '#ff4d6b';
+    let pfSign = totalProfit >= 0 ? '+' : '';
+    let fuTime = (data.followup.time || '');
+    html += '<div class="section"><div class="section-title" style="color:#ffd700;border-left:3px solid #ffd700">📊 SIGNAL REPORT ' + fuTime + ' — Gewinner & Verlierer</div>';
+    // Zusammenfassung
+    html += '<div style="padding:10px 14px;background:#0d1628;display:flex;justify-content:space-between;align-items:center">'
+      + '<div style="font-size:13px;color:#94a3b8">'
+      +   winners + '/' + allFu.length + ' Ziele erreicht &nbsp;|&nbsp; '
+      +   '$' + totalInvest + ' investiert'
+      + '</div>'
+      + '<div style="font-size:18px;font-weight:bold;color:' + pfCol + '">'
+      +   pfSign + '$' + totalProfit + ' (' + pfSign + Math.round(totalProfit/totalInvest*100) + '%)'
+      + '</div>'
+      + '</div>';
+    html += '<div style="background:#111827;border-top:1px solid #2a2000;overflow:hidden">';
     allFu.forEach(f => {
-      let won = f.won;
-      let color = won ? '#4dff91' : '#ff4d6b';
+      let won   = f.won;
+      let col   = won ? '#4dff91' : '#ff4d6b';
       let icon  = won ? '✅' : '❌';
-      html += '<div style="padding:8px 14px;border-bottom:1px solid #1e2a3a;display:flex;justify-content:space-between">'
-        + '<span style="font-weight:bold;color:#fff">' + icon + ' ' + f.t + ' ' + f.signal + '</span>'
-        + '<span style="color:' + color + ';font-size:13px">' + (f.chg_pct >= 0 ? '+' : '') + f.chg_pct.toFixed(1) + '% (Ziel: ' + (f.won ? 'Erreicht' : 'Nicht erreicht') + ')</span>'
+      let prof  = f.profit || 0;
+      let tot   = f.total  || 100;
+      let psign = prof >= 0 ? '+' : '';
+      html += '<div style="padding:8px 14px;border-bottom:1px solid #1a2a3a;display:flex;justify-content:space-between;align-items:center">'
+        + '<div>'
+        +   '<span style="font-weight:bold;color:#fff;font-size:14px">' + icon + ' ' + f.t + '</span>'
+        +   ' <span style="font-size:11px;color:#94a3b8">' + f.signal + ' Entry:$' + f.entry + ' → $' + f.current + '</span>'
+        + '</div>'
+        + '<div style="text-align:right">'
+        +   '<div style="color:' + col + ';font-weight:bold;font-size:14px">' + psign + '$' + prof + '</div>'
+        +   '<div style="font-size:10px;color:#475569">$100 → $' + tot + '</div>'
+        + '</div>'
         + '</div>';
     });
     html += '</div></div>';
