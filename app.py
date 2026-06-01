@@ -1382,7 +1382,7 @@ Antworte auf Deutsch, max 3 Sätze:
 3. Was ist das Marktrisiko heute?"""
 
         body = json.dumps({
-            'model': 'hermes-3-llama-3.1-405b-fp8-128k',
+            'model': 'mistralai/mistral-small-2603',
             'messages': [
                 {'role': 'system', 'content': 'Du bist ein präziser Trading-Analyst. Antworte immer auf Deutsch, kurz und direkt.'},
                 {'role': 'user', 'content': prompt}
