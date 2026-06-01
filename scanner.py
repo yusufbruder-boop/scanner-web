@@ -719,7 +719,7 @@ def run_scan(progress_cb=None):
 
     # Social Trending für Universe-Erweiterung + Score-Boost (aus Cache — kein Fetch)
     social_tickers, _ = get_cached_social()
-    extra_social = [t for t in social_tickers if t not in UNIVERSE]
+    extra_social = [t for t in social_tickers if t not in UNIVERSE][:8]  # max 8 extra
     universe = list(UNIVERSE) + extra_social
 
     results = []
