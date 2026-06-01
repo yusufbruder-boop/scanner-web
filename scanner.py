@@ -1,10 +1,67 @@
-import urllib.request, json, ssl, time, threading, os
+import urllib.request, json, ssl, time, threading, os, re
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import yfinance as yf
 
 ctx = ssl.create_default_context()
 API = os.environ.get('POLYGON_API_KEY', '')
+
+# ── Social Trending (Reddit WSB + Stocktwits) ────────────────────────────────
+_TICKER_RE = re.compile(r'\b([A-Z]{2,5})\b')
+_SKIP_WORDS = {'THE','AND','FOR','ARE','YOU','NOT','BUT','HAS','WAS','ALL','CAN',
+               'GET','ITS','TOO','NEW','BUY','PUT','CALL','CEO','IPO','SEC','ETF',
+               'LOL','WSB','DD','YOLO','ATH','ATL','IMO','IMO','TBH','GBH'}
+
+def get_social_trending():
+    """Holt trending Tickers von Reddit WSB + Stocktwits."""
+    tickers = {}  # {sym: score}
+
+    # 1) Reddit WSB hot posts
+    try:
+        url = 'https://www.reddit.com/r/wallstreetbets/hot.json?limit=50'
+        req = urllib.request.Request(url, headers={'User-Agent': 'scanner/2.0'})
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+            data = json.loads(r.read())
+        posts = data.get('data', {}).get('children', [])
+        for post in posts:
+            d = post.get('data', {})
+            text = (d.get('title', '') + ' ' + d.get('selftext', ''))[:500]
+            score = d.get('score', 0)
+            upvote_ratio = d.get('upvote_ratio', 0.5)
+            for m in _TICKER_RE.findall(text):
+                if m not in _SKIP_WORDS and len(m) >= 2:
+                    tickers[m] = tickers.get(m, 0) + int(score * upvote_ratio / 100)
+    except Exception:
+        pass
+
+    # 2) Stocktwits trending
+    try:
+        url2 = 'https://api.stocktwits.com/api/2/trending/symbols.json'
+        req2 = urllib.request.Request(url2, headers={'User-Agent': 'scanner/2.0'})
+        with urllib.request.urlopen(req2, context=ctx, timeout=8) as r:
+            d2 = json.loads(r.read())
+        for sym_data in d2.get('symbols', []):
+            sym = sym_data.get('symbol', '')
+            if sym:
+                tickers[sym] = tickers.get(sym, 0) + 50
+    except Exception:
+        pass
+
+    # Top 10 nach Score, nur bekannte Aktien (Preis wird später geprüft)
+    sorted_tickers = sorted(tickers.items(), key=lambda x: -x[1])
+    top = [t for t, s in sorted_tickers if s >= 10][:12]
+    return top, {t: s for t, s in sorted_tickers if t in top}
+
+# Cached social data
+_social_cache = {'tickers': [], 'scores': {}, 'ts': 0}
+_social_lock  = threading.Lock()
+
+def get_cached_social():
+    with _social_lock:
+        if time.time() - _social_cache['ts'] > 1800:  # 30 Min Cache
+            tickers, scores = get_social_trending()
+            _social_cache.update({'tickers': tickers, 'scores': scores, 'ts': time.time()})
+        return _social_cache['tickers'], _social_cache['scores']
 
 UNIVERSE = [
     'NVDA','AMD','META','AAPL','MSFT','AMZN','GOOGL','TSLA','NFLX',
@@ -105,6 +162,7 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         news_data = poly_fetch(f'https://api.polygon.io/v2/reference/news?ticker={ticker}&limit=5&apiKey={API}')
         katalysator = 'KEIN'
         kat_text = ''
+        kat_url  = ''
         for n in news_data.get('results', []):
             if n.get('published_utc', '')[:10] < news_cutoff:
                 continue
@@ -115,11 +173,18 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
             if has_pos and sent in ('positive', 'neutral', ''):
                 katalysator = 'POSITIV'
                 kat_text = n.get('title', '')[:70]
+                kat_url  = n.get('article_url', '')
                 break
             elif has_neg or sent == 'negative':
                 if katalysator != 'POSITIV':
                     katalysator = 'NEGATIV'
                     kat_text = n.get('title', '')[:70]
+                    kat_url  = n.get('article_url', '')
+
+        # Social momentum score
+        _, social_scores = get_cached_social()
+        social_score = social_scores.get(ticker, 0)
+        social_boost = min(2, social_score // 50)  # max +2 für social buzz
 
         long_score = short_score = 0
         if pc < 0.3:    long_score  += 3
@@ -145,6 +210,9 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         if katalysator == 'NEGATIV': short_score += 4
         if cp > pp * 3: long_score  += 1
         if pp > cp * 2: short_score += 1
+        # Social boost: Reddit/Stocktwits Hype → extra LONG-Punkte (Momentum)
+        if social_boost > 0 and trend_pct > 0:
+            long_score += social_boost
 
         bc = best_option(calls, True,  price, today, exp_cutoff)
         bp = best_option(puts,  False, price, today, exp_cutoff)
@@ -175,7 +243,8 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
             'long_score': long_score, 'short_score': short_score,
             'katalysator': katalysator, 'kat_text': kat_text,
             'best': best, 'otype': otype, 'ziel': ziel, 'mult': mult,
-            'atr': round(atr, 2), 'today': today, 'conflict': conflict
+            'atr': round(atr, 2), 'today': today, 'conflict': conflict,
+            'kat_url': kat_url, 'social_score': social_score
         }
     except Exception as e:
         return None
@@ -186,8 +255,15 @@ def run_scan(progress_cb=None):
     exp_cutoff = (datetime.now() + timedelta(days=35)).strftime('%Y-%m-%d')
     news_cutoff= (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
 
+    # Social Trending vorab laden + dynamisch zur UNIVERSE hinzufügen
+    social_tickers, social_scores = get_cached_social()
+    extra_social = [t for t in social_tickers if t not in UNIVERSE]
+    universe = list(UNIVERSE) + extra_social
+    if extra_social:
+        print(f'  [Social] Trending hinzugefügt: {extra_social}')
+
     results = []
-    total = len(UNIVERSE)
+    total = len(universe)
     done  = [0]
     lock  = threading.Lock()
 
@@ -201,7 +277,7 @@ def run_scan(progress_cb=None):
         return r
 
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(scan_one, (i, t)): t for i, t in enumerate(UNIVERSE)}
+        futures = {ex.submit(scan_one, (i, t)): t for i, t in enumerate(universe)}
         for fut in as_completed(futures):
             r = fut.result()
             if r:
@@ -219,13 +295,18 @@ def run_scan(progress_cb=None):
                 movers.append(r)
     movers = sorted(movers, key=lambda x: (x['pc'], -x['long_score']))[:5]
 
+    # Social trending Symbole markieren
+    for r in results:
+        r['is_social'] = r['t'] in social_tickers
+
     return {
         'longs': longs[:10],
         'shorts': shorts[:10],
         'watch': watch,
         'movers': movers,
+        'social': social_tickers[:10],
         'scanned': len(results),
-        'total': total,
+        'total': len(universe),
         'time': datetime.now().strftime('%Y-%m-%d %H:%M'),
         'today': today
     }

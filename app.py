@@ -23,7 +23,13 @@ state = {
     'next_scan':      None,
     'error':          None,
     'last_results_hash': None,
+    'followup':       None,
+    'followup_date':  None,
 }
+
+# Follow-up: 10:00 ET = 14:00 UTC täglich
+FOLLOWUP_UTC_HOUR   = 14
+FOLLOWUP_UTC_MINUTE = 0
 
 # ── Hilfsfunktionen ──────────────────────────────────────────────────────────
 
@@ -117,21 +123,94 @@ def run_scan_thread(trigger='manual'):
         state['current_ticker'] = ''
         state['next_scan']      = next_scan_time()
 
+def run_followup():
+    """Prüft um 10:00 ET ob die Signale von heute ihr Ziel erreicht haben."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    if state['followup_date'] == today:
+        return  # Heute schon gemacht
+    data = state['results'] or load_results()
+    if not data or data.get('today') != today:
+        return  # Kein heutiger Scan
+
+    import yfinance as yf
+    longs  = data.get('longs', [])[:5]
+    shorts = data.get('shorts', [])[:5]
+    followup_results = {'longs': [], 'shorts': [], 'time': datetime.now().strftime('%H:%M')}
+
+    for r in longs:
+        try:
+            df = yf.download(r['t'], period='1d', interval='5m', progress=False, auto_adjust=True)
+            if df is not None and len(df) > 0:
+                current = float(df['Close'].iloc[-1])
+                entry   = r['price']
+                ziel    = r.get('ziel') or (entry * 1.02)
+                chg_pct = (current - entry) / entry * 100
+                won     = current >= ziel
+                followup_results['longs'].append({'t': r['t'], 'signal': 'LONG', 'entry': entry,
+                    'current': round(current, 2), 'ziel': round(ziel, 2),
+                    'chg_pct': round(chg_pct, 1), 'won': won})
+        except Exception:
+            pass
+
+    for r in shorts:
+        try:
+            df = yf.download(r['t'], period='1d', interval='5m', progress=False, auto_adjust=True)
+            if df is not None and len(df) > 0:
+                current = float(df['Close'].iloc[-1])
+                entry   = r['price']
+                ziel    = r.get('ziel') or (entry * 0.98)
+                chg_pct = (current - entry) / entry * 100
+                won     = current <= ziel
+                followup_results['shorts'].append({'t': r['t'], 'signal': 'SHORT', 'entry': entry,
+                    'current': round(current, 2), 'ziel': round(ziel, 2),
+                    'chg_pct': round(chg_pct, 1), 'won': won})
+        except Exception:
+            pass
+
+    state['followup']      = followup_results
+    state['followup_date'] = today
+
+    # Telegram Report
+    lines = [f'<b>📊 10:00 SIGNAL CHECK — {today}</b>\n']
+    all_res = followup_results['longs'] + followup_results['shorts']
+    winners = sum(1 for r in all_res if r['won'])
+    losers  = len(all_res) - winners
+    lines.append(f'✅ Gewinner: {winners} | ❌ Verlierer: {losers}\n')
+    for r in all_res:
+        icon = '✅' if r['won'] else '❌'
+        lines.append(f'{icon} <b>{r["t"]}</b> {r["signal"]}: {r["chg_pct"]:+.1f}% '
+                     f'(Entry: ${r["entry"]} → Jetzt: ${r["current"]} | Ziel: ${r["ziel"]})')
+    tg_send('\n'.join(lines))
+
 # ── Auto-Scheduler: jeden Tag 09:30 ET ───────────────────────────────────────
 
 def auto_scheduler():
     while True:
         now = datetime.now(timezone.utc)
-        target = now.replace(hour=AUTO_SCAN_UTC_HOUR, minute=AUTO_SCAN_UTC_MINUTE,
-                             second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        wait_sec = (target - now).total_seconds()
+        # Nächsten Scan-Zeitpunkt berechnen
+        target_scan = now.replace(hour=AUTO_SCAN_UTC_HOUR, minute=AUTO_SCAN_UTC_MINUTE,
+                                  second=0, microsecond=0)
+        if target_scan <= now:
+            target_scan += timedelta(days=1)
+        # Nächsten Follow-up Zeitpunkt
+        target_fu = now.replace(hour=FOLLOWUP_UTC_HOUR, minute=FOLLOWUP_UTC_MINUTE,
+                                second=0, microsecond=0)
+        if target_fu <= now:
+            target_fu += timedelta(days=1)
+        # Das frühere Event abwarten
+        next_event = min(target_scan, target_fu)
+        wait_sec = (next_event - now).total_seconds()
         state['next_scan'] = next_scan_time()
-        time.sleep(wait_sec)
-        if not state['running']:
+        time.sleep(max(wait_sec, 1))
+        now2 = datetime.now(timezone.utc)
+        # Scan starten?
+        if not state['running'] and abs((now2 - target_scan).total_seconds()) < 120:
             t = threading.Thread(target=run_scan_thread, kwargs={'trigger': 'auto'}, daemon=True)
             t.start()
+        # Follow-up starten?
+        if abs((now2 - target_fu).total_seconds()) < 120:
+            tf = threading.Thread(target=run_followup, daemon=True)
+            tf.start()
 
 # ── HTML ─────────────────────────────────────────────────────────────────────
 
@@ -263,15 +342,23 @@ function renderCard(r, cls, isNew) {
     ? '<span class="badge badge-kat">' + (r.katalysator === 'POSITIV' ? 'POSITIV NEWS' : 'NEGATIV NEWS') + '</span>' : '';
   let conflictBadge = r.conflict
     ? '<span class="badge" style="background:#3a2000;color:#ffa500;border:1px solid #a06000">⚠ PULLBACK</span>' : '';
+  let socialBadge = r.is_social || r.social_score > 20
+    ? '<span class="badge" style="background:#1a1a3a;color:#b070ff;border:1px solid #6040aa">🔥 REDDIT/X</span>' : '';
   let opt = b ? optionBox(b, r.otype || (cls === 'short' ? 'PUT' : 'CALL'), r.mult, r.today) : '';
-  let kat = r.kat_text ? '<div class="kat-text">' + r.kat_text + '</div>' : '';
+  // News mit Link
+  let kat = '';
+  if (r.kat_text) {
+    kat = r.kat_url
+      ? '<div class="kat-text"><a href="' + r.kat_url + '" target="_blank" style="color:#4db8ff;text-decoration:none">' + r.kat_text + ' ↗</a></div>'
+      : '<div class="kat-text">' + r.kat_text + '</div>';
+  }
   let flash = isNew ? ' new-flash' : '';
 
   return '<div class="card' + flash + '">'
     + '<div class="card-header">'
     +   '<div><span class="ticker">' + r.t + '</span>'
     +   '<span class="price ' + sigColor + '" style="margin-left:10px">$' + r.price + '</span></div>'
-    +   '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' + katBadge + conflictBadge
+    +   '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' + katBadge + conflictBadge + socialBadge
     +   '<span class="badge ' + badge + '">' + r.signal + (r.score > 0 ? ' ' + r.score : '') + '</span></div>'
     + '</div>'
     + '<div class="card-body">'
@@ -318,13 +405,46 @@ function renderResults(data, isNew) {
     newsItems.slice(0, 15).forEach(n => {
       let cls   = n.katalysator === 'POSITIV' ? 'news-pos' : 'news-neg';
       let label = n.katalysator === 'POSITIV' ? '▲ POSITIV' : '▼ NEGATIV';
+      let titleHtml = n.kat_url
+        ? '<a href="' + n.kat_url + '" target="_blank" style="color:#c0d4e8;text-decoration:none">' + n.kat_text + ' <span style="color:#4db8ff;font-size:10px">↗ LINK</span></a>'
+        : n.kat_text;
       html += '<div class="news-card">'
         + '<div class="news-ticker">' + n.t + ' &nbsp; ' + pct(n.trend) + '</div>'
-        + '<div class="news-title">'  + n.kat_text + '</div>'
+        + '<div class="news-title">'  + titleHtml + '</div>'
         + '<span class="news-kat ' + cls + '">' + label + '</span>'
         + '</div>';
     });
     html += '</div>';
+  }
+
+  // Social Trending
+  if (data.social && data.social.length > 0) {
+    html += '<div class="section"><div class="section-title" style="color:#b070ff;border-left:3px solid #b070ff">🔥 REDDIT/X TRENDING (' + data.social.length + ')</div>';
+    html += '<div style="background:#111827;border:1px solid #2a1a4a;margin:8px;border-radius:10px;padding:10px 14px;display:flex;flex-wrap:wrap;gap:8px">';
+    data.social.forEach(t => {
+      let inScan = (data.longs || []).concat(data.shorts || []).find(r => r.t === t);
+      let badge  = inScan ? (inScan.signal === 'LONG' ? ' style="background:#0d3a1f;color:#4dff91"' : ' style="background:#3a0d1a;color:#ff4d6b"') : '';
+      let sig    = inScan ? ' ' + inScan.signal : '';
+      html += '<span style="background:#1a1a3a;border:1px solid #4030aa;color:#b070ff;padding:4px 10px;border-radius:12px;font-size:12px;font-weight:bold"' + badge + '>' + t + sig + '</span>';
+    });
+    html += '</div></div>';
+  }
+
+  // 10:00 Follow-up
+  if (data.followup && (data.followup.longs || data.followup.shorts)) {
+    html += '<div class="section"><div class="section-title" style="color:#ffd700;border-left:3px solid #ffd700">📊 10:00 SIGNAL CHECK — Gewinner & Verlierer</div>';
+    html += '<div style="background:#111827;border:1px solid #2a2000;margin:8px;border-radius:10px;overflow:hidden">';
+    let allFu = (data.followup.longs || []).concat(data.followup.shorts || []);
+    allFu.forEach(f => {
+      let won = f.won;
+      let color = won ? '#4dff91' : '#ff4d6b';
+      let icon  = won ? '✅' : '❌';
+      html += '<div style="padding:8px 14px;border-bottom:1px solid #1e2a3a;display:flex;justify-content:space-between">'
+        + '<span style="font-weight:bold;color:#fff">' + icon + ' ' + f.t + ' ' + f.signal + '</span>'
+        + '<span style="color:' + color + ';font-size:13px">' + (f.chg_pct >= 0 ? '+' : '') + f.chg_pct.toFixed(1) + '% (Ziel: ' + (f.won ? 'Erreicht' : 'Nicht erreicht') + ')</span>'
+        + '</div>';
+    });
+    html += '</div></div>';
   }
 
   // Watch
@@ -476,7 +596,24 @@ def results():
     data = state['results'] or load_results()
     if not data:
         return jsonify({'error': 'Noch kein Scan. Drücke SCAN STARTEN.'})
+    # Follow-up aus Cache anhängen
+    if state.get('followup'):
+        data = dict(data)
+        data['followup'] = state['followup']
     return jsonify(data)
+
+@app.route('/followup')
+def followup_api():
+    return jsonify(state.get('followup') or {})
+
+@app.route('/social')
+def social_api():
+    try:
+        from scanner import get_cached_social
+        tickers, scores = get_cached_social()
+        return jsonify({'tickers': tickers, 'scores': scores})
+    except Exception as e:
+        return jsonify({'error': str(e)})
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 
