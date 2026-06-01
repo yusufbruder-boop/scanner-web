@@ -32,6 +32,7 @@ state = {
     'hermes_universe': set(),    # dynamisch erweiterte Tickers
     'hermes_ts':      None,
     'hermes_running': False,
+    'hermes_running_since': None,
     'hermes_ai':      '',
     # Background threads: Social KI-Score + HF 13F
     'social_data':    [],
@@ -1434,47 +1435,60 @@ Antworte auf Deutsch, max 3 Sätze:
 def hermes_monitor():
     """
     Hermes Agent — läuft 24/7, alle 5 Min.
-    Überwacht: Polygon Movers, Dark Pool, Options Sweep, News (Polygon+Alpaca),
-    Reddit Trends, Breaking News. Scannt starke Funde direkt. AI Analyse immer.
+    Selbst-heilend: repariert Scans, Social-Daten, stuck-Zustände automatisch.
+    Läuft unabhängig vom Scan-Status.
     """
-    time.sleep(60)
+    time.sleep(30)
     while True:
         try:
-            # ── AUTO-REPAIR: Hermes prüft und repariert ───────────────────────
-            if not state['running']:
-                # 1) Kein Scan oder Scan > 6h alt → Rescan
-                last = state.get('last_scan') or ''
-                needs_scan = False
-                if not last:
-                    needs_scan = True
-                else:
-                    try:
-                        from datetime import datetime as _ddt
-                        age_h = (datetime.now() - _ddt.strptime(last, '%Y-%m-%d %H:%M')).total_seconds() / 3600
-                        if age_h > 6:
-                            needs_scan = True
-                    except Exception:
-                        pass
-                if needs_scan and _scan_lock.acquire(blocking=False):
-                    _scan_lock.release()
-                    t = threading.Thread(target=run_scan_thread, kwargs={'trigger': 'hermes-repair'}, daemon=True)
-                    t.start()
-                    tg_send('🔧 <b>HERMES REPAIR</b>: Scan war veraltet/fehlend — neuer Scan gestartet')
-                    time.sleep(120)
-                    continue
-
-                # 2) Scan ok aber social_data/hf_data leer → enrich_background nochmal
-                data = state['results'] or load_results()
-                if data and not state.get('social_data') and not state.get('hf_data'):
-                    t2 = threading.Thread(target=enrich_background, args=(data,), daemon=True)
-                    t2.start()
-
-            if not state['running']:
-                data = state['results'] or load_results()
-                if data:
+            # ── WATCHDOG: stuck hermes_running → reset ────────────────────────
+            with _hermes_lock:
+                h_since = state.get('hermes_running_since')
+                h_running = state.get('hermes_running', False)
+            if h_running and h_since:
+                stuck_min = (datetime.now() - h_since).total_seconds() / 60
+                if stuck_min > 12:
                     with _hermes_lock:
-                        state['hermes_running'] = True
-                    try:
+                        state['hermes_running'] = False
+                        state['hermes_running_since'] = None
+                    tg_send('⚠️ <b>HERMES WATCHDOG</b>: stuck-Zustand zurückgesetzt')
+
+            # ── AUTO-REPAIR: Scan & Social ────────────────────────────────────
+            # 1) Kein Scan oder Scan > 6h alt → Rescan
+            last = state.get('last_scan') or ''
+            needs_scan = False
+            if not last:
+                needs_scan = True
+            else:
+                try:
+                    age_h = (datetime.now() - datetime.strptime(last, '%Y-%m-%d %H:%M')).total_seconds() / 3600
+                    if age_h > 6:
+                        needs_scan = True
+                except Exception:
+                    pass
+            if needs_scan and not state['running'] and _scan_lock.acquire(blocking=False):
+                _scan_lock.release()
+                t = threading.Thread(target=run_scan_thread, kwargs={'trigger': 'hermes-repair'}, daemon=True)
+                t.start()
+                tg_send('🔧 <b>HERMES REPAIR</b>: Scan war veraltet/fehlend — neuer Scan gestartet')
+                time.sleep(120)
+                continue
+
+            # 2) Social-Daten fehlen → enrich_background nochmal
+            data = state['results'] or load_results()
+            if data and not state.get('social_data') and not state.get('hf_data') and not state['running']:
+                t2 = threading.Thread(target=enrich_background, args=(data,), daemon=True)
+                t2.start()
+
+            # 3) Hermes Analyse — läuft auch wenn Scan parallel läuft (nutzt letzte Ergebnisse)
+            forced = state.pop('hermes_force', False)
+            with _hermes_lock:
+                already_running = state.get('hermes_running', False)
+            if (not already_running or forced) and data:
+                with _hermes_lock:
+                    state['hermes_running'] = True
+                    state['hermes_running_since'] = datetime.now()
+                try:
                         from scanner import hermes_hunt, scan_ticker, get_alpaca_market_news
 
                         # 1) Hermes Hunt — 24/7: Polygon Movers + Dark Pool + News
@@ -1543,6 +1557,7 @@ def hermes_monitor():
                     finally:
                         with _hermes_lock:
                             state['hermes_running'] = False
+                            state['hermes_running_since'] = None
 
                     prev_keys = {a['ticker'] for a in state.get('hermes_alerts', [])}
                     new_finds = [a for a in alerts if a['ticker'] not in prev_keys]
@@ -1584,6 +1599,20 @@ def hermes_monitor():
             time.sleep(300)   # immer 5 Min — 24/7
         except Exception:
             time.sleep(120)
+
+
+@app.route('/hermes/trigger', methods=['POST'])
+def hermes_trigger():
+    """Startet Hermes sofort — für Tests und Reparatur."""
+    with _hermes_lock:
+        already = state.get('hermes_running', False)
+    if already:
+        return jsonify({'ok': False, 'msg': 'Hermes läuft bereits'})
+    data = state['results'] or load_results()
+    if not data:
+        return jsonify({'ok': False, 'msg': 'Keine Scan-Ergebnisse vorhanden'})
+    state['hermes_force'] = True
+    return jsonify({'ok': True, 'msg': 'Hermes wird beim nächsten Tick gestartet (<30s)'})
 
 
 @app.route('/hermes/alerts')
