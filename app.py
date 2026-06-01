@@ -315,7 +315,7 @@ def enrich_background(scan_results: dict):
             except Exception:
                 pass
             try:
-                # 2) Aggregates → 7T Trend
+                # 2) Aggregates → 7T Trend + heute% Fallback
                 from_d = (datetime.now() - timedelta(days=12)).strftime('%Y-%m-%d')
                 to_d   = datetime.now().strftime('%Y-%m-%d')
                 agg_url = f'https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/day/{from_d}/{to_d}?adjusted=true&sort=asc&limit=12&apiKey={POLY2}'
@@ -326,6 +326,8 @@ def enrich_background(scan_results: dict):
                     if not price:
                         price = round(bars[-1], 2)
                     trend_7d = round((bars[-1] - bars[0]) / bars[0] * 100, 1)
+                    if today_chg == 0.0:   # Snapshot hat versagt → Fallback aus Aggregates
+                        today_chg = round((bars[-1] - bars[-2]) / bars[-2] * 100, 1) if bars[-2] else 0.0
             except Exception:
                 pass
             return round(price, 2), today_chg, trend_7d
@@ -1785,12 +1787,20 @@ def hermes_monitor():
                     from scanner import hermes_hunt, scan_ticker, get_alpaca_market_news
                     POLY_KEY = os.environ.get('POLYGON_API_KEY', '')
 
-                    # 1) Alpaca Portfolio — Positionen + P&L
-                    alpaca_data = get_alpaca_portfolio()
-                    state['alpaca_portfolio'] = alpaca_data
-
-                    # 2) Memory P&L Update — offene Signale aktualisieren
-                    mem = memory_update_pl(POLY_KEY)
+                    # 1) Alpaca Portfolio + Memory P&L — im Hintergrund (nicht blockieren)
+                    def _bg_alpaca_mem():
+                        try:
+                            state['alpaca_portfolio'] = get_alpaca_portfolio()
+                        except Exception:
+                            pass
+                        try:
+                            memory_update_pl(POLY_KEY)
+                            state['hermes_memory'] = load_memory()
+                        except Exception:
+                            pass
+                    threading.Thread(target=_bg_alpaca_mem, daemon=True).start()
+                    alpaca_data = state.get('alpaca_portfolio', {})
+                    mem = load_memory()
 
                     # 3) Hermes Hunt — Polygon Movers + Dark Pool + Options Sweep
                     alerts = hermes_hunt(
