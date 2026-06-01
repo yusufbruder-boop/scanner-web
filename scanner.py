@@ -1,7 +1,6 @@
 import urllib.request, json, ssl, time, threading, os, re
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import yfinance as yf
 
 ctx = ssl.create_default_context()
 API           = os.environ.get('POLYGON_API_KEY', '')
@@ -551,13 +550,20 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         # Options Sweep Detection
         sweep = get_options_sweep(res)
 
-        df = yf.download(ticker, period='20d', interval='1d', progress=False, auto_adjust=True)
-        if df is None or len(df) < 3:
+        # Polygon Aggregates — immer aktuelle Tages-OHLCV Daten (kein yfinance)
+        from_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+        to_date   = datetime.now().strftime('%Y-%m-%d')
+        agg = poly_fetch(
+            f'https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day'
+            f'/{from_date}/{to_date}?adjusted=true&sort=asc&limit=25&apiKey={API}'
+        )
+        bars = agg.get('results', [])
+        if not bars or len(bars) < 3:
             return None
-        closes = list(df['Close'].values.flatten().astype(float))
-        highs  = list(df['High'].values.flatten().astype(float))
-        lows_a = df['Low'].values.flatten().astype(float)
-        atr = max(highs[-i] - float(lows_a[-i]) for i in range(1, 4))
+        closes = [float(b['c']) for b in bars]
+        highs  = [float(b['h']) for b in bars]
+        lows   = [float(b['l']) for b in bars]
+        atr = max(highs[-i] - lows[-i] for i in range(1, 4))
         c10 = closes[-10:] if len(closes) >= 10 else closes
         trend_pct   = ((c10[-1] - c10[0]) / c10[0]) * 100
         c3 = closes[-3:]

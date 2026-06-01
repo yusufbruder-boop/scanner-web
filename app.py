@@ -166,20 +166,30 @@ def enrich_background(scan_results: dict):
         POLYGON_API = os.environ.get('POLYGON_API_KEY', '')
 
         def _yahoo_quote(sym):
-            """Aktueller Preis + heute % + 7T % via Yahoo Finance."""
+            """Aktueller Preis + heute% + 7T% via Polygon Snapshot + Aggregates."""
+            POLY2 = os.environ.get('POLYGON_API_KEY', '')
             try:
-                url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=10d'
-                req = _ur2.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with _ur2.urlopen(req, context=_ctx2, timeout=6) as r:
+                # Aktueller Kurs + Tagesveränderung via Polygon Snapshot
+                url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{sym}?apiKey={POLY2}'
+                req = _ur2.Request(url)
+                with _ur2.urlopen(req, context=_ctx2, timeout=8) as r:
                     d = _json2.loads(r.read())
-                meta   = d['chart']['result'][0]['meta']
-                closes = d['chart']['result'][0]['indicators']['quote'][0]['close']
-                closes = [c for c in closes if c is not None]
-                price    = round(meta.get('regularMarketPrice') or closes[-1], 2)
-                prev     = meta.get('previousClose') or closes[-2] if len(closes) >= 2 else price
-                today_chg = round((price - prev) / prev * 100, 1) if prev else 0
-                trend_7d  = round((closes[-1] - closes[0]) / closes[0] * 100, 1) if len(closes) >= 2 else 0
-                return price, today_chg, trend_7d
+                ticker_d = d.get('ticker', {})
+                day  = ticker_d.get('day', {})
+                prev = ticker_d.get('prevDay', {})
+                price     = float(day.get('c') or prev.get('c') or 0)
+                prev_c    = float(prev.get('c') or price)
+                today_chg = round((price - prev_c) / prev_c * 100, 1) if prev_c else 0
+                # 7T Trend via Polygon Aggregates
+                from_d = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
+                to_d   = datetime.now().strftime('%Y-%m-%d')
+                agg_url = f'https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/day/{from_d}/{to_d}?adjusted=true&sort=asc&limit=10&apiKey={POLY2}'
+                req2 = _ur2.Request(agg_url)
+                with _ur2.urlopen(req2, context=_ctx2, timeout=8) as r2:
+                    d2 = _json2.loads(r2.read())
+                bars = [b['c'] for b in d2.get('results', []) if b.get('c')]
+                trend_7d = round((bars[-1] - bars[0]) / bars[0] * 100, 1) if len(bars) >= 2 else 0
+                return round(price, 2), today_chg, trend_7d
             except Exception:
                 return 0.0, 0.0, 0.0
 
@@ -315,25 +325,25 @@ def enrich_background(scan_results: dict):
             return '2026-05-15'
 
         def _yahoo_price_change(sym, filing_date):
-            """Aktueller Kurs + % seit Filing-Datum."""
+            """Aktueller Kurs + % seit Filing-Datum via Polygon."""
+            POLY2 = os.environ.get('POLYGON_API_KEY', '')
             try:
-                url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=3mo'
-                req = _ur2.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with _ur2.urlopen(req, context=_ctx2, timeout=6) as r:
+                # Aktueller Kurs
+                url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{sym}?apiKey={POLY2}'
+                req = _ur2.Request(url)
+                with _ur2.urlopen(req, context=_ctx2, timeout=8) as r:
                     d = json.loads(r.read())
-                res  = d['chart']['result'][0]
-                meta = res['meta']
-                ts   = res.get('timestamp', [])
-                cls  = res['indicators']['quote'][0].get('close', [])
-                price_now = float(meta.get('regularMarketPrice') or 0)
-                # Kurs am Filing-Datum
-                from datetime import datetime as _dt
-                target_ts = int(_dt.strptime(filing_date, '%Y-%m-%d').timestamp())
-                price_then = 0.0
-                for i, t in enumerate(ts):
-                    if t and i < len(cls) and cls[i]:
-                        if abs(t - target_ts) < 86400 * 5:
-                            price_then = float(cls[i])
+                td = d.get('ticker', {})
+                price_now = float((td.get('day') or {}).get('c') or (td.get('prevDay') or {}).get('c') or 0)
+                # Kurs am Filing-Datum via Aggregates
+                from_d = filing_date
+                to_d   = (datetime.strptime(filing_date, '%Y-%m-%d') + timedelta(days=5)).strftime('%Y-%m-%d')
+                agg_url = f'https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/day/{from_d}/{to_d}?adjusted=true&sort=asc&limit=5&apiKey={POLY2}'
+                req2 = _ur2.Request(agg_url)
+                with _ur2.urlopen(req2, context=_ctx2, timeout=8) as r2:
+                    d2 = json.loads(r2.read())
+                bars = d2.get('results', [])
+                price_then = float(bars[0]['c']) if bars else 0.0
                 since = round((price_now - price_then) / price_then * 100, 1) if price_then > 0 else 0.0
                 return round(price_now, 2), round(price_then, 2), since
             except Exception:
@@ -446,38 +456,52 @@ def run_followup():
     if not data or data.get('today') != today:
         return  # Kein heutiger Scan
 
-    import yfinance as yf
+    # Polygon Snapshot — aktueller Kurs direkt aus Polygon (kein yfinance)
+    POLY = os.environ.get('POLYGON_API_KEY', '')
+    _ctx_fu = ssl.create_default_context()
+
+    def _poly_current_price(sym):
+        try:
+            url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{sym}?apiKey={POLY}'
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, context=_ctx_fu, timeout=8) as r:
+                d = json.loads(r.read())
+            day = d.get('ticker', {}).get('day', {})
+            prev = d.get('ticker', {}).get('prevDay', {})
+            price = float(day.get('c') or prev.get('c') or 0)
+            return price
+        except Exception:
+            return 0.0
+
     longs  = data.get('longs', [])[:5]
     shorts = data.get('shorts', [])[:5]
     followup_results = {'longs': [], 'shorts': [], 'time': datetime.now().strftime('%H:%M')}
 
     for r in longs:
         try:
-            df = yf.download(r['t'], period='1d', interval='5m', progress=False, auto_adjust=True)
-            if df is not None and len(df) > 0:
-                current = float(df['Close'].iloc[-1])
+            current = _poly_current_price(r['t'])
+            if current > 0:
                 entry   = r['price']
                 ziel    = r.get('ziel') or (entry * 1.02)
                 chg_pct = (current - entry) / entry * 100
                 won     = current >= ziel
                 followup_results['longs'].append({'t': r['t'], 'signal': 'LONG', 'entry': entry,
                     'current': round(current, 2), 'ziel': round(ziel, 2),
-                    'chg_pct': round(chg_pct, 1), 'won': won})
+                    'chg_pct': round(chg_pct, 1), 'won': bool(won)})
         except Exception:
             pass
 
     for r in shorts:
         try:
-            df = yf.download(r['t'], period='1d', interval='5m', progress=False, auto_adjust=True)
-            if df is not None and len(df) > 0:
-                current = float(df['Close'].iloc[-1])
+            current = _poly_current_price(r['t'])
+            if current > 0:
                 entry   = r['price']
                 ziel    = r.get('ziel') or (entry * 0.98)
                 chg_pct = (current - entry) / entry * 100
                 won     = current <= ziel
                 followup_results['shorts'].append({'t': r['t'], 'signal': 'SHORT', 'entry': entry,
                     'current': round(current, 2), 'ziel': round(ziel, 2),
-                    'chg_pct': round(chg_pct, 1), 'won': won})
+                    'chg_pct': round(chg_pct, 1), 'won': bool(won)})
         except Exception:
             pass
 
