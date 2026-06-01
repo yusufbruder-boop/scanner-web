@@ -16,6 +16,11 @@ ALPACA_KEY    = os.environ.get('ALPACA_KEY',    'PK5T6OU5ENWZQK5DVZ746MHHEF')
 ALPACA_SECRET = os.environ.get('ALPACA_SECRET', '3nngSp7NksYikEZvf5hLihWEBtFdnuG336KfeYvFb5D9')
 ALPACA_BASE   = 'https://paper-api.alpaca.markets'
 
+# Auto-Trading: Hermes handelt bei Score >= AUTO_TRADE_MIN_SCORE
+AUTO_TRADE_ENABLED   = os.environ.get('AUTO_TRADE', 'false').lower() == 'true'
+AUTO_TRADE_AMOUNT    = float(os.environ.get('AUTO_TRADE_AMOUNT', '300'))   # $ pro Trade
+AUTO_TRADE_MIN_SCORE = int(os.environ.get('AUTO_TRADE_MIN_SCORE', '10'))   # Mindest-Score
+
 # Auto-Scan: täglich 09:30 ET = 13:30 UTC (Sommer) / 14:30 UTC (Winter)
 AUTO_SCAN_UTC_HOUR   = 13
 AUTO_SCAN_UTC_MINUTE = 30
@@ -43,6 +48,8 @@ state = {
     'hermes_signal_evals': {},
     'alpaca_portfolio':    {},
     'hermes_memory':       {},
+    'auto_trade_enabled':  AUTO_TRADE_ENABLED,
+    'auto_trades':         [],
     # Background threads: Social KI-Score + HF 13F
     'social_data':    [],
     'hf_data':        [],
@@ -114,6 +121,94 @@ def alpaca_order(sym, qty, side, reason='hermes-signal'):
     ok = 'id' in result
     tg_send(f'🤖 <b>HERMES ORDER</b>: {side.upper()} {qty}x <b>{sym}</b> — {"✅ OK" if ok else "❌ " + str(result.get("message","?"))}')
     return result
+
+def _build_occ(sym, exp, strike, opt_type):
+    """OCC Options Symbol: META260605C00630000"""
+    try:
+        d = datetime.strptime(exp, '%Y-%m-%d')
+        exp_str = d.strftime('%y%m%d')
+        t = 'C' if opt_type.upper() == 'CALL' else 'P'
+        strike_str = f'{int(float(strike) * 1000):08d}'
+        return f'{sym}{exp_str}{t}{strike_str}'
+    except Exception:
+        return None
+
+def hermes_auto_trade(signal_result: dict):
+    """
+    Hermes handelt automatisch: NUR OPTIONS (CALL/PUT) bei Score >= AUTO_TRADE_MIN_SCORE.
+    Alpaca Paper — OCC Symbol aus Scanner best_option konstruiert.
+    """
+    if not state.get('auto_trade_enabled'):
+        return
+    sym    = signal_result.get('t', '')
+    price  = float(signal_result.get('price', 0))
+    signal = signal_result.get('signal', '')
+    score  = int(signal_result.get('score', 0))
+    best   = signal_result.get('best') or {}
+    otype  = signal_result.get('otype', '')
+
+    if score < AUTO_TRADE_MIN_SCORE or not sym or price <= 0:
+        return
+    if signal not in ('LONG', 'SHORT') or not best or not otype:
+        return
+
+    # Options-Daten aus Scanner
+    strike    = best.get('strike', 0)
+    exp       = best.get('exp', '')
+    opt_price = float(best.get('pr', 0))
+    if not strike or not exp or opt_price <= 0:
+        return
+
+    # OCC Symbol bauen
+    occ = _build_occ(sym, exp, strike, otype)
+    if not occ:
+        return
+
+    # Bereits heute gehandelt?
+    today = datetime.now().strftime('%Y-%m-%d')
+    mem = load_memory()
+    trade_key = f'{today}-{occ}'
+    if trade_key in mem.get('auto_trades_today', {}):
+        return
+
+    # Anzahl Kontrakte: AUTO_TRADE_AMOUNT / (opt_price * 100), mind. 1
+    contracts = max(1, int(AUTO_TRADE_AMOUNT / (opt_price * 100)))
+    cost = round(contracts * opt_price * 100, 2)
+
+    # Options Order auf Alpaca
+    body = {
+        'symbol':           occ,
+        'qty':              str(contracts),
+        'side':             'buy',           # Immer BUY (Call für Long, Put für Short)
+        'type':             'market',
+        'time_in_force':    'day',
+        'client_order_id':  f'hermes-{sym}-{int(time.time())}',
+    }
+    result = _alpaca('/v2/orders', method='POST', body=body)
+    ok = 'id' in result
+    err = '' if ok else result.get('message', str(result))[:80]
+
+    # In Memory + State speichern
+    trade_entry = {
+        'sym': sym, 'occ': occ, 'type': otype, 'contracts': contracts,
+        'strike': strike, 'exp': exp, 'entry_pr': opt_price,
+        'cost': cost, 'score': score, 'signal': signal,
+        'time': datetime.now().strftime('%H:%M'), 'date': today,
+        'ok': ok, 'error': err,
+    }
+    if 'auto_trades_today' not in mem:
+        mem['auto_trades_today'] = {}
+    mem['auto_trades_today'][trade_key] = trade_entry
+    save_memory(mem)
+    state['auto_trades'].append(trade_entry)
+
+    tg_send(
+        f'🎯 <b>HERMES AUTO-TRADE</b> {datetime.now().strftime("%H:%M")}\n'
+        f'{"✅" if ok else "❌"} {otype} <b>{sym}</b> ${strike} Exp:{exp}\n'
+        f'{contracts} Kontrakt(e) @ ${opt_price:.2f} = ${cost:.0f}\n'
+        f'Score:{score} | OCC:{occ}\n'
+        + (f'Fehler: {err}' if err else '')
+    )
 
 # ── Hermes Memory (persistent) ────────────────────────────────────────────────
 
@@ -801,9 +896,14 @@ body { background: #0a0e1a; color: #e0e6f0; font-family: -apple-system, BlinkMac
 <div class="header">
   <div class="header-top">
     <div><h1>OPTIONS SCANNER</h1><span class="live-dot" id="liveDot"></span></div>
-    <div id="hermes-badge" style="background:#0a2a1a;border:1px solid #2d9e57;border-radius:20px;padding:3px 10px;display:flex;align-items:center;gap:5px;font-size:11px;font-weight:700;color:#4dff91;cursor:default" title="Hermes Agent Status">
-      <span style="width:6px;height:6px;background:#4dff91;border-radius:50%;display:inline-block;animation:pulse 2s infinite"></span>
-      <span id="hermes-status-text">HERMES</span>
+    <div style="display:flex;gap:6px;align-items:center">
+      <div id="hermes-badge" style="background:#0a2a1a;border:1px solid #2d9e57;border-radius:20px;padding:3px 10px;display:flex;align-items:center;gap:5px;font-size:11px;font-weight:700;color:#4dff91;cursor:default" title="Hermes Agent Status">
+        <span style="width:6px;height:6px;background:#4dff91;border-radius:50%;display:inline-block;animation:pulse 2s infinite"></span>
+        <span id="hermes-status-text">HERMES</span>
+      </div>
+      <div id="autotrade-btn" onclick="toggleAutoTrade()" style="background:#0a1a2a;border:1px solid #1e3a5f;border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700;color:#4a6a8a;cursor:pointer" title="Auto-Trade ein/ausschalten">
+        🤖 AUTO AUS
+      </div>
     </div>
   </div>
   <div class="header-info" style="padding:0 0 6px">
@@ -1284,6 +1384,27 @@ function showTab(n) {
   if (n === 2 && _lastData) {
     document.getElementById('intel-content').innerHTML = renderTab2(_lastData) || '<div class="empty">Wird nach Scan geladen...</div>';
   }
+}
+
+let _autoTradeOn = false;
+function toggleAutoTrade() {
+  _autoTradeOn = !_autoTradeOn;
+  fetch('/hermes/autotrade', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({enabled: _autoTradeOn})})
+  .then(r => r.json()).then(d => {
+    let btn = document.getElementById('autotrade-btn');
+    if (d.enabled) {
+      btn.style.background = '#0a2a0a';
+      btn.style.borderColor = '#2d9e57';
+      btn.style.color = '#4dff91';
+      btn.textContent = '🤖 AUTO EIN $' + d.amount;
+    } else {
+      btn.style.background = '#0a1a2a';
+      btn.style.borderColor = '#1e3a5f';
+      btn.style.color = '#4a6a8a';
+      btn.textContent = '🤖 AUTO AUS';
+    }
+  });
 }
 
 function startScan() {
@@ -1957,7 +2078,22 @@ def hermes_monitor():
                                 pass
                     threading.Thread(target=_scan_asch, args=(picks,), daemon=True).start()
 
-                    # 7) Universe erweitern
+                    # 7) Auto-Trade — starke Signale direkt auf Alpaca als Options
+                    if state.get('auto_trade_enabled'):
+                        # Haupt-Scanner Signale
+                        for sig_r in data.get('longs', [])[:5] + data.get('shorts', [])[:3]:
+                            try:
+                                hermes_auto_trade(sig_r)
+                            except Exception:
+                                pass
+                        # Hermes Picks (eigene Funde)
+                        for sig_r in picks[:3]:
+                            try:
+                                hermes_auto_trade(sig_r)
+                            except Exception:
+                                pass
+
+                    # 7b) Universe erweitern
                     uni = state.get('hermes_universe', set())
                     state['hermes_universe'] = uni | {a['ticker'] for a in alerts if a['score'] >= 7}
 
@@ -2085,6 +2221,26 @@ def alpaca_portfolio_api():
 @app.route('/hermes/memory')
 def hermes_memory_api():
     return jsonify(load_memory())
+
+@app.route('/hermes/autotrade', methods=['POST'])
+def hermes_autotrade_toggle():
+    """Toggle Auto-Trading on/off."""
+    body = request.get_json(force=True) or {}
+    enabled = body.get('enabled', not state.get('auto_trade_enabled', False))
+    state['auto_trade_enabled'] = bool(enabled)
+    status = 'EIN' if enabled else 'AUS'
+    tg_send(f'🤖 <b>HERMES AUTO-TRADE {status}</b> — Score >= {AUTO_TRADE_MIN_SCORE}, ${AUTO_TRADE_AMOUNT} pro Trade')
+    return jsonify({'ok': True, 'enabled': enabled, 'min_score': AUTO_TRADE_MIN_SCORE, 'amount': AUTO_TRADE_AMOUNT})
+
+@app.route('/hermes/autotrade')
+def hermes_autotrade_status():
+    trades = state.get('auto_trades', [])
+    return jsonify({
+        'enabled':   state.get('auto_trade_enabled', False),
+        'min_score': AUTO_TRADE_MIN_SCORE,
+        'amount':    AUTO_TRADE_AMOUNT,
+        'trades':    trades[-20:],
+    })
 
 @app.route('/hermes/trigger', methods=['POST'])
 def hermes_trigger():
