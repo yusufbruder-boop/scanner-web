@@ -169,31 +169,29 @@ def enrich_background(scan_results: dict):
         _ctx2 = _ssl2.create_default_context()
         POLYGON_API = os.environ.get('POLYGON_API_KEY', '')
 
+        _CRYPTO = {'BTC', 'ETH', 'SOL', 'BTC.X', 'ETH.X', 'DOGE', 'XRP'}
+
         def _yahoo_quote(sym):
-            """Aktueller Preis + heute% + 7T% via Polygon Snapshot + Aggregates."""
+            """Preis + heute% + 7T% nur via Polygon Aggregates (stabiler als Snapshot)."""
+            if sym in _CRYPTO:
+                return 0.0, 0.0, 0.0
             POLY2 = os.environ.get('POLYGON_API_KEY', '')
+            if not POLY2:
+                return 0.0, 0.0, 0.0
             try:
-                # Aktueller Kurs + Tagesveränderung via Polygon Snapshot
-                url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{sym}?apiKey={POLY2}'
+                from_d = (datetime.now() - timedelta(days=12)).strftime('%Y-%m-%d')
+                to_d   = datetime.now().strftime('%Y-%m-%d')
+                url = f'https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/day/{from_d}/{to_d}?adjusted=true&sort=asc&limit=12&apiKey={POLY2}'
                 req = _ur2.Request(url)
                 with _ur2.urlopen(req, context=_ctx2, timeout=8) as r:
                     d = _json2.loads(r.read())
-                ticker_d = d.get('ticker', {})
-                day  = ticker_d.get('day', {})
-                prev = ticker_d.get('prevDay', {})
-                price     = float(day.get('c') or prev.get('c') or 0)
-                prev_c    = float(prev.get('c') or price)
-                today_chg = round((price - prev_c) / prev_c * 100, 1) if prev_c else 0
-                # 7T Trend via Polygon Aggregates
-                from_d = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
-                to_d   = datetime.now().strftime('%Y-%m-%d')
-                agg_url = f'https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/day/{from_d}/{to_d}?adjusted=true&sort=asc&limit=10&apiKey={POLY2}'
-                req2 = _ur2.Request(agg_url)
-                with _ur2.urlopen(req2, context=_ctx2, timeout=8) as r2:
-                    d2 = _json2.loads(r2.read())
-                bars = [b['c'] for b in d2.get('results', []) if b.get('c')]
-                trend_7d = round((bars[-1] - bars[0]) / bars[0] * 100, 1) if len(bars) >= 2 else 0
-                return round(price, 2), today_chg, trend_7d
+                bars = [b['c'] for b in d.get('results', []) if b.get('c')]
+                if len(bars) < 2:
+                    return 0.0, 0.0, 0.0
+                price     = round(bars[-1], 2)
+                today_chg = round((bars[-1] - bars[-2]) / bars[-2] * 100, 1) if bars[-2] else 0
+                trend_7d  = round((bars[-1] - bars[0])  / bars[0]  * 100, 1) if bars[0]  else 0
+                return price, today_chg, trend_7d
             except Exception:
                 return 0.0, 0.0, 0.0
 
@@ -1424,7 +1422,7 @@ def _nous_call(prompt: str, system: str = '', max_tokens: int = 500, temperature
             data=body,
             headers={'Authorization': f'Bearer {NOUS_KEY}', 'Content-Type': 'application/json'},
         )
-        with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=30) as r:
+        with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=20) as r:
             resp = json.loads(r.read())
         return resp['choices'][0]['message']['content'].strip()
     except Exception:
@@ -1660,10 +1658,10 @@ def hermes_monitor():
                     uni = state.get('hermes_universe', set())
                     state['hermes_universe'] = uni | {a['ticker'] for a in alerts if a['score'] >= 7}
 
-                    # 6) AI: Pro-Signal Tiefenbewertung (Top 5 Signale + Picks)
+                    # 6) AI: Pro-Signal Tiefenbewertung (Top 3 — mehr dauert zu lang)
                     signal_evals = {}
-                    top_signals = (data.get('longs',[])[:3] + data.get('shorts',[])[:2] + picks[:3])
-                    for sig_r in top_signals:
+                    top_signals = (data.get('longs',[])[:2] + data.get('shorts',[])[:1] + picks[:1])
+                    for sig_r in top_signals[:3]:
                         try:
                             ev = hermes_ai_signal_eval(sig_r)
                             if ev:
