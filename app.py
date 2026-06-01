@@ -8,6 +8,7 @@ app = Flask(__name__)
 
 RESULTS_FILE   = 'results.json'
 MEMORY_FILE    = 'hermes_memory.json'
+LEARNING_FILE  = 'hermes_learning.json'
 TG_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 TG_CHAT  = os.environ.get('TELEGRAM_CHAT',  '')
 
@@ -267,6 +268,219 @@ def memory_update_pl(poly_key):
     if changed:
         save_memory(mem)
     return mem
+
+# ── Hermes Self-Learning Engine ──────────────────────────────────────────────
+
+def load_learning():
+    """Lädt Hermes Lernparameter. Standard wenn nicht vorhanden."""
+    default = {
+        'weights': {
+            'vol_ratio_threshold': 3.0,   # ab wann Vol-Anomalie zählt
+            'vol_ratio_bonus':     2.0,   # Bonus-Multiplikator
+            'dp_threshold_m':      1.0,   # Dark Pool Minimum in Mio
+            'min_score_long':      4,     # Mindest-Score für LONG
+            'min_score_short':     4,     # Mindest-Score für SHORT
+            'earnings_bonus':      4,     # Bonus wenn Earnings erkannt
+            'small_cap_boost':     0,     # Boost für Aktien unter $50
+        },
+        'performance': {
+            'total_signals':   0,
+            'correct_long':    0,
+            'correct_short':   0,
+            'missed_moves':    0,
+            'win_rate':        0.0,
+        },
+        'missed_trades': [],    # was verpasst wurde
+        'hit_trades':    [],    # was korrekt war
+        'improvement_log': [],  # was geändert wurde und warum
+        'last_review':   None,
+    }
+    try:
+        if os.path.exists(LEARNING_FILE):
+            saved = json.load(open(LEARNING_FILE, encoding='utf-8'))
+            # Merge mit defaults (neue Keys übernehmen)
+            for k, v in default.items():
+                if k not in saved:
+                    saved[k] = v
+                elif isinstance(v, dict):
+                    for sk, sv in v.items():
+                        if sk not in saved[k]:
+                            saved[k][sk] = sv
+            return saved
+    except Exception:
+        pass
+    return default
+
+def save_learning(data):
+    try:
+        json.dump(data, open(LEARNING_FILE, 'w', encoding='utf-8'), indent=2)
+    except Exception:
+        pass
+
+def hermes_self_review(scan_data: dict, poly_key: str):
+    """
+    Tägliche Selbstanalyse: Vergleicht Hermes-Empfehlungen mit realem Markt.
+    Findet verpasste Moves, analysiert Muster, passt Gewichtung an.
+    Läuft täglich nach Marktschluss (20:00-20:30 UTC).
+    """
+    learn = load_learning()
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    if learn.get('last_review') == today:
+        return  # Heute schon gemacht
+
+    ctx = ssl.create_default_context()
+
+    # 1) Was hat der Scanner heute empfohlen?
+    recommended = {r['t']: r for r in
+                   scan_data.get('longs', []) + scan_data.get('shorts', []) +
+                   scan_data.get('movers', [])}
+
+    # 2) Was hat sich heute wirklich bewegt? (Polygon Gainers/Losers)
+    real_movers = {}
+    for direction in ['gainers', 'losers']:
+        try:
+            url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/{direction}?apiKey={poly_key}'
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+                d = json.loads(r.read())
+            for t in d.get('tickers', [])[:30]:
+                sym   = t.get('ticker', '')
+                day   = t.get('day', {})
+                prev  = t.get('prevDay', {})
+                price = float(day.get('c') or 0)
+                pc    = float(prev.get('c') or price or 1)
+                chg   = round((price - pc) / pc * 100, 1) if pc else 0
+                vol   = int(day.get('v') or 0)
+                pvol  = int(prev.get('v') or 1)
+                vol_r = round(vol / pvol, 1) if pvol else 0
+                if sym and abs(chg) >= 5 and price >= 5:
+                    real_movers[sym] = {'chg': chg, 'price': price, 'vol_ratio': vol_r}
+        except Exception:
+            pass
+
+    # 3) Hits: empfohlen UND bewegt
+    hits   = {s: d for s, d in real_movers.items() if s in recommended
+              and ((d['chg'] > 3 and recommended[s].get('signal') == 'LONG') or
+                   (d['chg'] < -3 and recommended[s].get('signal') == 'SHORT'))}
+
+    # 4) Misses: bewegt aber NICHT empfohlen (>8% und Volumen hoch)
+    misses = {s: d for s, d in real_movers.items()
+              if s not in recommended and abs(d['chg']) >= 8 and d.get('vol_ratio', 0) >= 3}
+
+    # 5) Was war das Muster bei Misses? → Polygon Daten holen
+    miss_patterns = []
+    for sym, data_m in list(misses.items())[:5]:
+        pattern = {'sym': sym, 'chg': data_m['chg'], 'vol_ratio': data_m['vol_ratio'],
+                   'had_dp': False, 'had_sweep': False, 'had_news': False,
+                   'price': data_m['price'], 'reason_missed': ''}
+        try:
+            # Dark Pool check
+            dp_url = f'https://api.polygon.io/v3/trades/{sym}?timestamp.gte={today}&limit=1000&apiKey={poly_key}'
+            with urllib.request.urlopen(urllib.request.Request(dp_url), context=ctx, timeout=6) as r:
+                dp_data = json.loads(r.read())
+            dp_trades = [t for t in dp_data.get('results', [])
+                        if t.get('conditions') and any(c in [20,29,37,41,80,81] for c in t['conditions'])]
+            dp_total = sum(t.get('size',0)*t.get('price',0) for t in dp_trades)
+            pattern['had_dp']  = dp_total >= 500_000
+            pattern['dp_m']    = round(dp_total/1e6, 1)
+        except Exception:
+            pass
+        try:
+            # News check
+            news_url = f'https://api.polygon.io/v2/reference/news?ticker={sym}&limit=3&apiKey={poly_key}'
+            with urllib.request.urlopen(urllib.request.Request(news_url), context=ctx, timeout=6) as r:
+                news_data = json.loads(r.read())
+            for n in news_data.get('results', []):
+                tl = n.get('title','').lower()
+                if any(k in tl for k in ['earnings','beat','guidance','raised','upgrade','deal','contract']):
+                    pattern['had_news'] = True
+                    pattern['news_title'] = n.get('title','')[:60]
+                    break
+        except Exception:
+            pass
+
+        # Warum verpasst?
+        reasons = []
+        if data_m['vol_ratio'] >= 5:
+            reasons.append(f'Vol {data_m["vol_ratio"]}x — hätte erkannt werden müssen')
+        if data_m['price'] < 50:
+            reasons.append(f'Preis ${data_m["price"]:.0f} — kleine Aktie ignoriert')
+        if pattern['had_news']:
+            reasons.append('Earnings/News Katalysator')
+        if not reasons:
+            reasons.append('Signal zu schwach bewertet')
+        pattern['reason_missed'] = ' | '.join(reasons)
+        miss_patterns.append(pattern)
+
+    # 6) Gewichtung automatisch anpassen
+    changes = []
+    w = learn['weights']
+
+    # Wenn viele Misses mit hohem Vol → Vol-Schwelle senken
+    high_vol_misses = [m for m in miss_patterns if m['vol_ratio'] >= 5]
+    if len(high_vol_misses) >= 2:
+        old = w['vol_ratio_threshold']
+        w['vol_ratio_threshold'] = max(2.0, old - 0.5)
+        changes.append(f'Vol-Schwelle: {old:.1f} → {w["vol_ratio_threshold"]:.1f} (wegen {len(high_vol_misses)} Vol-Anomalien verpasst)')
+
+    # Wenn Misses kleine Aktien waren → small_cap_boost erhöhen
+    small_misses = [m for m in miss_patterns if m['price'] < 50]
+    if len(small_misses) >= 2:
+        w['small_cap_boost'] = min(3, w.get('small_cap_boost', 0) + 1)
+        changes.append(f'Small-Cap Boost +{w["small_cap_boost"]} (${[round(m["price"]) for m in small_misses]} verpasst)')
+
+    # Wenn Misses Earnings hatten → Earnings-Bonus erhöhen
+    earnings_misses = [m for m in miss_patterns if m['had_news']]
+    if len(earnings_misses) >= 1:
+        w['earnings_bonus'] = min(6, w.get('earnings_bonus', 4) + 1)
+        changes.append(f'Earnings-Bonus +{w["earnings_bonus"]} (Katalysator-Moves verpasst)')
+
+    # Win-Rate berechnen
+    total = len(hits) + len(misses)
+    win_r = round(len(hits) / max(len(recommended), 1) * 100, 1)
+    learn['performance']['total_signals'] += len(recommended)
+    learn['performance']['correct_long']  += len([h for h,d in hits.items() if d['chg'] > 0])
+    learn['performance']['missed_moves']  += len(misses)
+    learn['performance']['win_rate']       = win_r
+
+    # 7) Ergebnisse speichern
+    learn['last_review'] = today
+    learn['missed_trades'] = (miss_patterns + learn.get('missed_trades', []))[:30]
+    learn['hit_trades']    = ([{'sym': s, 'chg': d['chg'], 'date': today}
+                                for s, d in hits.items()] + learn.get('hit_trades', []))[:50]
+    if changes:
+        learn['improvement_log'].insert(0, {
+            'date': today, 'changes': changes,
+            'misses': [m['sym'] for m in miss_patterns],
+            'hits': list(hits.keys()),
+            'win_rate': win_r,
+        })
+        learn['improvement_log'] = learn['improvement_log'][:30]
+    save_learning(learn)
+
+    # 8) Telegram Report
+    lines = [f'🧠 <b>HERMES SELBST-ANALYSE {today}</b>']
+    lines.append(f'Win-Rate: {win_r}% ({len(hits)}/{len(recommended)} Signale)')
+    if hits:
+        hit_str = ', '.join(f'{s} {d["chg"]:+.0f}%' for s,d in list(hits.items())[:4])
+        lines.append(f'✅ Richtig: {hit_str}')
+    if miss_patterns:
+        miss_str = ', '.join(f'{m["sym"]} {m["chg"]:+.0f}%' for m in miss_patterns[:4])
+        lines.append(f'❌ Verpasst: {miss_str}')
+    if changes:
+        lines.append(f'\n📈 Gelernt heute:')
+        for c in changes:
+            lines.append(f'  → {c}')
+    tg_send('\n'.join(lines))
+
+    return learn
+
+
+def get_learning_weights():
+    """Gibt aktuelle Lernparameter zurück."""
+    return load_learning().get('weights', {})
+
 
 # ── Hilfsfunktionen ──────────────────────────────────────────────────────────
 
@@ -1256,6 +1470,48 @@ function renderTab2(data) {
     html += '</div>';
   }
 
+  // ── Hermes Learning — Selbst-Optimierung ────────────────────────────────────
+  const lrn = data.hermes_learning || {};
+  const lw  = lrn.weights || {};
+  const lp  = lrn.performance || {};
+  const log = (lrn.improvement_log || []).slice(0,3);
+  const misses = (lrn.missed_trades || []).slice(0,5);
+  if (lw.vol_ratio_threshold || log.length > 0) {
+    html += '<div class="section"><div class="section-title" style="color:#ffa040;border-left:3px solid #ffa040">🧠 HERMES LEARNING — Selbst-Optimierung</div>';
+    html += '<div style="padding:8px 14px">';
+    // Aktuelle Gewichtung
+    html += '<div style="font-size:10px;color:#6b8cad;margin-bottom:6px">AKTUELLE PARAMETER:</div>';
+    html += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">';
+    if (lw.vol_ratio_threshold) html += '<span style="font-size:10px;background:#1a1200;border:1px solid #ffa04066;color:#ffa040;padding:2px 7px;border-radius:8px">Vol-Schwelle: ' + lw.vol_ratio_threshold + 'x</span>';
+    if (lw.earnings_bonus)      html += '<span style="font-size:10px;background:#1a1200;border:1px solid #ffa04066;color:#ffa040;padding:2px 7px;border-radius:8px">Earnings-Bonus: +' + lw.earnings_bonus + '</span>';
+    if (lw.small_cap_boost > 0) html += '<span style="font-size:10px;background:#1a1200;border:1px solid #ffa04066;color:#ffa040;padding:2px 7px;border-radius:8px">SmallCap-Boost: +' + lw.small_cap_boost + '</span>';
+    if (lp.win_rate)            html += '<span style="font-size:10px;background:#0a2a0a;border:1px solid #4dff9166;color:#4dff91;padding:2px 7px;border-radius:8px">Win-Rate: ' + lp.win_rate + '%</span>';
+    html += '</div>';
+    // Letzte Lernschritte
+    if (log.length > 0) {
+      html += '<div style="font-size:10px;color:#6b8cad;margin-bottom:4px">LETZTE VERBESSERUNGEN:</div>';
+      log.forEach(l => {
+        html += '<div style="font-size:10px;color:#c0d4e8;padding:3px 0;border-bottom:1px solid #1a2a3a">'
+          + '<span style="color:#ffa040">' + l.date + '</span> Win:' + l.win_rate + '% | '
+          + (l.changes||[]).slice(0,2).map(c => '→ ' + c).join(' | ')
+          + '</div>';
+      });
+    }
+    // Verpasste Trades
+    if (misses.length > 0) {
+      html += '<div style="font-size:10px;color:#6b8cad;margin:6px 0 4px">VERPASST (lernt daraus):</div>';
+      html += '<div style="display:flex;flex-wrap:wrap;gap:4px">';
+      misses.forEach(m => {
+        let col = m.chg > 0 ? '#4dff91' : '#ff4d6b';
+        html += '<span style="font-size:10px;background:#0a0e1a;border:1px solid #1e3a5f;color:' + col + ';padding:2px 6px;border-radius:6px">'
+          + m.sym + ' ' + (m.chg > 0 ? '+' : '') + m.chg + '%'
+          + '</span>';
+      });
+      html += '</div>';
+    }
+    html += '</div></div>';
+  }
+
   // ── Hermes Memory — Signal Tracking + P&L ───────────────────────────────────
   const mem = data.hermes_memory || {};
   const memSigs = Object.values(mem.signals || {}).filter(s => s.status === 'open').slice(0,8);
@@ -1645,6 +1901,7 @@ def results():
             out['alpaca_portfolio']    = state.get('alpaca_portfolio', {})
             out['hermes_memory']       = state.get('hermes_memory', {})
             out['hermes_24h']          = state.get('hermes_24h', [])
+            out['hermes_learning']     = load_learning()
         return jsonify(_to_json_safe(out))
     except Exception as e:
         return jsonify({'error': f'Server Fehler: {str(e)[:120]}'})
@@ -2140,9 +2397,19 @@ def hermes_monitor():
                     uni = state.get('hermes_universe', set())
                     state['hermes_universe'] = uni | {a['ticker'] for a in alerts if a['score'] >= 7}
 
-                    # 8) Marktschluss-Analyse (16:00-16:15 ET = 20:00-20:15 UTC)
+                    # 8) Marktschluss: Selbst-Analyse + Lernschleife (20:00-20:30 UTC = 16 ET)
                     now_utc = datetime.now(timezone.utc)
                     is_close = (now_utc.hour == 20 and now_utc.minute < 15)
+                    is_review = (now_utc.hour == 20 and 15 <= now_utc.minute < 30)
+
+                    # Self-Review: Hermes lernt aus Fehlern
+                    if is_review:
+                        def _bg_review():
+                            try:
+                                hermes_self_review(data, POLY_KEY)
+                            except Exception:
+                                pass
+                        threading.Thread(target=_bg_review, daemon=True).start()
                     close_analysis = ''
                     if is_close:
                         mem_sigs = list(mem.get('signals', {}).values())
@@ -2284,6 +2551,21 @@ def hermes_autotrade_status():
         'amount':    AUTO_TRADE_AMOUNT,
         'trades':    trades[-20:],
     })
+
+@app.route('/hermes/learning')
+def hermes_learning_api():
+    learn = load_learning()
+    return jsonify(learn)
+
+@app.route('/hermes/learning/review', methods=['POST'])
+def hermes_force_review():
+    """Startet Selbst-Analyse manuell."""
+    data = state['results'] or load_results()
+    if not data:
+        return jsonify({'ok': False, 'msg': 'Kein Scan vorhanden'})
+    POLY_KEY = os.environ.get('POLYGON_API_KEY', '')
+    threading.Thread(target=hermes_self_review, args=(data, POLY_KEY), daemon=True).start()
+    return jsonify({'ok': True, 'msg': 'Selbst-Analyse gestartet'})
 
 @app.route('/hermes/trigger', methods=['POST'])
 def hermes_trigger():

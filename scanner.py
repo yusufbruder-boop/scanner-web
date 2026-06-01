@@ -899,9 +899,33 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         reasons_long = []
         reasons_short = []
 
+        # Gelernte Gewichtungen laden (Hermes Self-Learning)
+        try:
+            import json as _lj, os as _lo
+            _lf = 'hermes_learning.json'
+            _lw = _lj.load(open(_lf)).get('weights', {}) if _lo.path.exists(_lf) else {}
+        except Exception:
+            _lw = {}
+        _vol_thresh    = float(_lw.get('vol_ratio_threshold', 3.0))
+        _earnings_bon  = int(_lw.get('earnings_bonus', 4))
+        _smallcap_bon  = int(_lw.get('small_cap_boost', 0))
+
+        # SmallCap Boost (gelernt: kleine Aktien nicht ignorieren)
+        if price < 50 and _smallcap_bon > 0:
+            long_score  += _smallcap_bon
+            short_score += _smallcap_bon
+
+        # Earnings-Erkennung mit gelerntem Bonus
+        has_earnings = any(k in (kat_text + al_news_text).lower()
+                          for k in ['earnings','beat','guidance','raised','revenue','results'])
+        if has_earnings:
+            long_score  += _earnings_bon
+            short_score += _earnings_bon
+            reasons_long.append(f'EARNINGS/KATALYSATOR (+{_earnings_bon} gelernt)')
+
         # ── TIER 1: Smart Money Signale (höchste Priorität) ──────────────────
 
-        # Vol/OI Anomalie (> 3x = institutionelle Positionierung)
+        # Vol/OI Anomalie mit gelernter Schwelle
         max_call_voi = sm['max_call_vol_oi']
         max_put_voi  = sm['max_put_vol_oi']
         if max_call_voi >= 10:
