@@ -16,7 +16,7 @@ AUTO_SCAN_UTC_MINUTE = 30
 state = {
     'running':        False,
     'progress':       0,
-    'progress_total': 39,
+    'progress_total': 0,
     'current_ticker': '',
     'results':        None,
     'last_scan':      None,
@@ -25,12 +25,18 @@ state = {
     'last_results_hash': None,
     'followup':       None,
     'followup_date':  None,
+    # Hermes Agent
     'hermes_alerts':  [],
     'hermes_ts':      None,
     'hermes_running': False,
     'hermes_ai':      '',
+    # Background threads: Social KI-Score + HF 13F
+    'social_data':    [],
+    'hf_data':        [],
+    'extra_ts':       None,
 }
 _hermes_lock = threading.Lock()
+_scan_lock   = threading.Lock()   # verhindert gleichzeitige Scans
 
 # Follow-up: 10:00 ET = 14:00 UTC täglich
 FOLLOWUP_UTC_HOUR   = 14
@@ -83,6 +89,8 @@ def next_scan_time():
 # ── Scan-Thread ───────────────────────────────────────────────────────────────
 
 def run_scan_thread(trigger='manual'):
+    if not _scan_lock.acquire(blocking=False):
+        return   # bereits ein Scan aktiv — sicher beenden
     from scanner import run_scan
     state['running'] = True
     state['error']   = None
@@ -119,6 +127,10 @@ def run_scan_thread(trigger='manual'):
                     lines.append(f'     CALL ${b.get("strike")} @ ${b.get("pr")}  {r.get("kat_text","")[:40]}')
 
         tg_send('\n'.join(lines))
+
+        # Social KI-Score + HF 13F im Hintergrund laden (blockiert nicht)
+        threading.Thread(target=enrich_background, args=(results,), daemon=True).start()
+
     except Exception as e:
         state['error'] = str(e)
         tg_send(f'Scanner Fehler: {e}')
@@ -127,6 +139,110 @@ def run_scan_thread(trigger='manual'):
         state['progress']       = 0
         state['current_ticker'] = ''
         state['next_scan']      = next_scan_time()
+        _scan_lock.release()
+
+def enrich_background(scan_results: dict):
+    """
+    Läuft nach dem Scan im Hintergrund:
+    - Social KI-Score berechnen (Reddit/Stocktwits + Scan-Daten)
+    - Hedge Fund 13F laden (SEC EDGAR)
+    - Influencer-Feeds (Leopold etc.)
+    Dauert 30-60s — blockiert NICHT den Haupt-Scan.
+    """
+    try:
+        from scanner import (get_cached_social, get_cached_influencers,
+                             get_alpaca_news, POS_KEYS, NEG_KEYS)
+        scan_map = {r['t']: r for r in
+                    scan_results.get('longs', []) +
+                    scan_results.get('shorts', []) +
+                    scan_results.get('watch', [])}
+
+        # ── Social KI-Score ──────────────────────────────────────────────────
+        social_raw, social_scores_map = get_cached_social()
+        social_data = []
+        for sym in social_raw[:12]:
+            src_sc = social_scores_map.get(sym, 0)
+            ki = min(30, int(src_sc / 3))
+            price = trend_7d = 0.0
+            pc_ratio = 1.0
+            news_kat = kat_text = ''
+            best_opt = signal = None
+
+            if sym in scan_map:
+                r = scan_map[sym]
+                price = r['price']; trend_7d = r['trend']
+                pc_ratio = r['pc']; news_kat = r['katalysator']
+                kat_text = r.get('kat_text', '')
+                best_opt = r.get('best'); signal = r['signal']
+                if r['pc'] < 0.3:  ki += 20
+                elif r['pc'] < 0.5: ki += 10
+                if trend_7d > 10: ki += 20
+                elif trend_7d > 5: ki += 10
+                elif trend_7d < -5: ki -= 10
+                if news_kat == 'POSITIV': ki += 20
+                if news_kat == 'NEGATIV': ki -= 10
+                dp_t = (r.get('dp') or {}).get('dp_total', 0) or 0
+                if dp_t >= 1_000_000: ki += 10
+            social_data.append({
+                'sym': sym, 'price': price, 'trend_7d': trend_7d,
+                'pc': round(pc_ratio, 3), 'ki_score': max(0, min(99, ki)),
+                'mentions': src_sc, 'news_kat': news_kat,
+                'kat_text': kat_text[:60], 'best': best_opt, 'signal': signal or '─',
+            })
+        social_data.sort(key=lambda x: -x['ki_score'])
+
+        # ── Hedge Fund 13F (SEC EDGAR) ────────────────────────────────────────
+        import urllib.request as _ur, ssl as _ssl
+        _ctx = _ssl.create_default_context()
+        HF_CIK = {
+            "Pershing Square (Ackman)": "0001336528",
+            "Duquesne (Druckenmiller)": "0001536411",
+            "Tiger Global":             "0001167483",
+            "Coatue Management":        "0001336119",
+            "Appaloosa (Tepper)":       "0001418814",
+        }
+        hf_data = []
+        for nm, cik in HF_CIK.items():
+            try:
+                pad = cik.lstrip('0').zfill(10)
+                req = _ur.Request(
+                    f'https://data.sec.gov/submissions/CIK{pad}.json',
+                    headers={'User-Agent': 'scanner/3.0 yusufbruder@gmail.com', 'Accept': 'application/json'})
+                with _ur.urlopen(req, context=_ctx, timeout=10) as r:
+                    d = json.loads(r.read())
+                fls = d.get('filings', {}).get('recent', {})
+                for i, frm in enumerate(fls.get('form', [])[:20]):
+                    if '13F' in frm:
+                        hf_data.append({
+                            'manager': nm, 'form': frm,
+                            'date': fls.get('filingDate', [''])[i],
+                            'url': f'https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=13F',
+                            'holdings': [],
+                        })
+                        break
+            except Exception:
+                pass
+            time.sleep(0.8)
+
+        # ── Influencer ────────────────────────────────────────────────────────
+        influencers = get_cached_influencers()
+
+        state['social_data'] = social_data
+        state['hf_data']     = hf_data
+        state['extra_ts']    = datetime.now().strftime('%H:%M')
+
+        # Results mit extra Daten updaten
+        if state['results']:
+            merged = dict(state['results'])
+            merged['social_data'] = social_data
+            merged['hf_data']     = hf_data
+            merged['influencers'] = influencers
+            state['results'] = merged
+            save_results(merged)
+
+    except Exception as e:
+        print(f'[enrich] Fehler: {e}')
+
 
 def run_followup():
     """Prüft um 10:00 ET ob die Signale von heute ihr Ziel erreicht haben."""

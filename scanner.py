@@ -707,27 +707,25 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
 
 
 def run_scan(progress_cb=None):
+    """
+    Haupt-Scan: NUR Polygon Options Daten.
+    Social-Scoring, HF, Influencer laufen in eigenen Background-Threads (app.py).
+    """
     today      = datetime.now().strftime('%Y-%m-%d')
     exp_cutoff = (datetime.now() + timedelta(days=35)).strftime('%Y-%m-%d')
     news_cutoff= (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
 
-    # Influencer-Signale parallel laden
-    influencers = get_cached_influencers()
-
-    # Social Trending vorab laden + dynamisch zur UNIVERSE hinzufügen
-    social_tickers, social_scores = get_cached_social()
+    # Social Trending für Universe-Erweiterung + Score-Boost (aus Cache — kein Fetch)
+    social_tickers, _ = get_cached_social()
     extra_social = [t for t in social_tickers if t not in UNIVERSE]
     universe = list(UNIVERSE) + extra_social
-    if extra_social:
-        print(f'  [Social] Trending hinzugefügt: {extra_social}')
 
     results = []
-    total = len(universe)
-    done  = [0]
-    lock  = threading.Lock()
+    total   = len(universe)
+    done    = [0]
+    lock    = threading.Lock()
 
-    def scan_one(args):
-        i, ticker = args
+    def scan_one(ticker):
         r = scan_ticker(ticker, today, exp_cutoff, news_cutoff)
         with lock:
             done[0] += 1
@@ -735,143 +733,37 @@ def run_scan(progress_cb=None):
                 progress_cb(done[0], total, ticker)
         return r
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(scan_one, (i, t)): t for i, t in enumerate(universe)}
-        for fut in as_completed(futures):
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs = [ex.submit(scan_one, t) for t in universe]
+        for fut in as_completed(futs):
             r = fut.result()
             if r:
                 results.append(r)
 
-    longs  = sorted([r for r in results if r['signal'] == 'LONG'],  key=lambda x: x['score'], reverse=True)
-    shorts = sorted([r for r in results if r['signal'] == 'SHORT'], key=lambda x: x['score'], reverse=True)
+    longs  = sorted([r for r in results if r['signal'] == 'LONG'],  key=lambda x: -x['score'])
+    shorts = sorted([r for r in results if r['signal'] == 'SHORT'], key=lambda x: -x['score'])
     watch  = [r for r in results if r['signal'] == 'WATCH']
 
-    # NEXT MOVER: Kleines Cap + Katalysator + billiger Call
-    movers = []
-    for r in watch + longs:
-        if r['price'] < 200 and r['pc'] < 0.45 and r['katalysator'] == 'POSITIV' and r.get('best'):
-            if r['best']['pr'] < 1.0:
-                movers.append(r)
-    movers = sorted(movers, key=lambda x: (x['pc'], -x['long_score']))[:5]
+    # NEXT MOVER: Kleines Cap + Katalysator + billiger Call (Hauptziel: 10%+ Mover)
+    movers = sorted(
+        [r for r in watch + longs
+         if r['price'] < 200 and r['pc'] < 0.45
+         and r['katalysator'] == 'POSITIV' and r.get('best')
+         and r['best']['pr'] < 1.0],
+        key=lambda x: (x['pc'], -x['long_score'])
+    )[:5]
 
-    # Social trending Symbole markieren
-    scan_map = {r['t']: r for r in results}
     for r in results:
         r['is_social'] = r['t'] in social_tickers
 
-    # ── Social mit KI-Score ───────────────────────────────────────────────────
-    def _score_social_ticker(sym, mentions, src_score):
-        """KI-Score für Social-Trending-Ticker: Options + Preis + Trend."""
-        ki = min(30, int(src_score / 3))      # Social-Basis (0-30)
-        price = trend_7d = 0.0
-        pc_ratio = 1.0
-        news_kat = 'KEIN'
-        kat_text = ''
-        best_opt = None
-        signal = '─'
-        # Wenn schon im Haupt-Scan: Daten direkt übernehmen
-        if sym in scan_map:
-            r = scan_map[sym]
-            price    = r['price']
-            trend_7d = r['trend']
-            pc_ratio = r['pc']
-            news_kat = r['katalysator']
-            kat_text = r['kat_text']
-            best_opt = r.get('best')
-            signal   = r['signal']
-            if r['pc'] < 0.3:  ki += 20
-            elif r['pc'] < 0.5: ki += 10
-            if trend_7d > 10:   ki += 20
-            elif trend_7d > 5:  ki += 10
-            elif trend_7d < -5: ki -= 10
-            if news_kat == 'POSITIV': ki += 20
-            if news_kat == 'NEGATIV': ki -= 10
-            dp_total = r.get('dp', {}).get('dp_total', 0) or 0
-            if dp_total >= 1_000_000: ki += 10
-        else:
-            try:
-                df = yf.download(sym, period='7d', interval='1d', progress=False, auto_adjust=True)
-                if df is not None and len(df) >= 2:
-                    cls = list(df['Close'].values.flatten().astype(float))
-                    price    = round(cls[-1], 2)
-                    trend_7d = round((cls[-1]-cls[0])/cls[0]*100, 1)
-                    if trend_7d > 10: ki += 20
-                    elif trend_7d > 5: ki += 10
-            except Exception:
-                pass
-        ki = max(0, min(99, ki))
-        return {
-            'sym':     sym,
-            'price':   price,
-            'trend_7d': trend_7d,
-            'pc':      round(pc_ratio, 3),
-            'ki_score': ki,
-            'mentions': mentions,
-            'source':  '',
-            'news_kat': news_kat,
-            'kat_text': kat_text[:60],
-            'best':    best_opt,
-            'signal':  signal,
-        }
-
-    social_raw, social_scores_map = get_cached_social()
-    social_data = []
-    for sym in social_raw[:12]:
-        sc = social_scores_map.get(sym, 0)
-        entry = _score_social_ticker(sym, sc, sc)
-        social_data.append(entry)
-    social_data.sort(key=lambda x: -x['ki_score'])
-
-    # ── Hedge Fund 13F (SEC EDGAR) ────────────────────────────────────────────
-    HF_CIK = {
-        "Pershing Square (Ackman)":  "0001336528",
-        "Duquesne (Druckenmiller)":  "0001536411",
-        "Tiger Global":              "0001167483",
-        "Coatue Management":         "0001336119",
-        "Appaloosa (Tepper)":        "0001418814",
-    }
-
-    def _fetch_hf_quick(name, cik):
-        try:
-            cik_pad = cik.lstrip('0').zfill(10)
-            url = f'https://data.sec.gov/submissions/CIK{cik_pad}.json'
-            req = urllib.request.Request(url, headers={
-                'User-Agent': 'scanner/3.0 yusufbruder@gmail.com', 'Accept': 'application/json'})
-            with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
-                d = json.loads(r.read())
-            filings = d.get('filings', {}).get('recent', {})
-            forms, dates, accnums = filings.get('form',[]), filings.get('filingDate',[]), filings.get('accessionNumber',[])
-            for i, form in enumerate(forms[:20]):
-                if '13F' in form:
-                    return {
-                        'manager': name,
-                        'form':    form,
-                        'date':    dates[i] if i < len(dates) else '',
-                        'url':     f'https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=13F&dateb=&owner=include&count=5',
-                        'holdings': [],
-                    }
-        except Exception:
-            pass
-        return None
-
-    hf_data = []
-    for nm, cik in HF_CIK.items():
-        entry = _fetch_hf_quick(nm, cik)
-        if entry:
-            hf_data.append(entry)
-        time.sleep(0.5)
-
     return {
-        'longs':      longs[:10],
-        'shorts':     shorts[:10],
-        'watch':      watch,
-        'movers':     movers,
-        'social':     social_tickers[:10],    # rückwärtskompatibel
-        'social_data': social_data,           # neu: mit KI-Score + Preis
-        'hf_data':    hf_data,               # neu: Hedge Fund Filings
-        'influencers': influencers,
-        'scanned':    len(results),
-        'total':      len(universe),
-        'time':       datetime.now().strftime('%Y-%m-%d %H:%M'),
-        'today':      today
+        'longs':    longs[:10],
+        'shorts':   shorts[:10],
+        'watch':    watch,
+        'movers':   movers,
+        'social':   social_tickers[:10],
+        'scanned':  len(results),
+        'total':    len(universe),
+        'time':     datetime.now().strftime('%Y-%m-%d %H:%M'),
+        'today':    today,
     }
