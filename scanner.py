@@ -564,7 +564,8 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         trend_pct   = ((c10[-1] - c10[0]) / c10[0]) * 100
         c3 = closes[-3:]
         short_trend = ((c3[-1] - c3[0]) / c3[0]) * 100
-        prev_chg    = ((closes[-1] - closes[-2]) / closes[-2]) * 100 if len(closes) >= 2 else 0
+        prev_close  = closes[-1]  # letzter daily bar = gestern's Close
+        prev_chg    = ((price - prev_close) / prev_close * 100) if prev_close else 0  # live vs gestern
         period_high = max(highs[-10:]) if len(highs) >= 10 else max(highs)
         drop_from_high = ((closes[-1] - period_high) / period_high) * 100
 
