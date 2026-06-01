@@ -1744,36 +1744,63 @@ def hermes_monitor():
                         state['hermes_running_since'] = None
                     tg_send('⚠️ <b>HERMES WATCHDOG</b>: stuck-Zustand zurückgesetzt')
 
-            # ── AUTO-REPAIR: Scan & Social ────────────────────────────────────
-            # 1) Kein Scan oder Scan > 6h alt → Rescan
+            # ── HERMES SCANNER KONTROLLE & SELF-HEALING ──────────────────────
+            data = state['results'] or load_results()
+            now  = datetime.now()
             last = state.get('last_scan') or ''
-            needs_scan = False
-            if not last:
-                needs_scan = True
-            else:
+            scan_age_h = 999
+            if last:
                 try:
-                    age_h = (datetime.now() - datetime.strptime(last, '%Y-%m-%d %H:%M')).total_seconds() / 3600
-                    if age_h > 6:
-                        needs_scan = True
+                    scan_age_h = (now - datetime.strptime(last, '%Y-%m-%d %H:%M')).total_seconds() / 3600
                 except Exception:
                     pass
-            if needs_scan and not state['running'] and _scan_lock.acquire(blocking=False):
-                _scan_lock.release()
-                t = threading.Thread(target=run_scan_thread, kwargs={'trigger': 'hermes-repair'}, daemon=True)
-                t.start()
-                tg_send('🔧 <b>HERMES REPAIR</b>: Scan war veraltet/fehlend — neuer Scan gestartet')
-                # Warte auf Scan-Ende (max 3 Min, dann nochmal prüfen)
-                for _ in range(18):
-                    time.sleep(10)
-                    if not state['running']:
-                        break
-                continue
 
-            # 2) Social-Daten fehlen → enrich_background nochmal
-            data = state['results'] or load_results()
-            if data and not state.get('social_data') and not state.get('hf_data') and not state['running']:
-                t2 = threading.Thread(target=enrich_background, args=(data,), daemon=True)
-                t2.start()
+            def _start_scan(reason):
+                if not state['running'] and _scan_lock.acquire(blocking=False):
+                    _scan_lock.release()
+                    threading.Thread(target=run_scan_thread,
+                                     kwargs={'trigger': f'hermes-{reason}'}, daemon=True).start()
+                    tg_send(f'🔧 <b>HERMES</b>: Scan gestartet — {reason}')
+                    return True
+                return False
+
+            # 1) Kein Scan vorhanden → sofort starten
+            if not data:
+                if _start_scan('kein-ergebnis'):
+                    for _ in range(24):
+                        time.sleep(10)
+                        if not state['running']: break
+                    continue
+
+            # 2) Scan-Fehler → neu starten
+            if state.get('error') and not state['running']:
+                state['error'] = None
+                if _start_scan('fehler-behoben'):
+                    for _ in range(24):
+                        time.sleep(10)
+                        if not state['running']: break
+                    continue
+
+            # 3) Scan zu alt (>6h) → neu starten
+            if scan_age_h > 6 and not state['running']:
+                if _start_scan(f'scan-{scan_age_h:.0f}h-alt'):
+                    for _ in range(24):
+                        time.sleep(10)
+                        if not state['running']: break
+                    continue
+
+            # 4) Scan hat 0 Ergebnisse (leer) → neu starten
+            if data and not state['running']:
+                if not data.get('longs') and not data.get('shorts') and not data.get('watch'):
+                    if _start_scan('leere-ergebnisse'):
+                        for _ in range(24):
+                            time.sleep(10)
+                            if not state['running']: break
+                        continue
+
+            # 5) Social-Daten fehlen → enrich neu starten
+            if data and not state.get('social_data') and not state['running']:
+                threading.Thread(target=enrich_background, args=(data,), daemon=True).start()
 
             # 3) Hermes Analyse — läuft auch wenn Scan parallel läuft (nutzt letzte Ergebnisse)
             forced = state.pop('hermes_force', False)
