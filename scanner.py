@@ -264,28 +264,24 @@ def get_alpaca_news(tickers: list, limit: int = 5) -> list:
         return []
 
 
-# ── Yahoo Finance Top Movers (kostenlos) ────────────────────────────────────
+# ── Polygon Top Movers (Gainers/Losers — 24/7) ───────────────────────────────
 def get_market_movers() -> list:
-    """Holt aktuelle Top-Mover von Yahoo Finance — Aktien die sich heute stark bewegen."""
+    """Polygon Gainers + Losers — direkt aus Polygon-Abo, läuft 24/7."""
     movers = []
-    urls = [
-        ('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&scrIds=day_gainers&count=20', 'Gainer'),
-        ('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&scrIds=day_losers&count=20',  'Loser'),
-        ('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&scrIds=most_actives&count=20','Active'),
-    ]
-    for url, label in urls:
+    for direction, label in [('gainers', 'Gainer'), ('losers', 'Loser')]:
         try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
-                d = json.loads(r.read())
-            quotes = d.get('finance', {}).get('result', [{}])[0].get('quotes', [])
-            for q in quotes[:10]:
-                sym = q.get('symbol', '').split('.')[0]
-                chg = q.get('regularMarketChangePercent', 0) or 0
-                price = q.get('regularMarketPrice', 0) or 0
-                vol   = q.get('regularMarketVolume', 0) or 0
-                if sym and 2 <= len(sym) <= 5 and abs(chg) >= 3:
-                    movers.append({'sym': sym, 'chg': round(chg, 1), 'price': round(price, 2),
+            url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/{direction}?apiKey={API}'
+            data = poly_fetch(url)
+            for t in data.get('tickers', [])[:15]:
+                sym  = t.get('ticker', '')
+                day  = t.get('day', {})
+                prev = t.get('prevDay', {})
+                price = float(day.get('c') or 0)
+                pc    = float(prev.get('c') or price)
+                chg   = round((price - pc) / pc * 100, 1) if pc else 0
+                vol   = int(day.get('v') or 0)
+                if sym and 2 <= len(sym) <= 5 and abs(chg) >= 2:
+                    movers.append({'sym': sym, 'chg': chg, 'price': round(price, 2),
                                    'vol': vol, 'label': label})
         except Exception:
             pass
