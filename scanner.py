@@ -165,8 +165,11 @@ UNIVERSE = [
     'SNOW','PANW','UBER','LYFT','RIVN','LCID','NIO','F','GM',
     'SHOP','SQ','PYPL','ROKU','SPOT','PINS','SNAP',
     'ENPH','SEDG','FSLR','NEE','HIMS','CELH','WOLF',
-    # Situational Awareness LP (Aschenbrenner) — echte Positionen aus 13D/13G
-    'NBIS','CRWV','BE',
+    # Situational Awareness LP (Aschenbrenner) — 13F Q1 2026
+    # LONG: KI-Infrastruktur + Mining
+    'NBIS','KEEL','CLSK','RIOT','BTDR','APLD','CRWV','BE',
+    # SHORT (PUT): Semiconductors
+    'SMH',
 ]
 
 POS_KEYS = ['contract','government','deal','partnership','upgrade','raised','beat',

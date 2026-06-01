@@ -517,38 +517,54 @@ def enrich_background(scan_results: dict):
                 pass
             time.sleep(0.5)
 
-        # ── Situational Awareness LP (Leopold Aschenbrenner) — echte SEC-Positionen ──
-        # Quellen: 13D/13G SEC-Filings (stock-world.de, 2026)
-        # NBIS: $2.6 Mrd (5.6% Anteil), CoreWeave, IREN, Bloom Energy, SanDisk
-        leo_positions = [
-            ('NBIS',  2600, 'NBIS — 5.6% Anteil ($2.6 Mrd) — größte Position'),
-            ('CRWV',   800, 'CoreWeave — KI-Rechenzentren'),
-            ('IREN',   400, 'IREN — Bitcoin/KI Datacenter'),
-            ('BE',     300, 'Bloom Energy — KI Energieversorgung'),
+        # ── Situational Awareness LP (L. Aschenbrenner) — 13F Q1 2026 (filed 18.05.2026) ──
+        # LONG: KI-Infrastruktur ("Electricity is the new oil")
+        # PUT: Semiconductors als Hedge/Short ($7.7 Mrd Notional)
+        leo_longs = [
+            ('NBIS',  2600, 'NBIS — 38% des Portfolios ($2.6 Mrd) — Kernposition'),
+            ('KEEL',   450, 'KEEL (ehem. BITF) — 19.88M Aktien — AI Datacenter'),
+            ('CLSK',   380, 'CleanSpark — 12.28M Aktien — Bitcoin/AI Mining'),
+            ('RIOT',   320, 'Riot Platforms — 11.50M Aktien'),
+            ('BTDR',   180, 'Bitdeer — 3.44M Aktien — AI Compute'),
+            ('IREN',   150, 'IREN — erhöht — AI Datacenter'),
+            ('APLD',   120, 'Applied Digital — erhöht'),
+        ]
+        leo_puts = [
+            ('SMH',  2040, 'SMH PUT $2.04 Mrd — Semiconductor Hedge'),
+            ('NVDA', 1570, 'NVDA PUT $1.57 Mrd'),
+            ('ORCL', 1070, 'ORCL PUT $1.07 Mrd'),
+            ('AVGO', 1010, 'AVGO PUT $1.01 Mrd'),
+            ('AMD',   969, 'AMD PUT $969 Mio'),
         ]
         leo_holdings = []
-        for sym, val_m, reason in leo_positions:
+        for sym, val_m, reason in leo_longs:
             try:
                 price_now, price_then, since = _yahoo_price_change(sym, '2026-01-01')
                 if price_now > 0:
                     leo_holdings.append({
-                        'sym':        sym,
-                        'action':     'KAUFT',
-                        'val_m':      val_m,
-                        'date':       '2026-Q1',
-                        'reason':     reason,
-                        'price_now':  price_now,
-                        'price_then': price_then,
-                        'since_pct':  since,
+                        'sym': sym, 'action': 'KAUFT', 'val_m': val_m,
+                        'date': '2026-Q1', 'reason': reason,
+                        'price_now': price_now, 'price_then': price_then, 'since_pct': since,
+                    })
+            except Exception:
+                pass
+        for sym, val_m, reason in leo_puts:
+            try:
+                price_now, price_then, since = _yahoo_price_change(sym, '2026-01-01')
+                if price_now > 0:
+                    leo_holdings.append({
+                        'sym': sym, 'action': 'PUT (SHORT)', 'val_m': val_m,
+                        'date': '2026-Q1', 'reason': reason,
+                        'price_now': price_now, 'price_then': price_then, 'since_pct': since,
                     })
             except Exception:
                 pass
         if leo_holdings:
             hf_data.append({
-                'manager':  'Situational Awareness LP (L. Aschenbrenner)',
-                'date':     '2026-Q1',
-                'form':     '13D/13G',
-                'url':      'https://www.stock-world.de/nebius-aktie-aschenbrenner-fonds-mit-26-milliarden-dollar/',
+                'manager': 'Situational Awareness LP (L. Aschenbrenner)',
+                'date':    '2026-Q1 (13F 18.05.2026)',
+                'form':    '13F',
+                'url':     'https://trendspider.com/blog/leopold-aschenbrenner-situational-awareness-lp-13f-may-18-2026/',
                 'holdings': leo_holdings,
             })
 
