@@ -255,9 +255,12 @@ def enrich_background(scan_results: dict):
             })
         social_data.sort(key=lambda x: -x['ki_score'])
 
-        # ── Hedge Fund 13F (SEC EDGAR) ────────────────────────────────────────
+        # ── Hedge Fund 13F — echte Käufe/Verkäufe + Kursentwicklung ────────────
         import urllib.request as _ur, ssl as _ssl
+        import xml.etree.ElementTree as _ET
         _ctx = _ssl.create_default_context()
+        _HDR = {'User-Agent': 'scanner/3.0 yusufbruder@gmail.com', 'Accept': 'application/json'}
+
         HF_CIK = {
             "Pershing Square (Ackman)": "0001336528",
             "Duquesne (Druckenmiller)": "0001536411",
@@ -265,28 +268,168 @@ def enrich_background(scan_results: dict):
             "Coatue Management":        "0001336119",
             "Appaloosa (Tepper)":       "0001418814",
         }
-        hf_data = []
-        for nm, cik in HF_CIK.items():
+
+        def _get_filings_list(cik):
+            """Holt die letzten 2 13F-HR Filings (aktuell + Vorquartal)."""
             try:
                 pad = cik.lstrip('0').zfill(10)
-                req = _ur.Request(
-                    f'https://data.sec.gov/submissions/CIK{pad}.json',
-                    headers={'User-Agent': 'scanner/3.0 yusufbruder@gmail.com', 'Accept': 'application/json'})
+                req = _ur.Request(f'https://data.sec.gov/submissions/CIK{pad}.json', headers=_HDR)
                 with _ur.urlopen(req, context=_ctx, timeout=10) as r:
                     d = json.loads(r.read())
                 fls = d.get('filings', {}).get('recent', {})
-                for i, frm in enumerate(fls.get('form', [])[:20]):
-                    if '13F' in frm:
-                        hf_data.append({
-                            'manager': nm, 'form': frm,
-                            'date': fls.get('filingDate', [''])[i],
-                            'url': f'https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=13F',
-                            'holdings': [],
+                forms   = fls.get('form', [])
+                dates   = fls.get('filingDate', [])
+                accnums = fls.get('accessionNumber', [])
+                result = []
+                for i, frm in enumerate(forms[:40]):
+                    if frm in ('13F-HR', '13F-HR/A') and i < len(accnums):
+                        result.append({'date': dates[i], 'acc': accnums[i]})
+                        if len(result) == 2:
+                            break
+                return result
+            except Exception:
+                return []
+
+        def _parse_13f_xml(cik, acc):
+            """Parst 13F-HR XML → dict {sym: {shares, value_k}}."""
+            try:
+                cik_num  = cik.lstrip('0')
+                acc_path = acc.replace('-', '')
+                # Filing-Index laden
+                idx_url = f'https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik_num}&type=13F&dateb=&owner=include&count=5&search_text=&output=atom'
+                # Direkt XML über EDGAR full-text suchen
+                base = f'https://www.sec.gov/Archives/edgar/data/{cik_num}/{acc_path}/'
+                idx_req = _ur.Request(base, headers={'User-Agent': 'scanner/3.0 yusufbruder@gmail.com'})
+                with _ur.urlopen(idx_req, context=_ctx, timeout=10) as r:
+                    idx_html = r.read().decode('utf-8', errors='ignore')
+                # XML-Datei finden
+                import re as _re
+                xml_match = (_re.search(r'href="([^"]*informationtable[^"]*\.xml)"', idx_html, _re.I)
+                             or _re.search(r'href="([^"]*\.xml)"', idx_html, _re.I))
+                if not xml_match:
+                    return {}
+                xml_path = xml_match.group(1)
+                if not xml_path.startswith('http'):
+                    xml_path = 'https://www.sec.gov' + xml_path
+                req2 = _ur.Request(xml_path, headers={'User-Agent': 'scanner/3.0 yusufbruder@gmail.com'})
+                with _ur.urlopen(req2, context=_ctx, timeout=12) as r2:
+                    xml_data = r2.read()
+                root = _ET.fromstring(xml_data)
+                ns = {'n': root.tag.split('}')[0].strip('{')} if '}' in root.tag else {}
+                holdings = {}
+                tag = lambda t: f'n:{t}' if ns else t
+                for info in root.findall(f'.//{tag("infoTable")}', ns if ns else {}):
+                    def gt(t):
+                        el = info.find(tag(t), ns if ns else {})
+                        return el.text.strip() if el is not None and el.text else ''
+                    name   = gt('nameOfIssuer')
+                    shares = int(gt('sshPrnamt') or 0)
+                    val_k  = int(gt('value') or 0)        # in Tausend $
+                    sym    = gt('tickerCusip') or name[:5].replace(' ', '').upper()
+                    if sym and shares > 0:
+                        holdings[sym] = {'name': name[:30], 'shares': shares, 'val_k': val_k}
+                return holdings
+            except Exception:
+                return {}
+
+        def _price_on_date(sym, date_str):
+            """Holt Schlusskurs für ein Datum via Yahoo Finance."""
+            try:
+                url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&period1=&period2=&range=3mo'
+                req = _ur.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with _ur.urlopen(req, context=_ctx, timeout=6) as r:
+                    d = json.loads(r.read())
+                res   = d['chart']['result'][0]
+                ts    = res['timestamp']
+                cls   = res['indicators']['quote'][0]['close']
+                target = int(__import__('datetime').datetime.strptime(date_str, '%Y-%m-%d').timestamp())
+                best_i = min(range(len(ts)), key=lambda i: abs(ts[i] - target))
+                price_then = cls[best_i]
+                price_now  = res['meta'].get('regularMarketPrice') or cls[-1]
+                return round(price_then or 0, 2), round(price_now or 0, 2)
+            except Exception:
+                return 0.0, 0.0
+
+        hf_data = []
+        for nm, cik in HF_CIK.items():
+            try:
+                filings = _get_filings_list(cik)
+                if not filings:
+                    continue
+                curr_filing = filings[0]
+                prev_filing = filings[1] if len(filings) > 1 else None
+
+                curr_h = _parse_13f_xml(cik, curr_filing['acc'])
+                prev_h = _parse_13f_xml(cik, prev_filing['acc']) if prev_filing else {}
+                time.sleep(0.5)
+
+                # Käufe = neue Position oder >20% mehr Shares
+                # Verkäufe = verschwunden oder >20% weniger Shares
+                buys  = []
+                sells = []
+                for sym, h in curr_h.items():
+                    prev = prev_h.get(sym)
+                    val_m = round(h['val_k'] / 1000, 1)
+                    if not prev:
+                        action = 'NEU GEKAUFT'
+                        chg_pct = 100
+                    else:
+                        diff = (h['shares'] - prev['shares']) / prev['shares'] * 100
+                        if diff > 20:
+                            action = f'AUFGESTOCKT +{diff:.0f}%'
+                            chg_pct = diff
+                        else:
+                            continue
+                    # Kurs seit Kauf
+                    price_then, price_now = _price_on_date(sym, curr_filing['date'])
+                    since_pct = round((price_now - price_then) / price_then * 100, 1) if price_then else 0
+                    buys.append({
+                        'sym': sym, 'name': h['name'], 'action': action,
+                        'val_m': val_m, 'shares': h['shares'],
+                        'date': curr_filing['date'],
+                        'price_then': price_then, 'price_now': price_now,
+                        'since_pct': since_pct,
+                    })
+
+                for sym, h in prev_h.items():
+                    curr = curr_h.get(sym)
+                    if not curr:
+                        price_then, price_now = _price_on_date(sym, prev_filing['date'])
+                        since_pct = round((price_now - price_then) / price_then * 100, 1) if price_then else 0
+                        sells.append({
+                            'sym': sym, 'name': h['name'], 'action': 'VERKAUFT',
+                            'val_m': round(h['val_k'] / 1000, 1), 'shares': h['shares'],
+                            'date': prev_filing['date'],
+                            'price_then': price_then, 'price_now': price_now,
+                            'since_pct': since_pct,
                         })
-                        break
+                    elif h['shares'] > curr['shares'] * 1.2:
+                        price_then, price_now = _price_on_date(sym, curr_filing['date'])
+                        since_pct = round((price_now - price_then) / price_then * 100, 1) if price_then else 0
+                        diff = (h['shares'] - curr['shares']) / h['shares'] * 100
+                        sells.append({
+                            'sym': sym, 'name': h['name'], 'action': f'REDUZIERT -{diff:.0f}%',
+                            'val_m': round(curr['val_k'] / 1000, 1), 'shares': curr['shares'],
+                            'date': curr_filing['date'],
+                            'price_then': price_then, 'price_now': price_now,
+                            'since_pct': since_pct,
+                        })
+
+                # Sortieren: größte Positionen zuerst
+                buys.sort(key=lambda x: -x['val_m'])
+                sells.sort(key=lambda x: -x['val_m'])
+
+                hf_data.append({
+                    'manager':  nm,
+                    'date':     curr_filing['date'],
+                    'form':     '13F-HR',
+                    'url':      f'https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=13F',
+                    'buys':     buys[:5],
+                    'sells':    sells[:3],
+                })
             except Exception:
                 pass
-            time.sleep(0.8)
+            time.sleep(1.0)
 
         # ── Influencer ────────────────────────────────────────────────────────
         influencers = get_cached_influencers()
@@ -717,32 +860,70 @@ function renderResults(data, isNew) {
   }
   html += '</div>';
 
-  // ── Hedge Fund Positionen (SEC 13F) ─────────────────────────────────────────
+  // ── Hedge Fund 13F — Käufe/Verkäufe + Kursentwicklung seit Kauf ─────────────
   const hfData = data.hf_data || [];
-  html += '<div class="section"><div class="section-title" style="color:#a78bfa;border-left:3px solid #a78bfa">🏛 HEDGE FUNDS — SEC 13F Positionen</div>';
+  html += '<div class="section"><div class="section-title" style="color:#a78bfa;border-left:3px solid #a78bfa">🏛 HEDGE FUNDS — Käufe & Verkäufe (13F)</div>';
   if (hfData.length === 0) {
-    html += '<div style="padding:12px 16px;color:#4a6a8a;font-size:12px">Wird beim nächsten Scan geladen...</div>';
+    html += '<div style="padding:12px 16px;color:#4a6a8a;font-size:12px">Wird nach Scan geladen... (SEC EDGAR 13F Analyse)</div>';
   } else {
     hfData.forEach(hf => {
-      html += '<div style="padding:10px 14px;border-bottom:1px solid #1a2a40">'
-        + '<div style="display:flex;justify-content:space-between;align-items:center">'
-        +   '<div>'
-        +     '<span style="font-size:13px;font-weight:600;color:#e2e8f0">' + hf.manager + '</span>'
-        +     '<span style="font-size:10px;color:#475569;margin-left:8px">' + hf.form + ' &bull; ' + hf.date + '</span>'
-        +   '</div>'
-        +   (hf.url ? '<a href="' + hf.url + '" target="_blank" style="color:#a78bfa;font-size:11px">SEC ↗</a>' : '')
+      html += '<div style="border-bottom:1px solid #111f30">'
+        + '<div style="padding:8px 14px;background:#0d1628;display:flex;justify-content:space-between;align-items:center">'
+        +   '<span style="font-size:13px;font-weight:700;color:#a78bfa">' + hf.manager + '</span>'
+        +   '<span style="font-size:10px;color:#475569">13F-HR &bull; ' + hf.date
+        +   (hf.url ? ' &nbsp;<a href="' + hf.url + '" target="_blank" style="color:#6b8cad">SEC↗</a>' : '') + '</span>'
         + '</div>';
-      if (hf.holdings && hf.holdings.length > 0) {
-        html += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">';
-        hf.holdings.forEach(h => {
-          let chg = h.chg_w || 0;
-          let chgCol = chg >= 0 ? '#4dff91' : '#ff4d6b';
-          html += '<div style="background:#0d1628;border:1px solid #1e3a5f;border-radius:8px;padding:4px 8px">'
-            + '<div style="font-weight:700;color:#60a5fa;font-size:13px">' + h.sym + '</div>'
-            + (h.price > 0 ? '<div style="color:#94a3b8;font-size:10px">$' + h.price + ' <span style="color:' + chgCol + '">' + (chg>=0?'+':'') + chg + '% 7T</span></div>' : '')
+
+      // KÄUFE
+      const buys = hf.buys || [];
+      if (buys.length > 0) {
+        html += '<div style="padding:4px 14px 6px">';
+        buys.forEach(b => {
+          let sc = b.since_pct || 0;
+          let scCol = sc >= 0 ? '#4dff91' : '#ff4d6b';
+          let scStr = sc !== 0 ? '<span style="color:' + scCol + ';font-weight:bold">' + (sc>=0?'+':'') + sc + '%</span> seit Kauf' : '';
+          let pStr  = b.price_then > 0 ? ' @ $' + b.price_then + ' → $' + b.price_now : '';
+          html += '<div style="padding:5px 0;border-bottom:1px solid #0d1a28;display:flex;justify-content:space-between;align-items:center">'
+            +   '<div>'
+            +     '<span style="font-size:14px;font-weight:bold;color:#4dff91">▲ ' + b.sym + '</span>'
+            +     ' <span style="font-size:10px;color:#34d399;background:#0a2a1a;padding:1px 6px;border-radius:8px">' + b.action + '</span>'
+            +     '<div style="font-size:11px;color:#64748b;margin-top:1px">' + b.name + pStr + '</div>'
+            +   '</div>'
+            +   '<div style="text-align:right">'
+            +     '<div style="font-size:12px;color:#94a3b8">$' + b.val_m + 'M</div>'
+            +     '<div style="font-size:11px">' + scStr + '</div>'
+            +   '</div>'
             + '</div>';
         });
         html += '</div>';
+      }
+
+      // VERKÄUFE
+      const sells = hf.sells || [];
+      if (sells.length > 0) {
+        html += '<div style="padding:4px 14px 6px">';
+        sells.forEach(s => {
+          let sc = s.since_pct || 0;
+          let scCol = sc >= 0 ? '#4dff91' : '#ff4d6b';
+          let scStr = sc !== 0 ? '<span style="color:' + scCol + '">' + (sc>=0?'+':'') + sc + '%</span> seit Verkauf' : '';
+          let pStr  = s.price_then > 0 ? ' @ $' + s.price_then + ' → $' + s.price_now : '';
+          html += '<div style="padding:5px 0;border-bottom:1px solid #0d1a28;display:flex;justify-content:space-between;align-items:center">'
+            +   '<div>'
+            +     '<span style="font-size:14px;font-weight:bold;color:#ff4d6b">▼ ' + s.sym + '</span>'
+            +     ' <span style="font-size:10px;color:#f87171;background:#2a0a0a;padding:1px 6px;border-radius:8px">' + s.action + '</span>'
+            +     '<div style="font-size:11px;color:#64748b;margin-top:1px">' + s.name + pStr + '</div>'
+            +   '</div>'
+            +   '<div style="text-align:right">'
+            +     '<div style="font-size:12px;color:#94a3b8">$' + s.val_m + 'M</div>'
+            +     '<div style="font-size:11px">' + scStr + '</div>'
+            +   '</div>'
+            + '</div>';
+        });
+        html += '</div>';
+      }
+
+      if (!buys.length && !sells.length) {
+        html += '<div style="padding:8px 14px;font-size:11px;color:#475569">Keine neuen Käufe/Verkäufe erkannt (gleiche Positionen)</div>';
       }
       html += '</div>';
     });
