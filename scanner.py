@@ -7,6 +7,7 @@ ctx = ssl.create_default_context()
 API           = os.environ.get('POLYGON_API_KEY', '')
 ALPACA_KEY    = os.environ.get('ALPACA_API_KEY',    '')
 ALPACA_SECRET = os.environ.get('ALPACA_SECRET_KEY', '')
+NOUS_KEY      = os.environ.get('NOUS_API_KEY',      '')
 
 # ── Social Trending (Reddit WSB + Stocktwits) ────────────────────────────────
 _TICKER_RE = re.compile(r'\b([A-Z]{2,5})\b')
@@ -264,15 +265,80 @@ def get_alpaca_news(tickers: list, limit: int = 5) -> list:
         return []
 
 
-# ── Hermes Hunt: übersehene Mover suchen ─────────────────────────────────────
+# ── Yahoo Finance Top Movers (kostenlos) ────────────────────────────────────
+def get_market_movers() -> list:
+    """Holt aktuelle Top-Mover von Yahoo Finance — Aktien die sich heute stark bewegen."""
+    movers = []
+    urls = [
+        ('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&scrIds=day_gainers&count=20', 'Gainer'),
+        ('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&scrIds=day_losers&count=20',  'Loser'),
+        ('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&scrIds=most_actives&count=20','Active'),
+    ]
+    for url, label in urls:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+                d = json.loads(r.read())
+            quotes = d.get('finance', {}).get('result', [{}])[0].get('quotes', [])
+            for q in quotes[:10]:
+                sym = q.get('symbol', '').split('.')[0]
+                chg = q.get('regularMarketChangePercent', 0) or 0
+                price = q.get('regularMarketPrice', 0) or 0
+                vol   = q.get('regularMarketVolume', 0) or 0
+                if sym and 2 <= len(sym) <= 5 and abs(chg) >= 3:
+                    movers.append({'sym': sym, 'chg': round(chg, 1), 'price': round(price, 2),
+                                   'vol': vol, 'label': label})
+        except Exception:
+            pass
+    return movers
+
+
+# ── Alpaca Marktdaten (echte News + Preis) ───────────────────────────────────
+def get_alpaca_market_news(limit: int = 20) -> list:
+    """Alpaca allgemeine Marktnews — ohne Ticker-Filter, breites Signal."""
+    if not (ALPACA_KEY and ALPACA_SECRET):
+        return []
+    try:
+        url = f'https://data.alpaca.markets/v1beta1/news?limit={limit}&sort=desc'
+        req = urllib.request.Request(url, headers={
+            'APCA-API-KEY-ID':     ALPACA_KEY,
+            'APCA-API-SECRET-KEY': ALPACA_SECRET,
+            'User-Agent':          'scanner/3.0',
+        })
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+            return json.loads(r.read()).get('news', [])
+    except Exception:
+        return []
+
+
+def get_alpaca_snapshot(tickers: list) -> dict:
+    """Alpaca Snapshot: aktueller Preis + Tagesvolumen für mehrere Ticker."""
+    if not (ALPACA_KEY and ALPACA_SECRET):
+        return {}
+    try:
+        syms = ','.join(tickers[:30])
+        url  = f'https://data.alpaca.markets/v2/stocks/snapshots?symbols={syms}'
+        req  = urllib.request.Request(url, headers={
+            'APCA-API-KEY-ID':     ALPACA_KEY,
+            'APCA-API-SECRET-KEY': ALPACA_SECRET,
+        })
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+            return json.loads(r.read())
+    except Exception:
+        return {}
+
+
+# ── Hermes Hunt: übersehene 10%+ Mover suchen ────────────────────────────────
 def hermes_hunt(current_longs: list, current_shorts: list) -> list:
     """
-    Hermes Agent: sucht 10%+ Mover die der Haupt-Scanner übersehen hat.
-    Checkt Dark Pool + Options Sweep + Polygon/Alpaca News für alle Kandidaten.
+    Hermes Agent — volles Polygon + Alpaca + Yahoo:
+    Sucht 10%+ Mover die der Haupt-Scanner übersehen hat.
+    Quellen: Dark Pool, Options Sweep, Polygon News, Alpaca News, Yahoo Movers.
     """
     in_scan = {r['t'] for r in current_longs + current_shorts}
     today   = datetime.now().strftime('%Y-%m-%d')
 
+    # Kandidaten: UNIVERSE + Social + Yahoo Movers
     candidates = [t for t in UNIVERSE if t not in in_scan]
     try:
         social_t, _ = get_cached_social()
@@ -282,6 +348,33 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
     except Exception:
         pass
 
+    # Yahoo Movers: Aktien die sich heute bereits stark bewegen
+    movers_today = get_market_movers()
+    for m in movers_today:
+        t = m['sym']
+        if t not in in_scan and t not in candidates:
+            candidates.append(t)
+
+    # Alpaca Markt-News: Ticker aus News extrahieren
+    try:
+        _pat = re.compile(r'\b([A-Z]{2,5})\b')
+        _skip = {'THE','AND','FOR','ARE','NOT','BUT','HAS','CEO','IPO','FED','GDP',
+                 'ETF','USD','EUR','AI','US','UK','EU','OR','AT','IT','IS'}
+        al_news = get_alpaca_market_news(limit=15)
+        for n in al_news:
+            headline = n.get('headline', '')
+            for sym in n.get('symbols', []):
+                if sym and sym not in in_scan and sym not in candidates and 2 <= len(sym) <= 5:
+                    candidates.append(sym)
+            for m in _pat.findall(headline):
+                if m not in _skip and m not in in_scan and m not in candidates and 2 <= len(m) <= 5:
+                    candidates.append(m)
+    except Exception:
+        pass
+
+    # Alpaca Snapshot für alle Kandidaten (Batch)
+    al_snap = get_alpaca_snapshot(candidates[:40])
+
     alerts = []
 
     def check_one(ticker):
@@ -289,68 +382,103 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
         reasons = []
         dp_info = {}
 
-        # 1) Dark Pool Print
-        dp = get_darkpool_signal(ticker, today)
-        if dp.get('dp_total', 0) >= 1_000_000:
-            dp_info = dp
-            m = dp['dp_total'] / 1_000_000
-            score += 5 if m >= 10 else (4 if m >= 5 else 2)
-            reasons.append(f'Dark Pool ${m:.1f}M ({dp["dp_count"]} Prints)')
+        # 0) Yahoo Mover Check — bereits heute +5%?
+        mover = next((m for m in movers_today if m['sym'] == ticker), None)
+        if mover:
+            if abs(mover['chg']) >= 8:
+                score += 4
+                reasons.append(f'Yahoo {mover["label"]}: {mover["chg"]:+.1f}% heute')
+            elif abs(mover['chg']) >= 5:
+                score += 2
+                reasons.append(f'Yahoo {mover["label"]}: {mover["chg"]:+.1f}% heute')
 
-        # 2) Options Sweep
+        # 1) Dark Pool Print (Polygon /v3/trades)
+        dp = get_darkpool_signal(ticker, today)
+        if dp.get('dp_total', 0) >= 500_000:
+            dp_info = dp
+            m_val = dp['dp_total'] / 1_000_000
+            score += 5 if m_val >= 10 else (4 if m_val >= 5 else (3 if m_val >= 1 else 1))
+            reasons.append(f'Dark Pool ${m_val:.1f}M ({dp["dp_count"]} Prints)')
+
+        # 2) Options Sweep (Polygon Snapshot)
+        price_from_opt = 0
         try:
             opt = poly_fetch(f'https://api.polygon.io/v3/snapshot/options/{ticker}?limit=100&apiKey={API}')
             res = opt.get('results', [])
             if res:
+                price_from_opt = res[0].get('underlying_asset', {}).get('price', 0)
                 calls  = [r for r in res if r['details']['contract_type'] == 'call']
                 cv     = sum(r['day'].get('volume', 0) for r in calls)
                 oi_tot = sum(max(r.get('open_interest', 0) or 1, 1) for r in calls)
                 sw     = get_options_sweep(res)
-                if oi_tot and cv > oi_tot * 2:
+                if oi_tot and cv > oi_tot * 2 and cv > 200:
                     score += 3
                     reasons.append(f'Call Sweep Vol:{cv:,} vs OI:{oi_tot:,}')
-                if sw['sweeps_call'] >= 3:
+                if sw['sweeps_call'] >= 2:
                     score += 2
-                    reasons.append(f'{sw["sweeps_call"]} Call-Sweeps')
+                    reasons.append(f'{sw["sweeps_call"]} Call-Sweeps erkannt')
                 if sw['top_call_dollar'] >= 500_000:
                     score += 1
                     reasons.append(f'Block Call ${sw["top_call_dollar"]/1e6:.1f}M')
         except Exception:
             pass
 
-        # 3) Polygon News (letzte 6h)
+        # 3) Alpaca Snapshot: ungewöhnliches Volumen?
+        if ticker in al_snap:
+            snap = al_snap[ticker]
+            dbar = snap.get('dailyBar', {})
+            vol  = dbar.get('v', 0) or 0
+            prev = snap.get('prevDailyBar', {})
+            pvol = prev.get('v', 0) or 1
+            if pvol and vol / pvol > 3:
+                score += 2
+                reasons.append(f'Alpaca Vol {vol/1e6:.1f}M vs Vortag {pvol/1e6:.1f}M ({vol/pvol:.1f}x)')
+
+        # 4) Polygon News (letzte 4h)
         try:
-            nd = poly_fetch(f'https://api.polygon.io/v2/reference/news?ticker={ticker}&limit=3&apiKey={API}')
-            cut = (datetime.now() - timedelta(hours=6)).strftime('%Y-%m-%dT%H:%M:%SZ')
+            nd  = poly_fetch(f'https://api.polygon.io/v2/reference/news?ticker={ticker}&limit=5&apiKey={API}')
+            cut = (datetime.now() - timedelta(hours=4)).strftime('%Y-%m-%dT%H:%M:%SZ')
             for n in nd.get('results', []):
                 if n.get('published_utc', '') < cut:
                     continue
-                tl = n.get('title', '').lower()
-                sent = next((i.get('sentiment','') for i in n.get('insights',[]) if i.get('ticker')==ticker), '')
+                tl   = n.get('title', '').lower()
+                sent = next((i.get('sentiment','') for i in n.get('insights',[])
+                             if i.get('ticker') == ticker), '')
                 if any(k in tl for k in POS_KEYS) and sent != 'negative':
                     score += 3
-                    reasons.append(f'News: {n.get("title","")[:55]}')
+                    reasons.append(f'Polygon News: {n.get("title","")[:55]}')
+                    break
+                if any(k in tl for k in NEG_KEYS) or sent == 'negative':
+                    score += 2
+                    reasons.append(f'BEAR News: {n.get("title","")[:50]}')
                     break
         except Exception:
             pass
 
-        # 4) Alpaca News
-        if score >= 2:
-            for n in get_alpaca_news([ticker], limit=3):
-                h = n.get('headline', '')
-                if any(k in h.lower() for k in POS_KEYS):
-                    score += 2
-                    reasons.append(f'Alpaca: {h[:50]}')
-                    break
+        # 5) Alpaca News für diesen Ticker
+        for n in get_alpaca_news([ticker], limit=3):
+            h  = n.get('headline', '')
+            hl = h.lower()
+            if any(k in hl for k in POS_KEYS):
+                score += 2
+                reasons.append(f'Alpaca: {h[:50]}')
+                break
 
         if score >= 4 and reasons:
-            return {'ticker': ticker, 'score': score, 'reasons': reasons,
-                    'dp': dp_info, 'ts': datetime.now().strftime('%H:%M')}
+            price = price_from_opt or (mover['price'] if mover else 0)
+            return {
+                'ticker':  ticker,
+                'score':   score,
+                'reasons': reasons[:4],
+                'dp':      dp_info,
+                'price':   round(price, 2),
+                'ts':      datetime.now().strftime('%H:%M'),
+            }
         return None
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = [ex.submit(check_one, t) for t in candidates[:30]]
-        for fut in as_completed(futs, timeout=60):
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs = [ex.submit(check_one, t) for t in candidates[:40]]
+        for fut in as_completed(futs, timeout=90):
             try:
                 r = fut.result()
                 if r:
@@ -359,7 +487,7 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
                 pass
 
     alerts.sort(key=lambda x: -x['score'])
-    return alerts[:8]
+    return alerts[:10]
 
 
 # Paid Polygon plan ($79) — kein Rate-Limit nötig

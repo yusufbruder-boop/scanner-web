@@ -28,6 +28,7 @@ state = {
     'hermes_alerts':  [],
     'hermes_ts':      None,
     'hermes_running': False,
+    'hermes_ai':      '',
 }
 _hermes_lock = threading.Lock()
 
@@ -384,13 +385,22 @@ function renderCard(r, cls, isNew) {
 function renderResults(data, isNew) {
   let html = '';
 
+  // ── Hermes AI Analyse (ganz oben wenn vorhanden) ─────────────────────────
+  if (data.hermes_ai) {
+    html += '<div style="margin:8px;background:linear-gradient(135deg,#0a1f2e,#0d2840);border:1px solid #00e5ff44;border-radius:10px;padding:12px 14px">'
+      + '<div style="font-size:10px;font-weight:bold;color:#00e5ff;letter-spacing:2px;margin-bottom:6px">🤖 HERMES AI ANALYSE — ' + (data.hermes_ts||'') + '</div>'
+      + '<div style="font-size:13px;color:#c0d4e8;line-height:1.6">' + data.hermes_ai + '</div>'
+      + '</div>';
+  }
+
+  // ── Hauptziel: Mover + Long + Short ─────────────────────────────────────
   if (data.movers && data.movers.length > 0) {
-    html += '<div class="section"><div class="section-title mover">NEXT MOVER — Kleines Cap + Katalysator + Billiger Call</div>';
+    html += '<div class="section"><div class="section-title mover">🎯 NEXT MOVER — 10%+ Potenzial, Günstiger Call</div>';
     data.movers.forEach(r => { html += renderCard(r, 'mover', isNew); });
     html += '</div>';
   }
 
-  html += '<div class="section"><div class="section-title long">TOP LONG — Katalysator + P/C tief</div>';
+  html += '<div class="section"><div class="section-title long">▲ TOP LONG — Options Flow + Katalysator</div>';
   if (!data.longs || data.longs.length === 0) {
     html += '<div class="empty">Keine Long-Signale.</div>';
   } else {
@@ -398,7 +408,7 @@ function renderResults(data, isNew) {
   }
   html += '</div>';
 
-  html += '<div class="section"><div class="section-title short">TOP SHORT — Überbewertet / Fallend</div>';
+  html += '<div class="section"><div class="section-title short">▼ TOP SHORT — Überbewertet / Fallend</div>';
   if (!data.shorts || data.shorts.length === 0) {
     html += '<div class="empty">Keine Short-Signale.</div>';
   } else {
@@ -425,6 +435,58 @@ function renderResults(data, isNew) {
     });
     html += '</div>';
   }
+
+  // ── HERMES AGENT ALERTS (direkt nach Nachrichten) ──────────────────────────
+  if (data.hermes_alerts && data.hermes_alerts.length > 0) {
+    html += '<div class="section"><div class="section-title" style="color:#00e5ff;border-left:3px solid #00e5ff">🤖 HERMES — Übersehene Mover (' + data.hermes_alerts.length + ')' + (data.hermes_ts ? ' ' + data.hermes_ts : '') + '</div>';
+    data.hermes_alerts.forEach(a => {
+      let sc = a.score >= 8 ? '#4dff91' : a.score >= 6 ? '#ffd700' : '#ffa040';
+      let dp = a.dp && a.dp.dp_total ? ' 🏦$' + (a.dp.dp_total/1e6).toFixed(1) + 'M' : '';
+      let px = a.price > 0 ? '$' + a.price : '';
+      html += '<div style="padding:10px 14px;border-bottom:1px solid #0a1f30;display:flex;gap:10px;align-items:flex-start">'
+        + '<div style="min-width:48px;text-align:center">'
+        +   '<div style="font-size:20px;font-weight:bold;color:' + sc + '">' + a.score + '</div>'
+        +   '<div style="font-size:9px;color:#4a6a8a">SCORE</div>'
+        + '</div>'
+        + '<div style="flex:1">'
+        +   '<div style="font-size:15px;font-weight:bold;color:#fff">' + a.ticker + ' <span style="color:#6b8cad;font-size:12px">' + px + '</span>' + dp + '</div>';
+      (a.reasons||[]).forEach(r => { html += '<div style="font-size:11px;color:#94a3b8;margin-top:2px">• ' + r + '</div>'; });
+      html += '</div></div>';
+    });
+    html += '</div>';
+  }
+
+  // ── 10:00 Follow-up ──────────────────────────────────────────────────────
+  if (data.followup && (data.followup.longs || data.followup.shorts)) {
+    html += '<div class="section"><div class="section-title" style="color:#ffd700;border-left:3px solid #ffd700">📊 10:00 SIGNAL CHECK — Gewinner & Verlierer</div>';
+    html += '<div style="background:#111827;border:1px solid #2a2000;margin:8px;border-radius:10px;overflow:hidden">';
+    let allFu = (data.followup.longs || []).concat(data.followup.shorts || []);
+    allFu.forEach(f => {
+      let won = f.won;
+      let color = won ? '#4dff91' : '#ff4d6b';
+      let icon  = won ? '✅' : '❌';
+      html += '<div style="padding:8px 14px;border-bottom:1px solid #1e2a3a;display:flex;justify-content:space-between">'
+        + '<span style="font-weight:bold;color:#fff">' + icon + ' ' + f.t + ' ' + f.signal + '</span>'
+        + '<span style="color:' + color + ';font-size:13px">' + (f.chg_pct >= 0 ? '+' : '') + f.chg_pct.toFixed(1) + '% (Ziel: ' + (f.won ? 'Erreicht' : 'Nicht erreicht') + ')</span>'
+        + '</div>';
+    });
+    html += '</div></div>';
+  }
+
+  // ── WATCH ────────────────────────────────────────────────────────────────
+  if (data.watch && data.watch.length > 0) {
+    html += '<div class="section"><div class="section-title">WATCH (' + data.watch.length + ')</div>';
+    html += '<div style="background:#111827;border:1px solid #1e3a5f;margin:8px;border-radius:10px;overflow:hidden">';
+    data.watch.forEach(r => {
+      html += '<div class="watch-row">'
+        + '<span style="font-weight:bold;color:#a0b4c8">' + r.t + '</span>'
+        + '<span style="color:#6b8cad;font-size:12px">$' + r.price + ' &nbsp; ' + pct(r.trend) + ' &nbsp; L:' + r.long_score + '/S:' + r.short_score + '</span>'
+        + '</div>';
+    });
+    html += '</div></div>';
+  }
+
+  // ══════════ EXTRA DATEN — am Ende ══════════════════════════════════════════
 
   // ── Reddit / Social Trending mit KI-Score ──────────────────────────────────
   const socialData = data.social_data || [];
@@ -523,57 +585,6 @@ function renderResults(data, isNew) {
         + '</div>';
     });
     html += '</div>';
-  }
-
-  // ── Hermes Agent Alerts ────────────────────────────────────────────────────
-  if (data.hermes_alerts && data.hermes_alerts.length > 0) {
-    html += '<div class="section"><div class="section-title" style="color:#00e5ff;border-left:3px solid #00e5ff">🤖 HERMES AGENT — Übersehene Mover (' + data.hermes_alerts.length + ') ' + (data.hermes_ts ? data.hermes_ts : '') + '</div>';
-    data.hermes_alerts.forEach(a => {
-      let scoreCol = a.score >= 8 ? '#4dff91' : a.score >= 6 ? '#ffd700' : '#ffa040';
-      let dpInfo = a.dp && a.dp.dp_total ? '🏦 $' + (a.dp.dp_total/1e6).toFixed(1) + 'M Dark Pool' : '';
-      html += '<div style="padding:10px 14px;border-bottom:1px solid #1a2a40">'
-        + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">'
-        +   '<span style="font-size:16px;font-weight:bold;color:#fff">' + a.ticker + '</span>'
-        +   '<span style="font-size:18px;font-weight:bold;color:' + scoreCol + '">' + a.score + ' pts</span>'
-        + '</div>'
-        + '<div style="display:flex;flex-direction:column;gap:2px">';
-      (a.reasons || []).forEach(r => {
-        html += '<div style="font-size:11px;color:#94a3b8">• ' + r + '</div>';
-      });
-      if (dpInfo) html += '<div style="font-size:11px;color:#ffa040;margin-top:2px">' + dpInfo + '</div>';
-      html += '</div></div>';
-    });
-    html += '</div>';
-  }
-
-  // 10:00 Follow-up
-  if (data.followup && (data.followup.longs || data.followup.shorts)) {
-    html += '<div class="section"><div class="section-title" style="color:#ffd700;border-left:3px solid #ffd700">📊 10:00 SIGNAL CHECK — Gewinner & Verlierer</div>';
-    html += '<div style="background:#111827;border:1px solid #2a2000;margin:8px;border-radius:10px;overflow:hidden">';
-    let allFu = (data.followup.longs || []).concat(data.followup.shorts || []);
-    allFu.forEach(f => {
-      let won = f.won;
-      let color = won ? '#4dff91' : '#ff4d6b';
-      let icon  = won ? '✅' : '❌';
-      html += '<div style="padding:8px 14px;border-bottom:1px solid #1e2a3a;display:flex;justify-content:space-between">'
-        + '<span style="font-weight:bold;color:#fff">' + icon + ' ' + f.t + ' ' + f.signal + '</span>'
-        + '<span style="color:' + color + ';font-size:13px">' + (f.chg_pct >= 0 ? '+' : '') + f.chg_pct.toFixed(1) + '% (Ziel: ' + (f.won ? 'Erreicht' : 'Nicht erreicht') + ')</span>'
-        + '</div>';
-    });
-    html += '</div></div>';
-  }
-
-  // Watch
-  if (data.watch && data.watch.length > 0) {
-    html += '<div class="section"><div class="section-title">WATCH (' + data.watch.length + ')</div>';
-    html += '<div style="background:#111827;border:1px solid #1e3a5f;margin:8px;border-radius:10px;overflow:hidden">';
-    data.watch.forEach(r => {
-      html += '<div class="watch-row">'
-        + '<span style="font-weight:bold;color:#a0b4c8">' + r.t + '</span>'
-        + '<span style="color:#6b8cad;font-size:12px">$' + r.price + ' &nbsp; ' + pct(r.trend) + ' &nbsp; L:' + r.long_score + '/S:' + r.short_score + '</span>'
-        + '</div>';
-    });
-    html += '</div></div>';
   }
 
   return html;
@@ -718,6 +729,7 @@ def results():
     with _hermes_lock:
         data['hermes_alerts'] = state.get('hermes_alerts', [])
         data['hermes_ts']     = state.get('hermes_ts', '')
+        data['hermes_ai']     = state.get('hermes_ai', '')
     return jsonify(data)
 
 @app.route('/followup')
@@ -837,19 +849,65 @@ def hermes_approve():
 
 # ── Hermes Monitor: aktiver Hintergrund-Agent ────────────────────────────────
 
+NOUS_KEY = os.environ.get('NOUS_API_KEY', '')
+
+def hermes_ai_analysis(scan_data: dict, hunt_alerts: list) -> str:
+    """
+    Ruft NousResearch Hermes AI auf — analysiert Scanner-Ergebnisse + Hunt-Alerts.
+    Gibt kurze AI-Empfehlung zurück (max 300 Zeichen pro Signal).
+    """
+    if not NOUS_KEY:
+        return ''
+    try:
+        longs  = [(r['t'], r['score'], r.get('kat_text','')[:40]) for r in scan_data.get('longs',[])[:5]]
+        shorts = [(r['t'], r['score'], r.get('kat_text','')[:40]) for r in scan_data.get('shorts',[])[:5]]
+        hunts  = [(a['ticker'], a['score'], a['reasons'][:2]) for a in hunt_alerts[:5]]
+
+        prompt = f"""Du bist ein Trading-Analyst. Analysiere diese Options-Scanner Daten:
+
+LONG Signale: {longs}
+SHORT Signale: {shorts}
+HERMES gefunden (übersehen): {hunts}
+
+Antworte auf Deutsch, max 3 Sätze:
+1. Welches ist der stärkste Trade heute?
+2. Gibt es ein übersehenes Signal das wichtig sein könnte?
+3. Was ist das Marktrisiko heute?"""
+
+        body = json.dumps({
+            'model': 'hermes-3-llama-3.1-405b-fp8-128k',
+            'messages': [
+                {'role': 'system', 'content': 'Du bist ein präziser Trading-Analyst. Antworte immer auf Deutsch, kurz und direkt.'},
+                {'role': 'user', 'content': prompt}
+            ],
+            'max_tokens': 200,
+            'temperature': 0.2,
+        }).encode()
+        req = urllib.request.Request(
+            'https://inference-api.nousresearch.com/v1/chat/completions',
+            data=body,
+            headers={'Authorization': f'Bearer {NOUS_KEY}', 'Content-Type': 'application/json'},
+        )
+        with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=20) as r:
+            resp = json.loads(r.read())
+        return resp['choices'][0]['message']['content'].strip()
+    except Exception:
+        return ''
+
+
 def hermes_monitor():
     """
-    Hermes sucht alle 5 Min nach 10%+ Movern die der Haupt-Scanner übersehen hat.
-    Läuft nur während Marktzeiten (09:30-16:30 ET).
+    Hermes überwacht Scanner + Alpaca Bot + Markt alle 5 Min.
+    Volles Polygon + Alpaca + NousResearch AI.
     """
-    time.sleep(180)  # 3 Min warten bis Scan läuft
+    time.sleep(180)
     while True:
         try:
-            now_utc  = datetime.now(timezone.utc)
-            h_utc    = now_utc.hour + now_utc.minute / 60
+            now_utc   = datetime.now(timezone.utc)
+            h_utc     = now_utc.hour + now_utc.minute / 60
             is_market = 13.4 <= h_utc <= 21.0 and now_utc.weekday() < 5
 
-            if is_market and not state['running']:
+            if not state['running']:
                 data = state['results'] or load_results()
                 if data:
                     with _hermes_lock:
@@ -860,29 +918,35 @@ def hermes_monitor():
                             data.get('longs',  []),
                             data.get('shorts', [])
                         )
+                        # AI Analyse (nur wenn Markt offen)
+                        ai_text = hermes_ai_analysis(data, alerts) if is_market else ''
                     finally:
                         with _hermes_lock:
                             state['hermes_running'] = False
 
-                    prev = [a['ticker'] for a in state.get('hermes_alerts', [])]
-                    new_finds = [a for a in alerts if a['ticker'] not in prev]
+                    prev_keys = {a['ticker'] for a in state.get('hermes_alerts', [])}
+                    new_finds = [a for a in alerts if a['ticker'] not in prev_keys]
 
                     with _hermes_lock:
-                        state['hermes_alerts'] = alerts
-                        state['hermes_ts']     = datetime.now().strftime('%H:%M')
+                        state['hermes_alerts']  = alerts
+                        state['hermes_ts']      = datetime.now().strftime('%H:%M')
+                        state['hermes_ai']      = ai_text
 
-                    if new_finds:
-                        lines = [f'<b>🤖 HERMES — {state["hermes_ts"]} — {len(new_finds)} neue Funde</b>\n']
-                        for a in new_finds[:5]:
-                            lines.append(f'<b>{a["ticker"]}</b> (Score {a["score"]})')
-                            for r in a['reasons'][:3]:
-                                lines.append(f'  • {r}')
-                            lines.append('')
+                    # Telegram: neue Funde + AI
+                    if new_finds or ai_text:
+                        ts = state['hermes_ts']
+                        lines = [f'<b>🤖 HERMES — {ts}</b>\n']
+                        if ai_text:
+                            lines.append(f'<i>{ai_text}</i>\n')
+                        if new_finds:
+                            lines.append(f'<b>Neue Signale ({len(new_finds)}):</b>')
+                            for a in new_finds[:5]:
+                                lines.append(f'<b>{a["ticker"]}</b> Score:{a["score"]}')
+                                for r_txt in a['reasons'][:2]:
+                                    lines.append(f'  • {r_txt}')
                         tg_send('\n'.join(lines))
 
-                time.sleep(300)   # alle 5 Min
-            else:
-                time.sleep(600)   # außerhalb Markt: 10 Min
+            time.sleep(300 if is_market else 900)
         except Exception:
             time.sleep(300)
 
