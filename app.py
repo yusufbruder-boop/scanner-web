@@ -1489,112 +1489,112 @@ def hermes_monitor():
                     state['hermes_running'] = True
                     state['hermes_running_since'] = datetime.now()
                 try:
-                        from scanner import hermes_hunt, scan_ticker, get_alpaca_market_news
+                    from scanner import hermes_hunt, scan_ticker, get_alpaca_market_news
 
-                        # 1) Hermes Hunt — 24/7: Polygon Movers + Dark Pool + News
-                        alerts = hermes_hunt(
-                            data.get('longs',  []),
-                            data.get('shorts', [])
-                        )
+                    # 1) Hermes Hunt — 24/7: Polygon Movers + Dark Pool + News
+                    alerts = hermes_hunt(
+                        data.get('longs',  []),
+                        data.get('shorts', [])
+                    )
 
-                        # 2) Breaking News Check — Polygon News für alle aktuellen Positionen
-                        news_alerts = []
-                        all_tickers = list({r['t'] for r in
-                                           data.get('longs',[]) + data.get('shorts',[]) +
-                                           data.get('movers',[])})
-                        news_cutoff_h = (datetime.now(timezone.utc) -
-                                         timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%SZ')
-                        POLY_KEY = os.environ.get('POLYGON_API_KEY', '')
-                        for sym in all_tickers[:10]:
+                    # 2) Breaking News Check — Polygon News für alle aktuellen Positionen
+                    news_alerts = []
+                    all_tickers = list({r['t'] for r in
+                                       data.get('longs',[]) + data.get('shorts',[]) +
+                                       data.get('movers',[])})
+                    news_cutoff_h = (datetime.now(timezone.utc) -
+                                     timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%SZ')
+                    POLY_KEY = os.environ.get('POLYGON_API_KEY', '')
+                    for sym in all_tickers[:10]:
+                        try:
+                            url = f'https://api.polygon.io/v2/reference/news?ticker={sym}&limit=2&apiKey={POLY_KEY}'
+                            req = urllib.request.Request(url)
+                            ctx_h = ssl.create_default_context()
+                            with urllib.request.urlopen(req, context=ctx_h, timeout=6) as r:
+                                nd = json.loads(r.read())
+                            for n in nd.get('results', []):
+                                if n.get('published_utc', '') >= news_cutoff_h:
+                                    title = n.get('title', '')
+                                    news_alerts.append(f'{sym}: {title[:60]}')
+                                    break
+                        except Exception:
+                            pass
+
+                    # 3) Alpaca Breaking News — 24/7
+                    al_news = get_alpaca_market_news(limit=10)
+                    al_breaking = []
+                    from scanner import POS_KEYS, NEG_KEYS
+                    for n in al_news:
+                        h = n.get('headline', '')
+                        if any(k in h.lower() for k in POS_KEYS + NEG_KEYS):
+                            syms = n.get('symbols', [])
+                            if syms:
+                                al_breaking.append(f'{",".join(syms[:2])}: {h[:55]}')
+
+                    # 4) Starke Funde direkt scannen (Score >= 6)
+                    today      = datetime.now().strftime('%Y-%m-%d')
+                    exp_cutoff = (datetime.now() + timedelta(days=35)).strftime('%Y-%m-%d')
+                    news_cutoff= (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
+                    picks = []
+                    for a in alerts:
+                        if a['score'] >= 6:
                             try:
-                                url = f'https://api.polygon.io/v2/reference/news?ticker={sym}&limit=2&apiKey={POLY_KEY}'
-                                req = urllib.request.Request(url)
-                                ctx_h = ssl.create_default_context()
-                                with urllib.request.urlopen(req, context=ctx_h, timeout=6) as r:
-                                    nd = json.loads(r.read())
-                                for n in nd.get('results', []):
-                                    if n.get('published_utc', '') >= news_cutoff_h:
-                                        title = n.get('title', '')
-                                        news_alerts.append(f'{sym}: {title[:60]}')
-                                        break
+                                r = scan_ticker(a['ticker'], today, exp_cutoff, news_cutoff)
+                                if r and r['signal'] in ('LONG', 'SHORT'):
+                                    r['hermes_score']   = int(a['score'])
+                                    r['hermes_reasons'] = [str(x) for x in a.get('reasons', [])]
+                                    picks.append(r)
                             except Exception:
                                 pass
 
-                        # 3) Alpaca Breaking News — 24/7
-                        al_news = get_alpaca_market_news(limit=10)
-                        al_breaking = []
-                        from scanner import POS_KEYS, NEG_KEYS
-                        for n in al_news:
-                            h = n.get('headline', '')
-                            if any(k in h.lower() for k in POS_KEYS + NEG_KEYS):
-                                syms = n.get('symbols', [])
-                                if syms:
-                                    al_breaking.append(f'{",".join(syms[:2])}: {h[:55]}')
+                    # 5) Universe erweitern
+                    uni = state.get('hermes_universe', set())
+                    state['hermes_universe'] = uni | {a['ticker'] for a in alerts if a['score'] >= 7}
 
-                        # 4) Starke Funde direkt scannen (Score >= 6)
-                        today      = datetime.now().strftime('%Y-%m-%d')
-                        exp_cutoff = (datetime.now() + timedelta(days=35)).strftime('%Y-%m-%d')
-                        news_cutoff= (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
-                        picks = []
-                        for a in alerts:
-                            if a['score'] >= 6:
-                                try:
-                                    r = scan_ticker(a['ticker'], today, exp_cutoff, news_cutoff)
-                                    if r and r['signal'] in ('LONG', 'SHORT'):
-                                        r['hermes_score']   = int(a['score'])
-                                        r['hermes_reasons'] = [str(x) for x in a.get('reasons', [])]
-                                        picks.append(r)
-                                except Exception:
-                                    pass
+                    # 6) AI Analyse — 24/7 (auch nachts/Wochenende)
+                    ai_text = hermes_ai_analysis(data, alerts)
 
-                        # 5) Universe erweitern
-                        uni = state.get('hermes_universe', set())
-                        state['hermes_universe'] = uni | {a['ticker'] for a in alerts if a['score'] >= 7}
-
-                        # 6) AI Analyse — 24/7 (auch nachts/Wochenende)
-                        ai_text = hermes_ai_analysis(data, alerts)
-
-                    finally:
-                        with _hermes_lock:
-                            state['hermes_running'] = False
-                            state['hermes_running_since'] = None
-
-                    prev_keys = {a['ticker'] for a in state.get('hermes_alerts', [])}
-                    new_finds = [a for a in alerts if a['ticker'] not in prev_keys]
-
+                finally:
                     with _hermes_lock:
-                        state['hermes_alerts']  = alerts
-                        state['hermes_picks']   = picks
-                        state['hermes_ts']      = datetime.now().strftime('%H:%M')
-                        state['hermes_ai']      = ai_text
-                        state['hermes_news']    = (news_alerts + al_breaking)[:10]
+                        state['hermes_running'] = False
+                        state['hermes_running_since'] = None
 
-                    # Telegram — neue Funde + Breaking News
-                    if new_finds or news_alerts or ai_text:
-                        ts = datetime.now().strftime('%H:%M')
-                        lines = [f'<b>🤖 HERMES 24/7 — {ts}</b>']
-                        if ai_text:
-                            lines.append(f'\n<i>{ai_text}</i>')
-                        if news_alerts:
-                            lines.append(f'\n<b>Breaking News ({len(news_alerts)}):</b>')
-                            for na in news_alerts[:3]:
-                                lines.append(f'  📰 {na}')
-                        if al_breaking:
-                            lines.append(f'\n<b>Alpaca News:</b>')
-                            for ab in al_breaking[:3]:
-                                lines.append(f'  ⚡ {ab}')
-                        if new_finds:
-                            lines.append(f'\n<b>Neue Mover ({len(new_finds)}):</b>')
-                            for a in new_finds[:4]:
-                                lines.append(f'<b>{a["ticker"]}</b> Score:{a["score"]} — {a["reasons"][0][:45] if a["reasons"] else ""}')
-                        if picks:
-                            lines.append(f'\n<b>Hermes Picks ({len(picks)}):</b>')
-                            for p in picks[:3]:
-                                b = p.get('best') or {}
-                                lines.append(f'{p["signal"]} <b>{p["t"]}</b> ${p["price"]}')
-                                if b:
-                                    lines.append(f'  {p.get("otype")} ${b.get("strike")} @ ${b.get("pr")}  Exp:{b.get("exp")}')
-                        tg_send('\n'.join(lines))
+                prev_keys = {a['ticker'] for a in state.get('hermes_alerts', [])}
+                new_finds = [a for a in alerts if a['ticker'] not in prev_keys]
+
+                with _hermes_lock:
+                    state['hermes_alerts']  = alerts
+                    state['hermes_picks']   = picks
+                    state['hermes_ts']      = datetime.now().strftime('%H:%M')
+                    state['hermes_ai']      = ai_text
+                    state['hermes_news']    = (news_alerts + al_breaking)[:10]
+
+                # Telegram — neue Funde + Breaking News
+                if new_finds or news_alerts or ai_text:
+                    ts = datetime.now().strftime('%H:%M')
+                    lines = [f'<b>🤖 HERMES 24/7 — {ts}</b>']
+                    if ai_text:
+                        lines.append(f'\n<i>{ai_text}</i>')
+                    if news_alerts:
+                        lines.append(f'\n<b>Breaking News ({len(news_alerts)}):</b>')
+                        for na in news_alerts[:3]:
+                            lines.append(f'  📰 {na}')
+                    if al_breaking:
+                        lines.append(f'\n<b>Alpaca News:</b>')
+                        for ab in al_breaking[:3]:
+                            lines.append(f'  ⚡ {ab}')
+                    if new_finds:
+                        lines.append(f'\n<b>Neue Mover ({len(new_finds)}):</b>')
+                        for a in new_finds[:4]:
+                            lines.append(f'<b>{a["ticker"]}</b> Score:{a["score"]} — {a["reasons"][0][:45] if a["reasons"] else ""}')
+                    if picks:
+                        lines.append(f'\n<b>Hermes Picks ({len(picks)}):</b>')
+                        for p in picks[:3]:
+                            b = p.get('best') or {}
+                            lines.append(f'{p["signal"]} <b>{p["t"]}</b> ${p["price"]}')
+                            if b:
+                                lines.append(f'  {p.get("otype")} ${b.get("strike")} @ ${b.get("pr")}  Exp:{b.get("exp")}')
+                    tg_send('\n'.join(lines))
 
             time.sleep(300)   # immer 5 Min — 24/7
         except Exception:
