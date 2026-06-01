@@ -25,7 +25,11 @@ state = {
     'last_results_hash': None,
     'followup':       None,
     'followup_date':  None,
+    'hermes_alerts':  [],
+    'hermes_ts':      None,
+    'hermes_running': False,
 }
+_hermes_lock = threading.Lock()
 
 # Follow-up: 10:00 ET = 14:00 UTC täglich
 FOLLOWUP_UTC_HOUR   = 14
@@ -344,6 +348,11 @@ function renderCard(r, cls, isNew) {
     ? '<span class="badge" style="background:#3a2000;color:#ffa500;border:1px solid #a06000">⚠ PULLBACK</span>' : '';
   let socialBadge = r.is_social || r.social_score > 20
     ? '<span class="badge" style="background:#1a1a3a;color:#b070ff;border:1px solid #6040aa">🔥 REDDIT/X</span>' : '';
+  let dpM = r.dp && r.dp.dp_total ? (r.dp.dp_total / 1e6).toFixed(1) : 0;
+  let dpBadge = dpM >= 1
+    ? '<span class="badge" style="background:#1a1200;color:#ffa040;border:1px solid #a06000">🏦 Dark Pool $' + dpM + 'M</span>' : '';
+  let swBadge = r.sweep && r.sweep.sweeps_call >= 2
+    ? '<span class="badge" style="background:#0a1f0a;color:#80ff80;border:1px solid #208020">⚡ ' + r.sweep.sweeps_call + ' Sweeps</span>' : '';
   let opt = b ? optionBox(b, r.otype || (cls === 'short' ? 'PUT' : 'CALL'), r.mult, r.today) : '';
   // News mit Link
   let kat = '';
@@ -358,7 +367,7 @@ function renderCard(r, cls, isNew) {
     + '<div class="card-header">'
     +   '<div><span class="ticker">' + r.t + '</span>'
     +   '<span class="price ' + sigColor + '" style="margin-left:10px">$' + r.price + '</span></div>'
-    +   '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' + katBadge + conflictBadge + socialBadge
+    +   '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' + katBadge + conflictBadge + socialBadge + dpBadge + swBadge
     +   '<span class="badge ' + badge + '">' + r.signal + (r.score > 0 ? ' ' + r.score : '') + '</span></div>'
     + '</div>'
     + '<div class="card-body">'
@@ -417,22 +426,87 @@ function renderResults(data, isNew) {
     html += '</div>';
   }
 
-  // Social Trending
-  if (data.social && data.social.length > 0) {
-    html += '<div class="section"><div class="section-title" style="color:#b070ff;border-left:3px solid #b070ff">🔥 REDDIT/X TRENDING (' + data.social.length + ')</div>';
-    html += '<div style="background:#111827;border:1px solid #2a1a4a;margin:8px;border-radius:10px;padding:10px 14px;display:flex;flex-wrap:wrap;gap:8px">';
-    data.social.forEach(t => {
-      let inScan = (data.longs || []).concat(data.shorts || []).find(r => r.t === t);
-      let badge  = inScan ? (inScan.signal === 'LONG' ? ' style="background:#0d3a1f;color:#4dff91"' : ' style="background:#3a0d1a;color:#ff4d6b"') : '';
-      let sig    = inScan ? ' ' + inScan.signal : '';
-      html += '<span style="background:#1a1a3a;border:1px solid #4030aa;color:#b070ff;padding:4px 10px;border-radius:12px;font-size:12px;font-weight:bold"' + badge + '>' + t + sig + '</span>';
+  // ── Reddit / Social Trending mit KI-Score ──────────────────────────────────
+  const socialData = data.social_data || [];
+  html += '<div class="section"><div class="section-title" style="color:#b070ff;border-left:3px solid #b070ff">🔥 REDDIT / STOCKTWITS — KI Score</div>';
+  if (socialData.length === 0) {
+    html += '<div style="padding:12px 16px;color:#4a6a8a;font-size:12px">Wird geladen... (Reddit + Stocktwits, alle 30 Min)</div>';
+  } else {
+    socialData.forEach(s => {
+      let kiColor = s.ki_score >= 70 ? '#4dff91' : s.ki_score >= 50 ? '#ffd700' : s.ki_score >= 30 ? '#ffa040' : '#6b8cad';
+      let bar = Math.round(s.ki_score);
+      let trendCol = (s.trend_7d||0) >= 0 ? '#4dff91' : '#ff4d6b';
+      let sigBadge = s.signal && s.signal !== '─'
+        ? '<span style="font-size:10px;font-weight:bold;padding:2px 6px;border-radius:8px;background:' + (s.signal==='LONG'?'#0d3a1f':'#3a0d1a') + ';color:' + (s.signal==='LONG'?'#4dff91':'#ff4d6b') + '">' + s.signal + '</span>' : '';
+      let newsBadge = s.news_kat === 'POSITIV'
+        ? '<span style="font-size:9px;padding:1px 5px;border-radius:6px;background:#0d3a1f;color:#4dff91">NEWS ▲</span>'
+        : s.news_kat === 'NEGATIV'
+        ? '<span style="font-size:9px;padding:1px 5px;border-radius:6px;background:#3a0d1a;color:#ff4d6b">NEWS ▼</span>' : '';
+      let bestOpt = '';
+      if (s.best && s.signal && s.signal !== '─') {
+        let oType = s.signal === 'LONG' ? 'CALL' : 'PUT';
+        let oCol  = s.signal === 'LONG' ? '#4dff91' : '#ff4d6b';
+        bestOpt = '<div style="background:#0d1628;border:1px solid #1e3a5f;border-radius:6px;padding:5px 8px;margin-top:5px;font-size:11px">'
+          + '<span style="color:' + oCol + ';font-weight:bold">' + oType + ' $' + s.best.strike + '</span>'
+          + ' @ <b>$' + s.best.pr + '</b>'
+          + ' &nbsp;Vol:' + (s.best.vol||0).toLocaleString()
+          + ' &nbsp;Exp:' + (s.best.exp||'') + '</div>';
+      }
+      html += '<div style="padding:10px 14px;border-bottom:1px solid #1a2a40">'
+        + '<div style="display:flex;justify-content:space-between;align-items:center">'
+        +   '<div style="display:flex;align-items:center;gap:8px">'
+        +     '<span style="font-size:17px;font-weight:bold;color:#fff">' + s.sym + '</span>'
+        +     (s.price > 0 ? '<span style="color:#94a3b8;font-size:13px">$' + s.price.toFixed(2) + '</span>' : '')
+        +     '<span style="color:' + trendCol + ';font-size:12px">' + (s.trend_7d >= 0 ? '+' : '') + (s.trend_7d||0).toFixed(1) + '% (7T)</span>'
+        +     sigBadge + ' ' + newsBadge
+        +   '</div>'
+        +   '<div style="text-align:right">'
+        +     '<div style="font-size:18px;font-weight:bold;color:' + kiColor + '">' + bar + '</div>'
+        +     '<div style="font-size:9px;color:#4a6a8a">KI SCORE</div>'
+        +   '</div>'
+        + '</div>'
+        + (s.kat_text ? '<div style="font-size:11px;color:#4db8ff;margin-top:4px">' + s.kat_text + '</div>' : '')
+        + bestOpt
+        + '</div>';
     });
-    html += '</div></div>';
   }
+  html += '</div>';
 
-  // Influencer / Smart Money
+  // ── Hedge Fund Positionen (SEC 13F) ─────────────────────────────────────────
+  const hfData = data.hf_data || [];
+  html += '<div class="section"><div class="section-title" style="color:#a78bfa;border-left:3px solid #a78bfa">🏛 HEDGE FUNDS — SEC 13F Positionen</div>';
+  if (hfData.length === 0) {
+    html += '<div style="padding:12px 16px;color:#4a6a8a;font-size:12px">Wird beim nächsten Scan geladen...</div>';
+  } else {
+    hfData.forEach(hf => {
+      html += '<div style="padding:10px 14px;border-bottom:1px solid #1a2a40">'
+        + '<div style="display:flex;justify-content:space-between;align-items:center">'
+        +   '<div>'
+        +     '<span style="font-size:13px;font-weight:600;color:#e2e8f0">' + hf.manager + '</span>'
+        +     '<span style="font-size:10px;color:#475569;margin-left:8px">' + hf.form + ' &bull; ' + hf.date + '</span>'
+        +   '</div>'
+        +   (hf.url ? '<a href="' + hf.url + '" target="_blank" style="color:#a78bfa;font-size:11px">SEC ↗</a>' : '')
+        + '</div>';
+      if (hf.holdings && hf.holdings.length > 0) {
+        html += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">';
+        hf.holdings.forEach(h => {
+          let chg = h.chg_w || 0;
+          let chgCol = chg >= 0 ? '#4dff91' : '#ff4d6b';
+          html += '<div style="background:#0d1628;border:1px solid #1e3a5f;border-radius:8px;padding:4px 8px">'
+            + '<div style="font-weight:700;color:#60a5fa;font-size:13px">' + h.sym + '</div>'
+            + (h.price > 0 ? '<div style="color:#94a3b8;font-size:10px">$' + h.price + ' <span style="color:' + chgCol + '">' + (chg>=0?'+':'') + chg + '% 7T</span></div>' : '')
+            + '</div>';
+        });
+        html += '</div>';
+      }
+      html += '</div>';
+    });
+  }
+  html += '</div>';
+
+  // ── Leopold Aschenbrenner & Influencer ──────────────────────────────────────
   if (data.influencers && data.influencers.length > 0) {
-    html += '<div class="section"><div class="section-title" style="color:#ffa040;border-left:3px solid #ffa040">🧠 SMART MONEY — Leopold Aschenbrenner & Analysten</div>';
+    html += '<div class="section"><div class="section-title" style="color:#ffa040;border-left:3px solid #ffa040">🧠 LEOPOLD ASCHENBRENNER & Analysten</div>';
     data.influencers.forEach(inf => {
       let tBadges = inf.tickers.map(t => {
         let inScan = (data.longs || []).concat(data.shorts || []).find(r => r.t === t);
@@ -447,6 +521,27 @@ function renderResults(data, isNew) {
         + '<div class="news-title">' + titleHtml + '</div>'
         + '<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">' + tBadges + '</div>'
         + '</div>';
+    });
+    html += '</div>';
+  }
+
+  // ── Hermes Agent Alerts ────────────────────────────────────────────────────
+  if (data.hermes_alerts && data.hermes_alerts.length > 0) {
+    html += '<div class="section"><div class="section-title" style="color:#00e5ff;border-left:3px solid #00e5ff">🤖 HERMES AGENT — Übersehene Mover (' + data.hermes_alerts.length + ') ' + (data.hermes_ts ? data.hermes_ts : '') + '</div>';
+    data.hermes_alerts.forEach(a => {
+      let scoreCol = a.score >= 8 ? '#4dff91' : a.score >= 6 ? '#ffd700' : '#ffa040';
+      let dpInfo = a.dp && a.dp.dp_total ? '🏦 $' + (a.dp.dp_total/1e6).toFixed(1) + 'M Dark Pool' : '';
+      html += '<div style="padding:10px 14px;border-bottom:1px solid #1a2a40">'
+        + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">'
+        +   '<span style="font-size:16px;font-weight:bold;color:#fff">' + a.ticker + '</span>'
+        +   '<span style="font-size:18px;font-weight:bold;color:' + scoreCol + '">' + a.score + ' pts</span>'
+        + '</div>'
+        + '<div style="display:flex;flex-direction:column;gap:2px">';
+      (a.reasons || []).forEach(r => {
+        html += '<div style="font-size:11px;color:#94a3b8">• ' + r + '</div>';
+      });
+      if (dpInfo) html += '<div style="font-size:11px;color:#ffa040;margin-top:2px">' + dpInfo + '</div>';
+      html += '</div></div>';
     });
     html += '</div>';
   }
@@ -617,10 +712,12 @@ def results():
     data = state['results'] or load_results()
     if not data:
         return jsonify({'error': 'Noch kein Scan. Drücke SCAN STARTEN.'})
-    # Follow-up aus Cache anhängen
+    data = dict(data)
     if state.get('followup'):
-        data = dict(data)
         data['followup'] = state['followup']
+    with _hermes_lock:
+        data['hermes_alerts'] = state.get('hermes_alerts', [])
+        data['hermes_ts']     = state.get('hermes_ts', '')
     return jsonify(data)
 
 @app.route('/followup')
@@ -738,6 +835,68 @@ def hermes_approve():
                     'reason': f'Hermes OK | Bias:{bias} | Risk:{view["risk_level"]}',
                     'level': 'APPROVED'})
 
+# ── Hermes Monitor: aktiver Hintergrund-Agent ────────────────────────────────
+
+def hermes_monitor():
+    """
+    Hermes sucht alle 5 Min nach 10%+ Movern die der Haupt-Scanner übersehen hat.
+    Läuft nur während Marktzeiten (09:30-16:30 ET).
+    """
+    time.sleep(180)  # 3 Min warten bis Scan läuft
+    while True:
+        try:
+            now_utc  = datetime.now(timezone.utc)
+            h_utc    = now_utc.hour + now_utc.minute / 60
+            is_market = 13.4 <= h_utc <= 21.0 and now_utc.weekday() < 5
+
+            if is_market and not state['running']:
+                data = state['results'] or load_results()
+                if data:
+                    with _hermes_lock:
+                        state['hermes_running'] = True
+                    try:
+                        from scanner import hermes_hunt
+                        alerts = hermes_hunt(
+                            data.get('longs',  []),
+                            data.get('shorts', [])
+                        )
+                    finally:
+                        with _hermes_lock:
+                            state['hermes_running'] = False
+
+                    prev = [a['ticker'] for a in state.get('hermes_alerts', [])]
+                    new_finds = [a for a in alerts if a['ticker'] not in prev]
+
+                    with _hermes_lock:
+                        state['hermes_alerts'] = alerts
+                        state['hermes_ts']     = datetime.now().strftime('%H:%M')
+
+                    if new_finds:
+                        lines = [f'<b>🤖 HERMES — {state["hermes_ts"]} — {len(new_finds)} neue Funde</b>\n']
+                        for a in new_finds[:5]:
+                            lines.append(f'<b>{a["ticker"]}</b> (Score {a["score"]})')
+                            for r in a['reasons'][:3]:
+                                lines.append(f'  • {r}')
+                            lines.append('')
+                        tg_send('\n'.join(lines))
+
+                time.sleep(300)   # alle 5 Min
+            else:
+                time.sleep(600)   # außerhalb Markt: 10 Min
+        except Exception:
+            time.sleep(300)
+
+
+@app.route('/hermes/alerts')
+def hermes_alerts_api():
+    with _hermes_lock:
+        return jsonify({
+            'alerts':  state['hermes_alerts'],
+            'ts':      state['hermes_ts'],
+            'running': state['hermes_running'],
+        })
+
+
 # ── Startup ───────────────────────────────────────────────────────────────────
 
 saved = load_results()
@@ -751,6 +910,10 @@ state['next_scan'] = next_scan_time()
 # Auto-Scheduler im Hintergrund starten
 sched = threading.Thread(target=auto_scheduler, daemon=True)
 sched.start()
+
+# Hermes Agent starten
+hermes_thread = threading.Thread(target=hermes_monitor, daemon=True)
+hermes_thread.start()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))

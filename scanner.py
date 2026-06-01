@@ -4,7 +4,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import yfinance as yf
 
 ctx = ssl.create_default_context()
-API = os.environ.get('POLYGON_API_KEY', '')
+API           = os.environ.get('POLYGON_API_KEY', '')
+ALPACA_KEY    = os.environ.get('ALPACA_API_KEY',    '')
+ALPACA_SECRET = os.environ.get('ALPACA_SECRET_KEY', '')
 
 # ── Social Trending (Reddit WSB + Stocktwits) ────────────────────────────────
 _TICKER_RE = re.compile(r'\b([A-Z]{2,5})\b')
@@ -158,21 +160,207 @@ UNIVERSE = [
     'IONQ','RGTI','IREN','WULF','DELL','HPE',
     'GS','JPM','BAC','ASTS','LUNR','RKLB',
     'GLD','SLV','USO','AAL','DAL',
-    # Erweiterung: Crypto-Adjacent + Fintech + Enterprise
     'MSTR','COIN','HOOD','SOFI','ORCL','NOW',
-    # Energy + Commodities
-    'XOM','CVX',
-    # Defense + Aerospace
-    'LMT','RTX',
+    'XOM','CVX','LMT','RTX',
+    # Erweiterung: häufige Mover mit Katalysatoren
+    'SNOW','PANW','UBER','LYFT','RIVN','LCID','NIO','F','GM',
+    'SHOP','SQ','PYPL','ROKU','SPOT','PINS','SNAP',
+    'ENPH','SEDG','FSLR','NEE','HIMS','CELH','WOLF',
 ]
 
 POS_KEYS = ['contract','government','deal','partnership','upgrade','raised','beat',
             'record','billion','trump','invest','breakthrough','ai','quantum','launch',
             'buyback','dividend','acquisition','target','infrastructure','pivot',
-            'revenue','earnings','profit','surge','soar','stake','award']
+            'revenue','earnings','profit','surge','soar','stake','award','fda',
+            'approval','patent','merger','spin','ipo','buyout','license','guidance']
 NEG_KEYS = ['lawsuit','downgrade','miss','cut','investigation','fraud',
             'recall','ban','warning','below','probe','short seller','loss',
-            'decline','disappoint','weak','concern','risk']
+            'decline','disappoint','weak','concern','risk','violation','delay',
+            'bankruptcy','default','dilut','offering','withdrew']
+
+# ── Dark Pool / Block Trade Detection (Polygon Trades API) ───────────────────
+def get_darkpool_signal(ticker: str, today: str) -> dict:
+    """
+    Sucht große Block-Trades und Dark Pool Prints via Polygon /v3/trades.
+    Dark pool conditions: 37=Large Block, 41=OTC/Dark Pool, 20, 29, 80, 81.
+    """
+    try:
+        start = f'{today}T13:30:00Z'
+        url   = (f'https://api.polygon.io/v3/trades/{ticker}'
+                 f'?timestamp.gte={start}&order=desc&limit=250&apiKey={API}')
+        data   = poly_fetch(url)
+        trades = data.get('results', [])
+        if not trades:
+            return {}
+        DP_CONDS = {20, 29, 37, 41, 80, 81}
+        large_all = []
+        dark_prints = []
+        for t in trades:
+            size   = t.get('size', 0) or 0
+            price  = t.get('price', 0.0) or 0.0
+            dollar = size * price
+            conds  = set(t.get('conditions', []) or [])
+            is_dp  = bool(conds & DP_CONDS)
+            if dollar >= 500_000:
+                large_all.append(dollar)
+                if is_dp or dollar >= 2_000_000:
+                    dark_prints.append(dollar)
+        if not large_all:
+            return {}
+        return {
+            'count':    len(large_all),
+            'dp_count': len(dark_prints),
+            'total':    int(sum(large_all)),
+            'dp_total': int(sum(dark_prints)),
+            'largest':  int(max(large_all)),
+        }
+    except Exception:
+        return {}
+
+
+# ── Options Sweep Detection ───────────────────────────────────────────────────
+def get_options_sweep(contracts: list) -> dict:
+    """
+    Erkennt Sweep Orders: Vol > 2x OI = frische institutionelle Käufe.
+    Gibt Sweep-Anzahl und größten Block-Dollar zurück.
+    """
+    sweeps_call = sweeps_put = 0
+    top_call_dollar = top_put_dollar = 0.0
+    for c in contracts:
+        ctype  = c['details']['contract_type']
+        vol    = c['day'].get('volume', 0) or 0
+        oi     = max(c.get('open_interest', 0) or 1, 1)
+        pr     = c['day'].get('close') or c['day'].get('open') or 0
+        dollar = vol * pr * 100
+        if vol > oi * 2 and vol > 100:
+            if ctype == 'call': sweeps_call += 1
+            else:               sweeps_put  += 1
+        if ctype == 'call' and dollar > top_call_dollar: top_call_dollar = dollar
+        if ctype == 'put'  and dollar > top_put_dollar:  top_put_dollar  = dollar
+    return {
+        'sweeps_call':     sweeps_call,
+        'sweeps_put':      sweeps_put,
+        'top_call_dollar': int(top_call_dollar),
+        'top_put_dollar':  int(top_put_dollar),
+    }
+
+
+# ── Alpaca News API (kostenlos) ───────────────────────────────────────────────
+def get_alpaca_news(tickers: list, limit: int = 5) -> list:
+    """Alpaca Market News — kostenlos mit Paper-Account-Keys."""
+    if not (ALPACA_KEY and ALPACA_SECRET):
+        return []
+    try:
+        syms = ','.join(tickers[:10])
+        url  = f'https://data.alpaca.markets/v1beta1/news?symbols={syms}&limit={limit}&sort=desc'
+        req  = urllib.request.Request(url, headers={
+            'APCA-API-KEY-ID':     ALPACA_KEY,
+            'APCA-API-SECRET-KEY': ALPACA_SECRET,
+            'User-Agent':          'scanner/3.0',
+        })
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+            return json.loads(r.read()).get('news', [])
+    except Exception:
+        return []
+
+
+# ── Hermes Hunt: übersehene Mover suchen ─────────────────────────────────────
+def hermes_hunt(current_longs: list, current_shorts: list) -> list:
+    """
+    Hermes Agent: sucht 10%+ Mover die der Haupt-Scanner übersehen hat.
+    Checkt Dark Pool + Options Sweep + Polygon/Alpaca News für alle Kandidaten.
+    """
+    in_scan = {r['t'] for r in current_longs + current_shorts}
+    today   = datetime.now().strftime('%Y-%m-%d')
+
+    candidates = [t for t in UNIVERSE if t not in in_scan]
+    try:
+        social_t, _ = get_cached_social()
+        for t in social_t:
+            if t not in in_scan and t not in candidates and 2 <= len(t) <= 5:
+                candidates.append(t)
+    except Exception:
+        pass
+
+    alerts = []
+
+    def check_one(ticker):
+        score   = 0
+        reasons = []
+        dp_info = {}
+
+        # 1) Dark Pool Print
+        dp = get_darkpool_signal(ticker, today)
+        if dp.get('dp_total', 0) >= 1_000_000:
+            dp_info = dp
+            m = dp['dp_total'] / 1_000_000
+            score += 5 if m >= 10 else (4 if m >= 5 else 2)
+            reasons.append(f'Dark Pool ${m:.1f}M ({dp["dp_count"]} Prints)')
+
+        # 2) Options Sweep
+        try:
+            opt = poly_fetch(f'https://api.polygon.io/v3/snapshot/options/{ticker}?limit=100&apiKey={API}')
+            res = opt.get('results', [])
+            if res:
+                calls  = [r for r in res if r['details']['contract_type'] == 'call']
+                cv     = sum(r['day'].get('volume', 0) for r in calls)
+                oi_tot = sum(max(r.get('open_interest', 0) or 1, 1) for r in calls)
+                sw     = get_options_sweep(res)
+                if oi_tot and cv > oi_tot * 2:
+                    score += 3
+                    reasons.append(f'Call Sweep Vol:{cv:,} vs OI:{oi_tot:,}')
+                if sw['sweeps_call'] >= 3:
+                    score += 2
+                    reasons.append(f'{sw["sweeps_call"]} Call-Sweeps')
+                if sw['top_call_dollar'] >= 500_000:
+                    score += 1
+                    reasons.append(f'Block Call ${sw["top_call_dollar"]/1e6:.1f}M')
+        except Exception:
+            pass
+
+        # 3) Polygon News (letzte 6h)
+        try:
+            nd = poly_fetch(f'https://api.polygon.io/v2/reference/news?ticker={ticker}&limit=3&apiKey={API}')
+            cut = (datetime.now() - timedelta(hours=6)).strftime('%Y-%m-%dT%H:%M:%SZ')
+            for n in nd.get('results', []):
+                if n.get('published_utc', '') < cut:
+                    continue
+                tl = n.get('title', '').lower()
+                sent = next((i.get('sentiment','') for i in n.get('insights',[]) if i.get('ticker')==ticker), '')
+                if any(k in tl for k in POS_KEYS) and sent != 'negative':
+                    score += 3
+                    reasons.append(f'News: {n.get("title","")[:55]}')
+                    break
+        except Exception:
+            pass
+
+        # 4) Alpaca News
+        if score >= 2:
+            for n in get_alpaca_news([ticker], limit=3):
+                h = n.get('headline', '')
+                if any(k in h.lower() for k in POS_KEYS):
+                    score += 2
+                    reasons.append(f'Alpaca: {h[:50]}')
+                    break
+
+        if score >= 4 and reasons:
+            return {'ticker': ticker, 'score': score, 'reasons': reasons,
+                    'dp': dp_info, 'ts': datetime.now().strftime('%H:%M')}
+        return None
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = [ex.submit(check_one, t) for t in candidates[:30]]
+        for fut in as_completed(futs, timeout=60):
+            try:
+                r = fut.result()
+                if r:
+                    alerts.append(r)
+            except Exception:
+                pass
+
+    alerts.sort(key=lambda x: -x['score'])
+    return alerts[:8]
+
 
 # Paid Polygon plan ($79) — kein Rate-Limit nötig
 def poly_fetch(url, retries=2):
@@ -232,6 +420,9 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
             return None
         pc = pv / cv if cv else 99
 
+        # Options Sweep Detection
+        sweep = get_options_sweep(res)
+
         df = yf.download(ticker, period='20d', interval='1d', progress=False, auto_adjust=True)
         if df is None or len(df) < 3:
             return None
@@ -247,10 +438,18 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         period_high = max(highs[-10:]) if len(highs) >= 10 else max(highs)
         drop_from_high = ((closes[-1] - period_high) / period_high) * 100
 
-        news_data = poly_fetch(f'https://api.polygon.io/v2/reference/news?ticker={ticker}&limit=5&apiKey={API}')
+        # Dark Pool parallel (Thread)
+        dp_result = [{}]
+        def _fetch_dp():
+            dp_result[0] = get_darkpool_signal(ticker, today)
+        dp_thread = threading.Thread(target=_fetch_dp, daemon=True)
+        dp_thread.start()
+
+        # Polygon News
+        news_data = poly_fetch(f'https://api.polygon.io/v2/reference/news?ticker={ticker}&limit=8&apiKey={API}')
         katalysator = 'KEIN'
-        kat_text = ''
-        kat_url  = ''
+        kat_text = kat_url = ''
+        al_news_text = ''
         for n in news_data.get('results', []):
             if n.get('published_utc', '')[:10] < news_cutoff:
                 continue
@@ -269,36 +468,78 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
                     kat_text = n.get('title', '')[:70]
                     kat_url  = n.get('article_url', '')
 
-        # Social momentum score
+        # Alpaca News als zweite Quelle (nur wenn Polygon nichts hat)
+        if katalysator == 'KEIN':
+            for an in get_alpaca_news([ticker], limit=3):
+                h = an.get('headline', '')
+                hl = h.lower()
+                if any(k in hl for k in POS_KEYS):
+                    katalysator = 'POSITIV'
+                    kat_text = h[:70]
+                    kat_url  = an.get('url', '')
+                    al_news_text = '[Alpaca] '
+                    break
+                elif any(k in hl for k in NEG_KEYS):
+                    katalysator = 'NEGATIV'
+                    kat_text = h[:70]
+                    kat_url  = an.get('url', '')
+                    al_news_text = '[Alpaca] '
+
+        # Social momentum
         _, social_scores = get_cached_social()
         social_score = social_scores.get(ticker, 0)
-        social_boost = min(2, social_score // 50)  # max +2 für social buzz
+        social_boost = min(2, social_score // 50)
+
+        # Dark Pool warten
+        dp_thread.join(timeout=8)
+        dp = dp_result[0]
+        dp_dollar = dp.get('dp_total', 0)
+        dp_score  = (3 if dp_dollar >= 5_000_000 else
+                     2 if dp_dollar >= 1_000_000 else
+                     1 if dp_dollar >= 500_000   else 0)
 
         long_score = short_score = 0
-        if pc < 0.3:    long_score  += 3
-        elif pc < 0.5:  long_score  += 1
-        if pc > 0.8:    short_score += 3
-        elif pc > 0.6:  short_score += 1
-        if trend_pct < -7:    short_score += 4
-        elif trend_pct < -4:  short_score += 2
-        elif trend_pct < -2:  short_score += 1
-        # Trend-Bonus: positiver 10T-Trend gibt LONG-Punkte
-        if 5 < trend_pct < 25:  long_score += 2
-        if trend_pct >= 25 and short_trend > 0:  long_score  += 2  # Starker Aufwärtstrend, läuft noch
-        if trend_pct >= 25 and short_trend < -2: short_score += 2  # Starker Trend + gerade Pullback
-        # FIX: Kein auto-SHORT mehr nur wegen hohem Trend — nur bei echtem Pullback
-        # (alt: trend_pct >= 25 → short_score += 3 war falsch für ARM/IONQ/RGTI/LUNR)
-        if drop_from_high < -8:    short_score += 4
-        elif drop_from_high < -5:  short_score += 2
-        elif drop_from_high < -3:  short_score += 1
+
+        # P/C Ratio
+        if pc < 0.3:   long_score  += 3
+        elif pc < 0.5: long_score  += 1
+        if pc > 0.8:   short_score += 3
+        elif pc > 0.6: short_score += 1
+
+        # Trend
+        if trend_pct < -7:   short_score += 4
+        elif trend_pct < -4: short_score += 2
+        elif trend_pct < -2: short_score += 1
+        if 5 < trend_pct < 25:                              long_score  += 2
+        if trend_pct >= 25 and short_trend > 0:             long_score  += 2
+        if trend_pct >= 25 and short_trend < -2:            short_score += 2
+
+        # Abstand vom Hoch
+        if drop_from_high < -8:   short_score += 4
+        elif drop_from_high < -5: short_score += 2
+        elif drop_from_high < -3: short_score += 1
+
+        # Kurzfrist-Trend
         if short_trend < -3:   short_score += 2
         elif short_trend < -1: short_score += 1
         if short_trend > 3:    long_score  += 1
+
+        # News-Katalysator (+4 — wichtigstes Signal für 10%+ Moves)
         if katalysator == 'POSITIV': long_score  += 4
         if katalysator == 'NEGATIV': short_score += 4
+
+        # Dollar Flow
         if cp > pp * 3: long_score  += 1
         if pp > cp * 2: short_score += 1
-        # Social boost: Reddit/Stocktwits Hype → extra LONG-Punkte (Momentum)
+
+        # Options Sweep (+2 für institutionelle Käufe)
+        if sweep.get('sweeps_call', 0) >= 2: long_score  += 2
+        if sweep.get('sweeps_put',  0) >= 2: short_score += 2
+
+        # Dark Pool (+dp_score für große Block-Trades)
+        long_score  += dp_score
+
+        # Social Hype
         if social_boost > 0 and trend_pct > 0:
             long_score += social_boost
 
@@ -306,7 +547,6 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         bp = best_option(puts,  False, price, today, exp_cutoff)
 
         tie_goes_short = drop_from_high < -8 and short_score >= 4
-
         if short_score >= 4 and (short_score > long_score or tie_goes_short) and bp:
             signal, score, best, otype = 'SHORT', short_score, bp, 'PUT'
         elif long_score >= 4 and long_score > short_score and bc:
@@ -314,7 +554,6 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         else:
             signal, score, best, otype = 'WATCH', 0, bc or bp, None
 
-        # Konflikt-Flag: SHORT-Signal aber starker positiver Langzeit-Trend (Pullback in Aufwärtstrend)
         conflict = signal == 'SHORT' and trend_pct > 15 and short_trend > -5
 
         ziel = mult = None
@@ -329,12 +568,13 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
             'trend': round(trend_pct, 1), 'prev_chg': round(prev_chg, 1),
             'drop_high': round(drop_from_high, 1), 'short_trend': round(short_trend, 1),
             'long_score': long_score, 'short_score': short_score,
-            'katalysator': katalysator, 'kat_text': kat_text,
+            'katalysator': katalysator, 'kat_text': (al_news_text + kat_text),
             'best': best, 'otype': otype, 'ziel': ziel, 'mult': mult,
             'atr': round(atr, 2), 'today': today, 'conflict': conflict,
-            'kat_url': kat_url, 'social_score': social_score
+            'kat_url': kat_url, 'social_score': social_score,
+            'dp': dp, 'sweep': sweep,
         }
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -387,18 +627,123 @@ def run_scan(progress_cb=None):
     movers = sorted(movers, key=lambda x: (x['pc'], -x['long_score']))[:5]
 
     # Social trending Symbole markieren
+    scan_map = {r['t']: r for r in results}
     for r in results:
         r['is_social'] = r['t'] in social_tickers
 
+    # ── Social mit KI-Score ───────────────────────────────────────────────────
+    def _score_social_ticker(sym, mentions, src_score):
+        """KI-Score für Social-Trending-Ticker: Options + Preis + Trend."""
+        ki = min(30, int(src_score / 3))      # Social-Basis (0-30)
+        price = trend_7d = 0.0
+        pc_ratio = 1.0
+        news_kat = 'KEIN'
+        kat_text = ''
+        best_opt = None
+        signal = '─'
+        # Wenn schon im Haupt-Scan: Daten direkt übernehmen
+        if sym in scan_map:
+            r = scan_map[sym]
+            price    = r['price']
+            trend_7d = r['trend']
+            pc_ratio = r['pc']
+            news_kat = r['katalysator']
+            kat_text = r['kat_text']
+            best_opt = r.get('best')
+            signal   = r['signal']
+            if r['pc'] < 0.3:  ki += 20
+            elif r['pc'] < 0.5: ki += 10
+            if trend_7d > 10:   ki += 20
+            elif trend_7d > 5:  ki += 10
+            elif trend_7d < -5: ki -= 10
+            if news_kat == 'POSITIV': ki += 20
+            if news_kat == 'NEGATIV': ki -= 10
+            dp_total = r.get('dp', {}).get('dp_total', 0) or 0
+            if dp_total >= 1_000_000: ki += 10
+        else:
+            try:
+                df = yf.download(sym, period='7d', interval='1d', progress=False, auto_adjust=True)
+                if df is not None and len(df) >= 2:
+                    cls = list(df['Close'].values.flatten().astype(float))
+                    price    = round(cls[-1], 2)
+                    trend_7d = round((cls[-1]-cls[0])/cls[0]*100, 1)
+                    if trend_7d > 10: ki += 20
+                    elif trend_7d > 5: ki += 10
+            except Exception:
+                pass
+        ki = max(0, min(99, ki))
+        return {
+            'sym':     sym,
+            'price':   price,
+            'trend_7d': trend_7d,
+            'pc':      round(pc_ratio, 3),
+            'ki_score': ki,
+            'mentions': mentions,
+            'source':  '',
+            'news_kat': news_kat,
+            'kat_text': kat_text[:60],
+            'best':    best_opt,
+            'signal':  signal,
+        }
+
+    social_raw, social_scores_map = get_cached_social()
+    social_data = []
+    for sym in social_raw[:12]:
+        sc = social_scores_map.get(sym, 0)
+        entry = _score_social_ticker(sym, sc, sc)
+        social_data.append(entry)
+    social_data.sort(key=lambda x: -x['ki_score'])
+
+    # ── Hedge Fund 13F (SEC EDGAR) ────────────────────────────────────────────
+    HF_CIK = {
+        "Pershing Square (Ackman)":  "0001336528",
+        "Duquesne (Druckenmiller)":  "0001536411",
+        "Tiger Global":              "0001167483",
+        "Coatue Management":         "0001336119",
+        "Appaloosa (Tepper)":        "0001418814",
+    }
+
+    def _fetch_hf_quick(name, cik):
+        try:
+            cik_pad = cik.lstrip('0').zfill(10)
+            url = f'https://data.sec.gov/submissions/CIK{cik_pad}.json'
+            req = urllib.request.Request(url, headers={
+                'User-Agent': 'scanner/3.0 yusufbruder@gmail.com', 'Accept': 'application/json'})
+            with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+                d = json.loads(r.read())
+            filings = d.get('filings', {}).get('recent', {})
+            forms, dates, accnums = filings.get('form',[]), filings.get('filingDate',[]), filings.get('accessionNumber',[])
+            for i, form in enumerate(forms[:20]):
+                if '13F' in form:
+                    return {
+                        'manager': name,
+                        'form':    form,
+                        'date':    dates[i] if i < len(dates) else '',
+                        'url':     f'https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=13F&dateb=&owner=include&count=5',
+                        'holdings': [],
+                    }
+        except Exception:
+            pass
+        return None
+
+    hf_data = []
+    for nm, cik in HF_CIK.items():
+        entry = _fetch_hf_quick(nm, cik)
+        if entry:
+            hf_data.append(entry)
+        time.sleep(0.5)
+
     return {
-        'longs': longs[:10],
-        'shorts': shorts[:10],
-        'watch': watch,
-        'movers': movers,
-        'social': social_tickers[:10],
+        'longs':      longs[:10],
+        'shorts':     shorts[:10],
+        'watch':      watch,
+        'movers':     movers,
+        'social':     social_tickers[:10],    # rückwärtskompatibel
+        'social_data': social_data,           # neu: mit KI-Score + Preis
+        'hf_data':    hf_data,               # neu: Hedge Fund Filings
         'influencers': influencers,
-        'scanned': len(results),
-        'total': len(universe),
-        'time': datetime.now().strftime('%Y-%m-%d %H:%M'),
-        'today': today
+        'scanned':    len(results),
+        'total':      len(universe),
+        'time':       datetime.now().strftime('%Y-%m-%d %H:%M'),
+        'today':      today
     }
