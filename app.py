@@ -602,42 +602,55 @@ def enrich_background(scan_results: dict):
         _ctx2 = _ssl2.create_default_context()
         POLYGON_API = os.environ.get('POLYGON_API_KEY', '')
 
-        _CRYPTO = {'BTC', 'ETH', 'SOL', 'BTC.X', 'ETH.X', 'DOGE', 'XRP', 'MSTR'}
+        # Crypto komplett raus aus Social
+        _CRYPTO = {'BTC','ETH','SOL','BTC.X','ETH.X','DOGE','XRP','MSTR',
+                   'SHIB','ADA','AVAX','MATIC','LTC','BCH','LINK','UNI',
+                   'ATOM','XLM','ALGO','VET','HBAR','SAND','MANA','CRO'}
+
+        # Alpaca Keys für Live-Preise
+        _ALPA_KEY = os.environ.get('ALPACA_KEY', 'PK5T6OU5ENWZQK5DVZ746MHHEF')
+        _ALPA_SEC = os.environ.get('ALPACA_SECRET', '3nngSp7NksYikEZvf5hLihWEBtFdnuG336KfeYvFb5D9')
 
         def _poly_live(sym):
-            """Live-Preis + heute% via Polygon Snapshot, 7T% via Aggregates."""
+            """Live-Preis + heute% via Alpaca (zuverlässig), 7T% via Polygon Aggregates."""
             if sym in _CRYPTO:
                 return 0.0, 0.0, 0.0
-            POLY2 = os.environ.get('POLYGON_API_KEY', '')
-            if not POLY2:
-                return 0.0, 0.0, 0.0
             price = today_chg = trend_7d = 0.0
+            POLY2 = os.environ.get('POLYGON_API_KEY', '')
+
+            # 1) Alpaca Snapshot → Live-Preis + heute% (kostenlos, kein Auth-Problem)
             try:
-                # 1) Polygon Snapshot → Live-Preis + heutiges %
-                snap_url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{sym}?apiKey={POLY2}'
-                with _ur2.urlopen(_ur2.Request(snap_url), context=_ctx2, timeout=8) as r:
-                    sd = _json2.loads(r.read())
-                t = sd.get('ticker', {})
-                price      = float(t.get('lastTrade', {}).get('p') or t.get('day', {}).get('c') or 0)
-                today_chg  = round(float(t.get('todaysChangePerc') or 0), 1)
-                if not price:
-                    price = float(t.get('day', {}).get('c') or t.get('prevDay', {}).get('c') or 0)
+                alp_url = f'https://data.alpaca.markets/v2/stocks/{sym}/snapshot'
+                alp_req = _ur2.Request(alp_url, headers={
+                    'APCA-API-KEY-ID':     _ALPA_KEY,
+                    'APCA-API-SECRET-KEY': _ALPA_SEC,
+                })
+                with _ur2.urlopen(alp_req, context=_ctx2, timeout=8) as r:
+                    ad = _json2.loads(r.read())
+                lq   = ad.get('latestTrade', {}) or ad.get('latestQuote', {})
+                dbar = ad.get('dailyBar', {})
+                pbar = ad.get('prevDailyBar', {})
+                price = float(lq.get('p') or dbar.get('c') or 0)
+                prev_c = float(pbar.get('c') or price or 1)
+                if price and prev_c:
+                    today_chg = round((price - prev_c) / prev_c * 100, 1)
             except Exception:
                 pass
+
+            # 2) Polygon Aggregates → 7T Trend + Fallback-Preis
             try:
-                # 2) Aggregates → 7T Trend + heute% Fallback
                 from_d = (datetime.now() - timedelta(days=12)).strftime('%Y-%m-%d')
                 to_d   = datetime.now().strftime('%Y-%m-%d')
                 agg_url = f'https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/day/{from_d}/{to_d}?adjusted=true&sort=asc&limit=12&apiKey={POLY2}'
                 with _ur2.urlopen(_ur2.Request(agg_url), context=_ctx2, timeout=8) as r2:
-                    ad = _json2.loads(r2.read())
-                bars = [b['c'] for b in ad.get('results', []) if b.get('c')]
+                    pg = _json2.loads(r2.read())
+                bars = [b['c'] for b in pg.get('results', []) if b.get('c')]
                 if len(bars) >= 2:
                     if not price:
-                        price = round(bars[-1], 2)
-                    trend_7d = round((bars[-1] - bars[0]) / bars[0] * 100, 1)
-                    if today_chg == 0.0:   # Snapshot hat versagt → Fallback aus Aggregates
-                        today_chg = round((bars[-1] - bars[-2]) / bars[-2] * 100, 1) if bars[-2] else 0.0
+                        price     = round(bars[-1], 2)
+                    trend_7d  = round((bars[-1] - bars[0]) / bars[0] * 100, 1)
+                    if today_chg == 0.0:
+                        today_chg = round((bars[-1] - bars[-2]) / bars[-2] * 100, 1)
             except Exception:
                 pass
             return round(price, 2), today_chg, trend_7d
@@ -659,8 +672,10 @@ def enrich_background(scan_results: dict):
             return ''
 
         social_raw, social_scores_map = get_cached_social()
+        # Crypto komplett rausfiltern
+        social_filtered = [s for s in social_raw if s not in _CRYPTO and not s.endswith('.X')]
         social_data = []
-        for sym in social_raw[:12]:
+        for sym in social_filtered[:12]:
             src_sc = social_scores_map.get(sym, 0)
             ki = min(30, int(src_sc / 3))
             price = today_chg = trend_7d = 0.0
