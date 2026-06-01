@@ -1938,21 +1938,24 @@ def hermes_monitor():
                             except Exception:
                                 pass
 
-                    # 6b) Aschenbrenner-Positionen gezielt scannen (nach picks=[])
-                    ASCH_LONGS  = ['NBIS','KEEL','CLSK','RIOT','BTDR','IREN','APLD']
-                    ASCH_SHORTS = ['NVDA','AVGO','AMD','SMH','ORCL']
-                    scan_map_t  = {r['t'] for r in data.get('longs',[]) + data.get('shorts',[]) + data.get('watch',[])}
-                    for sym in (ASCH_LONGS + ASCH_SHORTS)[:8]:  # max 8 um Zeit zu sparen
-                        if sym not in scan_map_t:
+                    # 6b) Aschenbrenner-Positionen im Hintergrund scannen (blockiert Hermes nicht)
+                    def _scan_asch(p_list):
+                        ASCH_LONGS  = ['NBIS','KEEL','CLSK','RIOT','BTDR']
+                        ASCH_SHORTS = ['NVDA','AVGO','AMD']
+                        scan_map_t  = {r['t'] for r in data.get('longs',[]) + data.get('shorts',[]) + data.get('watch',[])}
+                        for sym in ASCH_LONGS + ASCH_SHORTS:
+                            if sym in scan_map_t:
+                                continue
                             try:
                                 r = scan_ticker(sym, today, exp_cutoff, news_cutoff)
                                 if r and r['score'] >= 3:
                                     side = 'LONG' if sym in ASCH_LONGS else 'SHORT'
                                     r['hermes_score']   = r['score']
-                                    r['hermes_reasons'] = [f'Aschenbrenner {side} ${["$2.6B","$450M","$380M","$320M","$180M","$150M","$120M","$2B","$1.57B","$1B","$969M","$1.07B"].pop(0) if ASCH_LONGS+ASCH_SHORTS else ""} Position']
-                                    picks.append(r)
+                                    r['hermes_reasons'] = [f'Aschenbrenner {side} Position']
+                                    p_list.append(r)
                             except Exception:
                                 pass
+                    threading.Thread(target=_scan_asch, args=(picks,), daemon=True).start()
 
                     # 7) Universe erweitern
                     uni = state.get('hermes_universe', set())
