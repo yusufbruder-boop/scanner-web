@@ -2,6 +2,7 @@ import json, os, threading, time
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string, request
 import urllib.request, ssl
+# v2.1 — Tabs: Scanner / Intel
 
 app = Flask(__name__)
 
