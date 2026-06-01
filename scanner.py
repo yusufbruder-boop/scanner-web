@@ -500,28 +500,42 @@ def poly_fetch(url, retries=2):
             if attempt >= retries:
                 raise
 
-def best_option(contracts, is_call, price, today, exp_cutoff):
+def best_option(contracts, is_call, price, today, exp_cutoff, atr=5.0):
     tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
     candidates = []
     for c in contracts:
         exp = c['details']['expiration_date']
-        if exp > exp_cutoff:
+        if exp > exp_cutoff or exp <= today:
             continue
         strike = c['details']['strike_price']
         pct = ((strike - price) / price * 100) if is_call else ((price - strike) / price * 100)
         pr  = c['day'].get('close') or c['day'].get('open') or 0
         vol = c['day'].get('volume', 0)
         oi  = c.get('open_interest', 0)
-        if exp <= today:          # 0-DTE komplett ignorieren
+        if pr < 0.05 or vol < 50:
             continue
-        if 0.3 <= pct <= 12 and pr >= 0.05:   # min $0.05 — kein Pennies-Junk
-            candidates.append({
-                'strike': strike, 'pct': round(pct, 1), 'pr': pr,
-                'vol': vol, 'oi': oi, 'exp': exp,
-                'total': vol * pr * 100
-            })
-    candidates.sort(key=lambda x: x['pr'])
-    return next((c for c in candidates if c['vol'] > 30), candidates[0] if candidates else None)
+        # Erreichbarkeit: OTM darf nicht größer als ~ATR × Tage × Faktor sein
+        try:
+            days_left = max(1, (datetime.strptime(exp, '%Y-%m-%d') - datetime.now()).days)
+        except Exception:
+            days_left = 7
+        max_otm = min(12.0, (atr / price * 100) * (days_left ** 0.5) * 1.8)
+        if not (0.5 <= pct <= max_otm):
+            continue
+        # Vol/OI Ratio — echtes Interesse erforderlich
+        vol_oi = vol / oi if oi > 0 else 0
+        if oi > 500 and vol_oi < 0.15:   # Altbestand ohne frisches Interesse
+            continue
+        candidates.append({
+            'strike': strike, 'pct': round(pct, 1), 'pr': pr,
+            'vol': vol, 'oi': oi, 'exp': exp,
+            'total': vol * pr * 100,
+            'vol_oi': round(vol_oi, 2),
+            'days': days_left,
+        })
+    # Sortierung: meistes Volumen zuerst (nicht billigster Preis)
+    candidates.sort(key=lambda x: -x['vol'])
+    return candidates[0] if candidates else None
 
 def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
     try:
@@ -674,8 +688,8 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         if social_boost > 0 and trend_pct > 0:
             long_score += social_boost
 
-        bc = best_option(calls, True,  price, today, exp_cutoff)
-        bp = best_option(puts,  False, price, today, exp_cutoff)
+        bc = best_option(calls, True,  price, today, exp_cutoff, atr)
+        bp = best_option(puts,  False, price, today, exp_cutoff, atr)
 
         tie_goes_short = drop_from_high < -8 and short_score >= 4
         if short_score >= 4 and (short_score > long_score or tie_goes_short) and bp:
