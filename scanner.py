@@ -13,6 +13,12 @@ UNIVERSE = [
     'IONQ','RGTI','IREN','WULF','DELL','HPE',
     'GS','JPM','BAC','ASTS','LUNR','RKLB',
     'GLD','SLV','USO','AAL','DAL',
+    # Erweiterung: Crypto-Adjacent + Fintech + Enterprise
+    'MSTR','COIN','HOOD','SOFI','ORCL','NOW',
+    # Energy + Commodities
+    'XOM','CVX',
+    # Defense + Aerospace
+    'LMT','RTX',
 ]
 
 POS_KEYS = ['contract','government','deal','partnership','upgrade','raised','beat',
@@ -123,8 +129,12 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         if trend_pct < -7:    short_score += 4
         elif trend_pct < -4:  short_score += 2
         elif trend_pct < -2:  short_score += 1
-        if 5 < trend_pct < 25: long_score  += 2
-        if trend_pct >= 25:    short_score += 3
+        # Trend-Bonus: positiver 10T-Trend gibt LONG-Punkte
+        if 5 < trend_pct < 25:  long_score += 2
+        if trend_pct >= 25 and short_trend > 0:  long_score  += 2  # Starker Aufwärtstrend, läuft noch
+        if trend_pct >= 25 and short_trend < -2: short_score += 2  # Starker Trend + gerade Pullback
+        # FIX: Kein auto-SHORT mehr nur wegen hohem Trend — nur bei echtem Pullback
+        # (alt: trend_pct >= 25 → short_score += 3 war falsch für ARM/IONQ/RGTI/LUNR)
         if drop_from_high < -8:    short_score += 4
         elif drop_from_high < -5:  short_score += 2
         elif drop_from_high < -3:  short_score += 1
@@ -148,6 +158,9 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         else:
             signal, score, best, otype = 'WATCH', 0, bc or bp, None
 
+        # Konflikt-Flag: SHORT-Signal aber starker positiver Langzeit-Trend (Pullback in Aufwärtstrend)
+        conflict = signal == 'SHORT' and trend_pct > 15 and short_trend > -5
+
         ziel = mult = None
         if best and signal != 'WATCH':
             ziel = (price + atr) if signal == 'LONG' else (price - atr)
@@ -162,7 +175,7 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
             'long_score': long_score, 'short_score': short_score,
             'katalysator': katalysator, 'kat_text': kat_text,
             'best': best, 'otype': otype, 'ziel': ziel, 'mult': mult,
-            'atr': round(atr, 2), 'today': today
+            'atr': round(atr, 2), 'today': today, 'conflict': conflict
         }
     except Exception as e:
         return None

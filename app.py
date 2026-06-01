@@ -261,6 +261,8 @@ function renderCard(r, cls, isNew) {
   let badge    = cls === 'long' ? 'badge-long'  : (cls === 'short' ? 'badge-short'  : 'badge-mover');
   let katBadge = r.katalysator !== 'KEIN'
     ? '<span class="badge badge-kat">' + (r.katalysator === 'POSITIV' ? 'POSITIV NEWS' : 'NEGATIV NEWS') + '</span>' : '';
+  let conflictBadge = r.conflict
+    ? '<span class="badge" style="background:#3a2000;color:#ffa500;border:1px solid #a06000">⚠ PULLBACK</span>' : '';
   let opt = b ? optionBox(b, r.otype || (cls === 'short' ? 'PUT' : 'CALL'), r.mult, r.today) : '';
   let kat = r.kat_text ? '<div class="kat-text">' + r.kat_text + '</div>' : '';
   let flash = isNew ? ' new-flash' : '';
@@ -269,7 +271,7 @@ function renderCard(r, cls, isNew) {
     + '<div class="card-header">'
     +   '<div><span class="ticker">' + r.t + '</span>'
     +   '<span class="price ' + sigColor + '" style="margin-left:10px">$' + r.price + '</span></div>'
-    +   '<div style="display:flex;gap:6px;align-items:center">' + katBadge
+    +   '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' + katBadge + conflictBadge
     +   '<span class="badge ' + badge + '">' + r.signal + (r.score > 0 ? ' ' + r.score : '') + '</span></div>'
     + '</div>'
     + '<div class="card-body">'
