@@ -1,6 +1,6 @@
 import json, os, threading, time
 from datetime import datetime, timezone, timedelta
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 import urllib.request, ssl
 
 app = Flask(__name__)
@@ -614,6 +614,108 @@ def social_api():
         return jsonify({'tickers': tickers, 'scores': scores})
     except Exception as e:
         return jsonify({'error': str(e)})
+
+# ── Hermes AI-Gate ────────────────────────────────────────────────────────────
+# Broker zwischen Hermes (lokal) und bot.js (Railway)
+# Hermes schreibt Market-View → bot.js liest vor jedem Trade
+
+_hermes_view = {
+    'bias':           'NEUTRAL',   # BULL / BEAR / NEUTRAL
+    'risk_level':     'NORMAL',    # NORMAL / HIGH / EXTREME
+    'approved_long':  [],          # Symbole die Hermes für LONG freigegeben hat
+    'approved_short': [],          # Symbole die Hermes für SHORT freigegeben hat
+    'blocked':        [],          # Explizit gesperrte Symbole
+    'reason':         'Noch keine Analyse',
+    'market_context': '',
+    'ts':             None,
+    'positions_ok':   True,        # False = keine neuen Positionen öffnen
+    'analysis':       []           # Letzte AI-Analysen [{sym, action, approved, reason}]
+}
+_hermes_lock = threading.Lock()
+
+@app.route('/hermes', methods=['GET'])
+def hermes_get():
+    with _hermes_lock:
+        return jsonify(_hermes_view)
+
+@app.route('/hermes', methods=['POST'])
+def hermes_post():
+    data = request.json or {}
+    with _hermes_lock:
+        _hermes_view.update(data)
+        _hermes_view['ts'] = datetime.now().isoformat()
+    return jsonify({'ok': True})
+
+@app.route('/hermes/approve', methods=['POST'])
+def hermes_approve():
+    """bot.js ruft das auf um Trade-Approval zu bekommen."""
+    data     = request.json or {}
+    symbol   = data.get('symbol', '')
+    action   = data.get('action', 'buy')   # buy / sell / short
+    score    = data.get('score', 0)
+    rsi      = data.get('rsi', 50)
+    reason   = data.get('reason', '')
+    price    = data.get('price', 0)
+    gain_pct = data.get('gain_pct', 0)
+
+    with _hermes_lock:
+        view = dict(_hermes_view)
+
+    # Sofort-Ablehnungen
+    if view['risk_level'] == 'EXTREME':
+        return jsonify({'approved': False, 'reason': 'EXTREME Risk — kein Trading', 'level': 'EXTREME'})
+
+    if symbol in view.get('blocked', []):
+        return jsonify({'approved': False, 'reason': f'{symbol} ist geblockt', 'level': 'BLOCKED'})
+
+    # Kein neues Positionieren erlaubt
+    if action in ('buy', 'short') and not view.get('positions_ok', True):
+        return jsonify({'approved': False, 'reason': 'positions_ok=False — keine neuen Trades', 'level': 'PAUSED'})
+
+    # Approved-List prüfen
+    approved_long  = view.get('approved_long', [])
+    approved_short = view.get('approved_short', [])
+
+    if action == 'buy' and approved_long:
+        if symbol not in approved_long:
+            return jsonify({'approved': False,
+                            'reason': f'{symbol} nicht in Hermes LONG-Liste: {approved_long[:5]}',
+                            'level': 'NOT_APPROVED'})
+
+    if action == 'short' and approved_short:
+        if symbol not in approved_short:
+            return jsonify({'approved': False,
+                            'reason': f'{symbol} nicht in Hermes SHORT-Liste',
+                            'level': 'NOT_APPROVED'})
+
+    # Verkäufe werden immer genehmigt (Exit ist immer ok)
+    if action in ('sell', 'cover'):
+        return jsonify({'approved': True, 'reason': 'Exit immer erlaubt', 'level': 'ALWAYS'})
+
+    # Bias-Check
+    bias = view.get('bias', 'NEUTRAL')
+    if action == 'buy' and bias == 'BEAR':
+        return jsonify({'approved': False, 'reason': f'Hermes sieht BEAR-Markt: {view.get("reason","")}',
+                        'level': 'BIAS'})
+
+    ts = view.get('ts')
+    age_min = 999
+    if ts:
+        try:
+            delta = datetime.now() - datetime.fromisoformat(ts)
+            age_min = int(delta.total_seconds() / 60)
+        except Exception:
+            pass
+
+    # Hermes-Analyse älter als 30 Min → Pass-through (kein Blocking)
+    if age_min > 30:
+        return jsonify({'approved': True,
+                        'reason': f'Hermes-Analyse veraltet ({age_min}min) — Pass-through',
+                        'level': 'STALE'})
+
+    return jsonify({'approved': True,
+                    'reason': f'Hermes OK | Bias:{bias} | Risk:{view["risk_level"]}',
+                    'level': 'APPROVED'})
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 
