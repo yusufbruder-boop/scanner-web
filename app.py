@@ -70,6 +70,7 @@ FOLLOWUP2_UTC_MINUTE = 0
 
 def _alpaca(path, method='GET', body=None):
     """Alpaca REST API Aufruf."""
+    import urllib.error
     try:
         url = f'{ALPACA_BASE}{path}'
         headers = {
@@ -82,6 +83,14 @@ def _alpaca(path, method='GET', body=None):
         ctx  = ssl.create_default_context()
         with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
             return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = json.loads(e.read())
+        except Exception:
+            err_body = {}
+        err_body['http_status'] = e.code
+        err_body.setdefault('message', str(e))
+        return err_body
     except Exception as e:
         return {'error': str(e)}
 
@@ -161,6 +170,12 @@ def hermes_auto_trade(signal_result: dict):
     if not strike or not exp or opt_price <= 0:
         return
 
+    # Strike-Sanity: max 20% OTM/ITM vom aktuellen Preis (verhindert falsche Polygon-Daten)
+    if price > 0:
+        pct_from_price = abs(strike - price) / price * 100
+        if pct_from_price > 20:
+            return
+
     # OCC Symbol bauen
     occ = _build_occ(sym, exp, strike, otype)
     if not occ:
@@ -173,8 +188,8 @@ def hermes_auto_trade(signal_result: dict):
     if trade_key in mem.get('auto_trades_today', {}):
         return
 
-    # Anzahl Kontrakte: AUTO_TRADE_AMOUNT / (opt_price * 100), mind. 1
-    contracts = max(1, int(AUTO_TRADE_AMOUNT / (opt_price * 100)))
+    # Anzahl Kontrakte: AUTO_TRADE_AMOUNT / (opt_price * 100), mind. 1, max 10
+    contracts = max(1, min(10, int(AUTO_TRADE_AMOUNT / (opt_price * 100))))
     cost = round(contracts * opt_price * 100, 2)
 
     # Options Order auf Alpaca
@@ -241,30 +256,47 @@ def memory_track_signal(sym, price, signal, score, reasons):
         save_memory(mem)
 
 def memory_update_pl(poly_key):
-    """Aktualisiert P&L für alle offenen Signale via Polygon."""
+    """Aktualisiert P&L für alle offenen Signale via Alpaca Data API (Polygon snapshot NOT_AUTHORIZED)."""
     mem = load_memory()
     changed = False
+    open_syms = [s for s, sig in mem['signals'].items() if sig.get('status') == 'open']
+    if not open_syms:
+        return mem
+
+    # Batch-Fetch via Alpaca Snapshots (bis 50 Symbole auf einmal)
+    snapshots = {}
+    try:
+        ctx = ssl.create_default_context()
+        for i in range(0, len(open_syms), 40):
+            batch = open_syms[i:i+40]
+            syms_param = ','.join(batch)
+            url = f'https://data.alpaca.markets/v2/stocks/snapshots?symbols={syms_param}&feed=iex'
+            req = urllib.request.Request(url, headers={
+                'APCA-API-KEY-ID':     ALPACA_KEY,
+                'APCA-API-SECRET-KEY': ALPACA_SECRET,
+            })
+            with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+                snapshots.update(json.loads(r.read()))
+    except Exception:
+        pass
+
     for sym, sig in mem['signals'].items():
         if sig.get('status') != 'open':
             continue
-        try:
-            ctx = ssl.create_default_context()
-            url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{sym}?apiKey={poly_key}'
-            with urllib.request.urlopen(urllib.request.Request(url), context=ctx, timeout=6) as r:
-                d = json.loads(r.read())
-            t = d.get('ticker', {})
-            now_price = float(t.get('lastTrade', {}).get('p') or t.get('day', {}).get('c') or 0)
-            if now_price and sig['entry_price']:
-                if sig['signal'] == 'LONG':
-                    pl_pct = (now_price - sig['entry_price']) / sig['entry_price'] * 100
-                else:
-                    pl_pct = (sig['entry_price'] - now_price) / sig['entry_price'] * 100
-                sig['current_pl_pct'] = round(pl_pct, 1)
-                sig['current_price']  = round(now_price, 2)
-                sig['peak_pl_pct']    = round(max(sig.get('peak_pl_pct', 0), pl_pct), 1)
-                changed = True
-        except Exception:
-            pass
+        snap = snapshots.get(sym, {})
+        now_price = float(
+            (snap.get('latestTrade') or {}).get('p') or
+            (snap.get('dailyBar') or {}).get('c') or 0
+        )
+        if now_price and sig['entry_price']:
+            if sig['signal'] == 'LONG':
+                pl_pct = (now_price - sig['entry_price']) / sig['entry_price'] * 100
+            else:
+                pl_pct = (sig['entry_price'] - now_price) / sig['entry_price'] * 100
+            sig['current_pl_pct'] = round(pl_pct, 1)
+            sig['current_price']  = round(now_price, 2)
+            sig['peak_pl_pct']    = round(max(sig.get('peak_pl_pct', 0), pl_pct), 1)
+            changed = True
     if changed:
         save_memory(mem)
     return mem
@@ -336,8 +368,33 @@ def hermes_self_review(scan_data: dict, poly_key: str):
                    scan_data.get('longs', []) + scan_data.get('shorts', []) +
                    scan_data.get('movers', [])}
 
-    # 2) Was hat sich heute wirklich bewegt? (Polygon Gainers/Losers)
+    # 2) Empfohlene Stocks via Alpaca Snapshots prüfen (Polygon NOT_AUTHORIZED für snapshots)
     real_movers = {}
+    rec_syms = list(recommended.keys())[:40]
+    if rec_syms:
+        try:
+            syms_param = ','.join(rec_syms)
+            url = f'https://data.alpaca.markets/v2/stocks/snapshots?symbols={syms_param}&feed=iex'
+            req = urllib.request.Request(url, headers={
+                'APCA-API-KEY-ID':     ALPACA_KEY,
+                'APCA-API-SECRET-KEY': ALPACA_SECRET,
+            })
+            with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+                snaps = json.loads(r.read())
+            for sym, snap in snaps.items():
+                daily = snap.get('dailyBar') or {}
+                prev  = snap.get('prevDailyBar') or {}
+                price = float(daily.get('c') or 0)
+                pc    = float(prev.get('c') or price or 1)
+                chg   = round((price - pc) / pc * 100, 1) if pc else 0
+                vol   = int(daily.get('v') or 0)
+                pvol  = int(prev.get('v') or 1)
+                vol_r = round(vol / pvol, 1) if pvol else 0
+                if sym and price >= 5:
+                    real_movers[sym] = {'chg': chg, 'price': price, 'vol_ratio': vol_r}
+        except Exception:
+            pass
+    # Zusätzlich Polygon Gainers/Losers für Misses (optional, kann 403 geben)
     for direction in ['gainers', 'losers']:
         try:
             url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/{direction}?apiKey={poly_key}'
@@ -354,7 +411,7 @@ def hermes_self_review(scan_data: dict, poly_key: str):
                 vol   = int(day.get('v') or 0)
                 pvol  = int(prev.get('v') or 1)
                 vol_r = round(vol / pvol, 1) if pvol else 0
-                if sym and abs(chg) >= 5 and price >= 5:
+                if sym and abs(chg) >= 5 and price >= 5 and sym not in real_movers:
                     real_movers[sym] = {'chg': chg, 'price': price, 'vol_ratio': vol_r}
         except Exception:
             pass
