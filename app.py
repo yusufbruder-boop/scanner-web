@@ -470,6 +470,21 @@ def hermes_self_review(scan_data: dict, poly_key: str):
         pattern['reason_missed'] = ' | '.join(reasons)
         miss_patterns.append(pattern)
 
+    # 5b) Falsche Signale erkennen (LONG auf crashed, SHORT auf ripped)
+    false_signals = []
+    for sym, rec in recommended.items():
+        mv = real_movers.get(sym, {})
+        chg = mv.get('chg', 0)
+        if rec.get('signal') == 'LONG' and chg <= -10:
+            false_signals.append({'sym': sym, 'signal': 'LONG', 'chg': chg, 'date': today,
+                                   'reason': f'LONG empfohlen aber {chg:.1f}% gefallen'})
+        elif rec.get('signal') == 'SHORT' and chg >= 8:
+            false_signals.append({'sym': sym, 'signal': 'SHORT', 'chg': chg, 'date': today,
+                                   'reason': f'SHORT empfohlen aber +{chg:.1f}% gestiegen'})
+    if false_signals:
+        learn.setdefault('false_signals', [])
+        learn['false_signals'] = (false_signals + learn['false_signals'])[:40]
+
     # 6) Gewichtung automatisch anpassen
     changes = []
     w = learn['weights']
@@ -486,6 +501,12 @@ def hermes_self_review(scan_data: dict, poly_key: str):
     if len(small_misses) >= 2:
         w['small_cap_boost'] = min(3, w.get('small_cap_boost', 0) + 1)
         changes.append(f'Small-Cap Boost +{w["small_cap_boost"]} (${[round(m["price"]) for m in small_misses]} verpasst)')
+
+    # Wenn falsche Signale (Crash-Longs) → false_signal_count erhöhen
+    if len(false_signals) >= 1:
+        w['false_signal_count'] = w.get('false_signal_count', 0) + len(false_signals)
+        syms_fs = ', '.join(f'{f["sym"]} {f["chg"]:+.0f}%' for f in false_signals[:3])
+        changes.append(f'Falsche Signale heute: {syms_fs} → catastrophic-filter aktiv')
 
     # Wenn Misses Earnings hatten → Earnings-Bonus erhöhen
     earnings_misses = [m for m in miss_patterns if m['had_news']]
@@ -525,6 +546,9 @@ def hermes_self_review(scan_data: dict, poly_key: str):
     if miss_patterns:
         miss_str = ', '.join(f'{m["sym"]} {m["chg"]:+.0f}%' for m in miss_patterns[:4])
         lines.append(f'❌ Verpasst: {miss_str}')
+    if false_signals:
+        fs_str = ', '.join(f'{f["sym"]} {f["chg"]:+.0f}%' for f in false_signals[:3])
+        lines.append(f'⚠️ Falsche Signale: {fs_str}')
     if changes:
         lines.append(f'\n📈 Gelernt heute:')
         for c in changes:
@@ -2428,6 +2452,22 @@ def hermes_monitor():
                                     picks.append(r)
                                     memory_track_signal(r['t'], r['price'], r['signal'],
                                                         r['score'], r.get('hermes_reasons',[]))
+                                elif r and a['score'] >= 9 and r.get('signal') == 'WATCH':
+                                    # Starke institutionelle Flows erzwingen Signal
+                                    # (Scanner sagt WATCH aber Hermes sieht riesige Sweep-Aktivität)
+                                    net_dir  = a.get('net_direction', 'LONG')
+                                    opt_type = 'CALL' if net_dir == 'LONG' else 'PUT'
+                                    best_opt = r.get('best')
+                                    if best_opt:
+                                        r['signal']         = net_dir
+                                        r['score']          = a['score']
+                                        r['otype']          = opt_type
+                                        r['hermes_score']   = a['score']
+                                        r['hermes_reasons'] = [str(x) for x in a.get('reasons', [])]
+                                        r['hermes_override'] = True
+                                        picks.append(r)
+                                        memory_track_signal(r['t'], r['price'], net_dir,
+                                                            a['score'], r['hermes_reasons'])
                             except Exception:
                                 pass
 

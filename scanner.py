@@ -550,6 +550,8 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
 
         # 2) Options Sweep (Polygon Snapshot)
         price_from_opt = 0
+        call_sweeps_n = 0
+        put_sweeps_n  = 0
         try:
             opt = poly_fetch(f'https://api.polygon.io/v3/snapshot/options/{ticker}?limit=100&apiKey={API}')
             res = opt.get('results', [])
@@ -559,12 +561,17 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
                 cv     = sum(r['day'].get('volume', 0) for r in calls)
                 oi_tot = sum(max(r.get('open_interest', 0) or 1, 1) for r in calls)
                 sw     = get_options_sweep(res)
+                call_sweeps_n = sw.get('sweeps_call', 0)
+                put_sweeps_n  = sw.get('sweeps_put', 0)
                 if oi_tot and cv > oi_tot * 2 and cv > 200:
                     score += 3
                     reasons.append(f'Call Sweep Vol:{cv:,} vs OI:{oi_tot:,}')
-                if sw['sweeps_call'] >= 2:
+                if call_sweeps_n >= 2:
                     score += 2
-                    reasons.append(f'{sw["sweeps_call"]} Call-Sweeps erkannt')
+                    reasons.append(f'{call_sweeps_n} Call-Sweeps erkannt')
+                if put_sweeps_n >= 2:
+                    score += 1
+                    reasons.append(f'{put_sweeps_n} Put-Sweeps erkannt')
                 if sw['top_call_dollar'] >= 500_000:
                     score += 1
                     reasons.append(f'Block Call ${sw["top_call_dollar"]/1e6:.1f}M')
@@ -614,13 +621,17 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
 
         if score >= 4 and reasons:
             price = price_from_opt or (mover['price'] if mover else 0)
+            net_dir = 'LONG' if call_sweeps_n >= put_sweeps_n else 'SHORT'
             return {
-                'ticker':  ticker,
-                'score':   score,
-                'reasons': reasons[:4],
-                'dp':      dp_info,
-                'price':   round(price, 2),
-                'ts':      datetime.now().strftime('%H:%M'),
+                'ticker':        ticker,
+                'score':         score,
+                'reasons':       reasons[:4],
+                'dp':            dp_info,
+                'price':         round(price, 2),
+                'ts':            datetime.now().strftime('%H:%M'),
+                'call_sweeps':   call_sweeps_n,
+                'put_sweeps':    put_sweeps_n,
+                'net_direction': net_dir,
             }
         return None
 
@@ -1032,6 +1043,14 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         elif long_score >= 4 and long_score > short_score and bc:
             signal, score, best, otype = 'LONG',  long_score,  bc, 'CALL'
         else:
+            signal, score, best, otype = 'WATCH', 0, bc or bp, None
+
+        # Catastrophic event filter: Tagesbewegung bereits extrem → kein Signal mehr
+        # Verhindert LONG auf Stocks die heute -15%+ gecrasht sind (FDA, Earnings fail etc.)
+        if signal == 'LONG' and prev_chg <= -15:
+            signal, score, best, otype = 'WATCH', 0, bc or bp, None
+        # Verhindert SHORT auf Stocks die heute schon +10%+ gestiegen sind (falsche Richtung)
+        elif signal == 'SHORT' and prev_chg >= 10:
             signal, score, best, otype = 'WATCH', 0, bc or bp, None
 
         conflict = signal == 'SHORT' and trend_pct > 15 and short_trend > -5
