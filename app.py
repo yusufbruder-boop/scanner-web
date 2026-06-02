@@ -9,6 +9,7 @@ app = Flask(__name__)
 RESULTS_FILE   = 'results.json'
 MEMORY_FILE    = 'hermes_memory.json'
 LEARNING_FILE  = 'hermes_learning.json'
+IDENTITY_FILE  = 'hermes_identity.json'
 TG_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 TG_CHAT  = os.environ.get('TELEGRAM_CHAT',  '')
 
@@ -555,12 +556,141 @@ def hermes_self_review(scan_data: dict, poly_key: str):
             lines.append(f'  → {c}')
     tg_send('\n'.join(lines))
 
+    # Hermes AI schreibt seine eigenen neuen Regeln
+    try:
+        hermes_ai_self_reflection(false_signals, hits, misses, win_r, today)
+    except Exception:
+        pass
+
     return learn
 
 
 def get_learning_weights():
     """Gibt aktuelle Lernparameter zurück."""
     return load_learning().get('weights', {})
+
+
+# ── Hermes Identity (persistent AI self-memory) ───────────────────────────────
+
+def load_identity() -> dict:
+    try:
+        if os.path.exists(IDENTITY_FILE):
+            return json.load(open(IDENTITY_FILE, encoding='utf-8'))
+    except Exception:
+        pass
+    return {
+        'version': 1,
+        'created': datetime.now().strftime('%Y-%m-%d'),
+        'lessons': [],
+        'rules': [],
+        'market_regime': '',
+        'false_signal_patterns': [],
+        'last_reflection': '',
+    }
+
+def save_identity(identity: dict):
+    try:
+        json.dump(identity, open(IDENTITY_FILE, 'w', encoding='utf-8'), indent=2)
+    except Exception:
+        pass
+
+
+def hermes_ai_self_reflection(false_signals: list, hits: dict, misses: dict,
+                               win_rate: float, today: str) -> str:
+    """
+    Hermes AI analysiert seine eigenen Fehler und schreibt neue Regeln in hermes_identity.json.
+    Läuft nach jedem Self-Review — Hermes lernt täglich dazu.
+    """
+    import re as _re
+    if not NOUS_KEY:
+        return ''
+    identity = load_identity()
+    if identity.get('last_reflection') == today:
+        return ''
+
+    past_lessons = identity.get('lessons', [])[:5]
+    past_rules   = identity.get('rules', [])[:8]
+
+    false_str   = '\n'.join(f'  - {f["sym"]}: {f["signal"]} empfohlen aber {f["chg"]:+.1f}% ({f["reason"]})'
+                            for f in false_signals[:5]) or '  keine'
+    hit_str     = ', '.join(f'{s} {d["chg"]:+.1f}%' for s, d in list(hits.items())[:5]) or 'keine'
+    miss_str    = ', '.join(f'{s} {d["chg"]:+.1f}%' for s, d in list(misses.items())[:5]) or 'keine'
+    lessons_str = '\n'.join(f'  [{l["date"]}] {l["lesson"][:90]}'
+                            for l in past_lessons) or '  noch keine'
+    rules_str   = '\n'.join(f'  - {r}' for r in past_rules) or '  noch keine'
+
+    prompt = f"""Du bist Hermes, ein AI Trading-Agent der sich täglich selbst verbessert.
+
+=== HEUTE ({today}) ===
+Win-Rate: {win_rate}%
+Richtige Signale: {hit_str}
+Verpasste Moves: {miss_str}
+Falsche Signale (empfohlen aber falsch):
+{false_str}
+
+=== DEINE BISHERIGEN REGELN ===
+{rules_str}
+
+=== DEINE BISHERIGEN LEKTIONEN ===
+{lessons_str}
+
+Aufgabe: Analysiere die Fehler von heute und schreibe neue Regeln für dich selbst.
+
+Antworte NUR mit diesem JSON (kein anderer Text):
+{{
+  "new_rules": ["max 3 konkrete Regeln wie: Keine LONG-Signale wenn prev_chg < -15%"],
+  "new_lesson": "1-2 Sätze was du heute gelernt hast",
+  "pattern": "Welches Muster steckt hinter den Fehlern (z.B. Biotech, Momentum, Makro)",
+  "remove_rules": ["Regel die nicht mehr gilt (oder leer)"]
+}}"""
+
+    response = _nous_call(
+        prompt,
+        system='Du bist Hermes AI Trading Agent. Du schreibst deine eigenen Handelsregeln basierend auf echten Marktdaten. Antworte AUSSCHLIESSLICH mit validem JSON.',
+        max_tokens=500, temperature=0.3
+    )
+    if not response:
+        return ''
+
+    try:
+        match = _re.search(r'\{[\s\S]*\}', response)
+        if not match:
+            return ''
+        data = json.loads(match.group())
+
+        # Neue Regeln eintragen (Duplikate überspringen)
+        existing = set(identity.get('rules', []))
+        for rule in data.get('new_rules', []):
+            if rule and rule.strip() and rule.strip() not in existing:
+                identity.setdefault('rules', []).append(rule.strip())
+
+        # Veraltete Regeln entfernen
+        remove = set(data.get('remove_rules', []))
+        identity['rules'] = [r for r in identity.get('rules', []) if r not in remove][-15:]
+
+        # Neue Lektion
+        lesson = data.get('new_lesson', '').strip()
+        if lesson:
+            identity.setdefault('lessons', []).insert(0, {
+                'date':       today,
+                'lesson':     lesson,
+                'pattern':    data.get('pattern', ''),
+                'win_rate':   win_rate,
+                'false_count': len(false_signals),
+            })
+            identity['lessons'] = identity['lessons'][:30]
+
+        identity['last_reflection'] = today
+        save_identity(identity)
+
+        tg_send(
+            f'🧠 <b>HERMES SELBST-REFLEXION {today}</b>\n'
+            f'{lesson}\n'
+            + (f'Neue Regeln: ' + ' | '.join(data.get("new_rules", [])[:2]) if data.get("new_rules") else '')
+        )
+        return lesson
+    except Exception:
+        return ''
 
 
 # ── Hilfsfunktionen ──────────────────────────────────────────────────────────
@@ -1998,6 +2128,7 @@ def results():
             out['hermes_memory']       = state.get('hermes_memory', {})
             out['hermes_24h']          = state.get('hermes_24h', [])
             out['hermes_learning']     = load_learning()
+            out['hermes_identity']     = load_identity()
         return jsonify(_to_json_safe(out))
     except Exception as e:
         return jsonify({'error': f'Server Fehler: {str(e)[:120]}'})
@@ -2182,6 +2313,20 @@ def hermes_ai_signal_eval(signal: dict) -> str:
     if sweep:
         sweep_info = f"Options Sweep: {sweep.get('direction','').upper()} ${sweep.get('total',0):,.0f} Premium, {sweep.get('count',0)} Sweeps"
 
+    # Hermes eigene Regeln für Signal-Bewertung
+    identity   = load_identity()
+    rules_str  = ' | '.join(identity.get('rules', [])[-4:]) or 'keine'
+
+    # Makro-Kontext
+    try:
+        from scanner import get_macro_context
+        macro   = get_macro_context()
+        vix_val = macro.get('VIX', {}).get('price', '?')
+        regime  = macro.get('regime', '')
+        macro_line = f"VIX:{vix_val} ({regime}) | 10Y:{macro.get('TNX',{}).get('price','?')}%"
+    except Exception:
+        macro_line = ''
+
     prompt = f"""Analysiere dieses Trading-Signal vollständig:
 
 TICKER: {t} | SIGNAL: {sig} | SCORE: {score}/10
@@ -2193,76 +2338,133 @@ KATALYSATOR: {kat} — {kat_txt}
 {dp_info}
 {sweep_info}
 {f"HERMES SCORE: {h_score} | Gründe: {', '.join(str(r) for r in h_reas[:3])}" if h_score else ""}
+{f"MAKRO: {macro_line}" if macro_line else ""}
+MEINE REGELN: {rules_str}
 
 Bewerte auf Deutsch:
 1. STÄRKE: Wie stark ist dieses Signal? (1-10 mit Begründung)
-2. SETUP: Ist das Setup realistisch? (Strike erreichbar, Trend passt, Timing?)
-3. RISIKO: Was könnte schiefgehen?
+2. SETUP: Ist das Setup realistisch? Strike erreichbar, Trend passt, Makro unterstützt?
+3. RISIKO: Was könnte schiefgehen? Verletzt es eine meiner Regeln?
 4. EMPFEHLUNG: Einsteigen, Warten, oder Finger weg? Warum?
 
 Antworte kompakt, max 150 Wörter."""
 
-    return _nous_call(prompt, system='Du bist ein erfahrener Options-Trader und Analyst. Analysiere präzise und ehrlich, auch wenn das Signal schwach ist.', max_tokens=300)
+    return _nous_call(prompt,
+        system='Du bist Hermes, ein lernfähiger AI Options-Trader. Beachte deine eigenen Regeln beim Bewerten.',
+        max_tokens=320)
 
 
 def hermes_ai_analysis(scan_data: dict, hunt_alerts: list) -> str:
     """
     Marktüberblick + Bewertung aller Signale via NousResearch Hermes-3 70B.
+    Inkl. Makro-Kontext (VIX/Yields), SEC Filings, eigene Hermes-Regeln.
     """
     if not NOUS_KEY:
         return ''
     try:
+        from scanner import get_macro_context, get_sec_alerts
+
         longs  = scan_data.get('longs',  [])[:6]
         shorts = scan_data.get('shorts', [])[:4]
         movers = scan_data.get('movers', [])[:3]
         hunts  = hunt_alerts[:6]
 
-        long_lines  = [f"  {r['t']} Score:{r['score']} Trend:{r.get('trend',0):+.1f}% P/C:{r.get('pc',0):.2f} Kat:{r.get('katalysator','')} | {r.get('kat_text','')[:60]}" for r in longs]
-        short_lines = [f"  {r['t']} Score:{r['score']} Trend:{r.get('trend',0):+.1f}% P/C:{r.get('pc',0):.2f} Kat:{r.get('katalysator','')} | {r.get('kat_text','')[:60]}" for r in shorts]
+        long_lines  = [f"  {r['t']} Score:{r['score']} Heute:{r.get('prev_chg',0):+.1f}% Trend:{r.get('trend',0):+.1f}% P/C:{r.get('pc',0):.2f} | {r.get('kat_text','')[:55]}" for r in longs]
+        short_lines = [f"  {r['t']} Score:{r['score']} Heute:{r.get('prev_chg',0):+.1f}% Trend:{r.get('trend',0):+.1f}% P/C:{r.get('pc',0):.2f} | {r.get('kat_text','')[:55]}" for r in shorts]
         hunt_lines  = [f"  {a['ticker']} Score:{a['score']} | {', '.join(str(x) for x in a.get('reasons',[])[:3])}" for a in hunts]
-        mover_lines = [f"  {r['t']} ${r['price']} Score:{r['score']} P/C:{r.get('pc',0):.2f}" for r in movers]
+        mover_lines = [f"  {r['t']} ${r['price']} Heute:{r.get('prev_chg',0):+.1f}% Score:{r['score']}" for r in movers]
 
-        # Aschenbrenner Positionen für Context
-        asch_longs = ['NBIS','KEEL','CLSK','RIOT','BTDR','IREN','APLD']
+        # Hermes Identity — eigene Regeln und Lektionen
+        identity = load_identity()
+        rules_lines   = '\n'.join(f'  - {r}' for r in identity.get('rules', [])[-6:]) or '  keine'
+        lessons_lines = '\n'.join(f'  [{l["date"]}] {l["lesson"][:80]}'
+                                  for l in identity.get('lessons', [])[:3]) or '  keine'
+
+        # Makro-Kontext
+        macro   = get_macro_context()
+        vix_val = macro.get('VIX', {}).get('price', '?')
+        tnx_val = macro.get('TNX', {}).get('price', '?')
+        spx_chg = macro.get('SPX', {}).get('chg', 0)
+        ndx_chg = macro.get('NDX', {}).get('chg', 0)
+        dxy_chg = macro.get('DXY', {}).get('chg', 0)
+        regime  = macro.get('regime', 'NORMAL')
+        fed_news_lines = '\n'.join(f'  - {n}' for n in macro.get('fed_news', [])[:3]) or '  keine'
+
+        # SEC Filings (8-K + Insider Form 4)
+        all_tickers = list({r['t'] for r in longs + shorts})
+        sec_alerts  = get_sec_alerts(all_tickers)
+        fresh_sec   = [a for a in sec_alerts if a.get('fresh')]
+        sec_lines   = '\n'.join(f'  {a["ticker"]} [{a["form"]}] {a["title"][:60]}'
+                                for a in fresh_sec[:5]) or '  keine heute'
+
+        # Earnings nächste Woche via Polygon
+        try:
+            from scanner import get_earnings_calendar_polygon
+            earnings = get_earnings_calendar_polygon(all_tickers)
+            earn_lines = ', '.join(f'{t} ({d})' for t, d in list(earnings.items())[:5]) or 'keine'
+        except Exception:
+            earn_lines = 'keine'
+
+        # Aschenbrenner Positionen
+        asch_longs  = ['NBIS','KEEL','CLSK','RIOT','BTDR','IREN','APLD']
         asch_shorts = ['NVDA','AVGO','AMD','SMH','ORCL']
-        asch_in_scan_long  = [r for r in longs  + scan_data.get('watch',[]) if r['t'] in asch_longs]
-        asch_in_scan_short = [r for r in shorts + scan_data.get('watch',[]) if r['t'] in asch_shorts]
-        asch_long_str  = ', '.join(f"{r['t']} {r.get('prev_chg',0):+.1f}% Score:{r['score']}" for r in asch_in_scan_long[:5]) or 'nicht im Scan'
-        asch_short_str = ', '.join(f"{r['t']} {r.get('prev_chg',0):+.1f}% Score:{r['score']}" for r in asch_in_scan_short[:5]) or 'nicht im Scan'
+        asch_l = [r for r in longs  + scan_data.get('watch',[]) if r['t'] in asch_longs]
+        asch_s = [r for r in shorts + scan_data.get('watch',[]) if r['t'] in asch_shorts]
+        asch_long_str  = ', '.join(f"{r['t']} {r.get('prev_chg',0):+.1f}% Score:{r['score']}" for r in asch_l[:5]) or 'nicht im Scan'
+        asch_short_str = ', '.join(f"{r['t']} {r.get('prev_chg',0):+.1f}% Score:{r['score']}" for r in asch_s[:5]) or 'nicht im Scan'
 
-        prompt = f"""Du bist Hermes, ein professioneller AI Trading-Agent. Analysiere den Markt heute mit allen verfügbaren Daten:
+        prompt = f"""Du bist Hermes, ein professioneller AI Trading-Agent mit Selbstlern-Fähigkeit.
+
+=== DEINE EIGENEN REGELN (selbst gelernt) ===
+{rules_lines}
+
+=== DEINE LETZTEN LEKTIONEN ===
+{lessons_lines}
+
+=== MAKRO-KONTEXT ===
+VIX: {vix_val} ({regime}) | 10Y Yield: {tnx_val}% | S&P500: {spx_chg:+.2f}% | NASDAQ: {ndx_chg:+.2f}% | Dollar: {dxy_chg:+.2f}%
+FED News:
+{fed_news_lines}
+
+=== SEC FILINGS HEUTE ===
+{sec_lines}
+
+=== EARNINGS NÄCHSTE WOCHE ===
+{earn_lines}
 
 === SITUATIONAL AWARENESS LP (Aschenbrenner 13F Q1 2026) ===
-LONG KI-Infrastruktur: NBIS(38%=$2.6B), KEEL, CLSK, RIOT, BTDR, IREN
-SHORT Semiconductors (PUT): SMH($2B), NVDA($1.57B), ORCL($1.07B), AVGO($1B), AMD($969M)
-→ Aschenbrenner Longs heute: {asch_long_str}
-→ Aschenbrenner Shorts heute: {asch_short_str}
+LONG KI: NBIS(38%=$2.6B), KEEL, CLSK, RIOT, BTDR, IREN
+SHORT Semis (PUT): SMH($2B), NVDA($1.57B), ORCL($1.07B), AVGO($1B), AMD($969M)
+→ Longs heute: {asch_long_str}
+→ Shorts heute: {asch_short_str}
 
-=== POLYGON SCANNER — LONG SIGNALE ({len(longs)}) ===
+=== POLYGON SCANNER — LONGS ({len(longs)}) ===
 {chr(10).join(long_lines) or '  keine'}
 
-=== POLYGON SCANNER — SHORT SIGNALE ({len(shorts)}) ===
+=== POLYGON SCANNER — SHORTS ({len(shorts)}) ===
 {chr(10).join(short_lines) or '  keine'}
 
-=== NEXT MOVERS ({len(movers)}) ===
-{chr(10).join(mover_lines) or '  keine'}
-
-=== HERMES HUNT — ÜBERSEHEN ({len(hunts)}) ===
+=== HERMES HUNT ({len(hunts)}) ===
 {chr(10).join(hunt_lines) or '  keine'}
 
 Trading-Briefing auf Deutsch:
-1. ASCHENBRENNER CHECK: Bestätigt Polygon heute seine Long- oder Short-These?
-2. TOP TRADE: Bestes Setup mit höchster Wahrscheinlichkeit (Polygon-Daten + Smart Money)
-3. NEXT MOVER: Welcher Ticker könnte heute noch 5-15% machen?
-4. WARNUNG: Was vermeiden? (besonders wenn Aschenbrenner dagegen positioniert ist)
+1. MAKRO CHECK: Wie beeinflusst VIX/Yield/Regime die heutigen Setups?
+2. SEC/NEWS: Gibt es 8-K oder Insider-Trades die ein Signal bestätigen/verneinen?
+3. TOP TRADE: Bestes Setup heute (Polygon + Smart Money + Makro zusammen)
+4. WARNUNG: Was meide ich heute basierend auf meinen eigenen Regeln?
 5. FAZIT: 1 klarer Satz.
 
-Max 200 Wörter. Nur saubere Setups mit echten Polygon-Daten."""
+Max 220 Wörter. Kombiniere Polygon-Flow mit Makro-Kontext."""
 
         return _nous_call(
             prompt,
-            system='Du bist Hermes, ein professioneller AI Trading-Agent. Du hast Zugang zu Polygon Options-Flow, Dark Pool, Smart Money Positionierung und dem kompletten Aschenbrenner 13F Portfolio. Analysiere nur mit echten Daten, keine Spekulationen.',
-            max_tokens=500
+            system=(
+                'Du bist Hermes, ein lernfähiger AI Trading-Agent. Du hast Zugang zu: '
+                'Polygon Options-Flow, Dark Pool, Smart Money, SEC EDGAR Filings, '
+                'VIX/Treasury/Makro-Daten, und deinen eigenen selbstgeschriebenen Handelsregeln. '
+                'Kombiniere alle Datenquellen für eine fundierte Analyse.'
+            ),
+            max_tokens=550
         )
     except Exception:
         return ''
@@ -2356,10 +2558,20 @@ def hermes_monitor():
                     state['hermes_running'] = True
                     state['hermes_running_since'] = datetime.now()
                 try:
-                    from scanner import hermes_hunt, scan_ticker, get_alpaca_market_news, hermes_24h_scan
+                    from scanner import (hermes_hunt, scan_ticker, get_alpaca_market_news,
+                                         hermes_24h_scan, get_macro_context, get_sec_alerts)
                     POLY_KEY = os.environ.get('POLYGON_API_KEY', '')
 
-                    # 0) 24h Intelligence Scan — Polygon Gainers/Losers + Vol/OI + Dark Pool
+                    # 0a) Makro + SEC im Hintergrund vorladen (für AI-Prompts später)
+                    def _bg_macro_sec():
+                        try:
+                            get_macro_context()
+                            get_sec_alerts()
+                        except Exception:
+                            pass
+                    threading.Thread(target=_bg_macro_sec, daemon=True).start()
+
+                    # 0b) 24h Intelligence Scan — Polygon Gainers/Losers + Vol/OI + Dark Pool
                     def _bg_24h():
                         try:
                             sigs_24h = hermes_24h_scan()

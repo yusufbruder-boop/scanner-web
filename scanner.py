@@ -182,6 +182,115 @@ NEG_KEYS = ['lawsuit','downgrade','miss','cut','investigation','fraud',
             'decline','disappoint','weak','concern','risk','violation','delay',
             'bankruptcy','default','dilut','offering','withdrew']
 
+# ── Macro Context (VIX, Yields, Indices, Fed) ────────────────────────────────
+_macro_cache = {'data': {}, 'ts': 0}
+_macro_lock  = threading.Lock()
+
+def get_macro_context() -> dict:
+    """VIX, 10Y Yield, S&P, NASDAQ, Dollar via Yahoo Finance. 30 Min Cache."""
+    with _macro_lock:
+        if time.time() - _macro_cache['ts'] < 1800:
+            return _macro_cache['data']
+    result = {}
+    symbols = {'VIX': '^VIX', 'TNX': '^TNX', 'SPX': '^GSPC', 'NDX': '^NDX', 'DXY': 'DX-Y.NYB'}
+    for name, sym in symbols.items():
+        try:
+            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d'
+            req = urllib.request.Request(url, headers={'User-Agent': 'hermes/3.0'})
+            with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+                d = json.loads(r.read())
+            meta = d['chart']['result'][0]['meta']
+            price = float(meta.get('regularMarketPrice', 0))
+            prev  = float(meta.get('chartPreviousClose', price) or price)
+            chg   = round((price - prev) / prev * 100, 2) if prev else 0
+            result[name] = {'price': round(price, 2), 'chg': chg}
+        except Exception:
+            pass
+    vix = result.get('VIX', {}).get('price', 20)
+    result['regime'] = ('LOW_VOL_BULL' if vix < 15 else
+                        'NORMAL'       if vix < 20 else
+                        'ELEVATED_RISK' if vix < 30 else 'HIGH_FEAR')
+    # Federal Reserve + Economic news via Fed RSS
+    try:
+        import xml.etree.ElementTree as ET
+        req = urllib.request.Request('https://www.federalreserve.gov/feeds/press_all.xml',
+                                     headers={'User-Agent': 'hermes/3.0'})
+        with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+            root = ET.fromstring(r.read())
+        fed_news = []
+        for item in root.findall('.//item')[:5]:
+            title = item.findtext('title', '')
+            if title:
+                fed_news.append(title[:80])
+        result['fed_news'] = fed_news
+    except Exception:
+        result['fed_news'] = []
+    with _macro_lock:
+        _macro_cache['data'] = result
+        _macro_cache['ts']   = time.time()
+    return result
+
+
+# ── SEC EDGAR Alerts (8-K + Form 4 Insider) ──────────────────────────────────
+_sec_cache = {'data': [], 'ts': 0}
+_sec_lock  = threading.Lock()
+
+def get_sec_alerts(tickers: list = None) -> list:
+    """Aktuelle SEC 8-K + Form 4 für Universe-Stocks via EDGAR EFTS. 1h Cache."""
+    with _sec_lock:
+        if time.time() - _sec_cache['ts'] < 3600:
+            return _sec_cache['data']
+    today   = datetime.now().strftime('%Y-%m-%d')
+    week_ago = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
+    alerts  = []
+    watch   = (tickers or UNIVERSE)[:25]
+    for ticker in watch:
+        for form, label in [('8-K', 'Material Event'), ('4', 'Insider Trade')]:
+            try:
+                url = (f'https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22'
+                       f'&dateRange=custom&startdt={week_ago}&enddt={today}&forms={form}')
+                req = urllib.request.Request(url,
+                    headers={'User-Agent': 'hermes-scanner/3.0 yusufbruder@gmail.com'})
+                with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+                    d = json.loads(r.read())
+                for hit in d.get('hits', {}).get('hits', [])[:2]:
+                    src = hit.get('_source', {})
+                    filing_date = src.get('file_date', today)
+                    entity = src.get('entity_name', ticker)[:40]
+                    form_desc = src.get('form_type', form)
+                    alerts.append({
+                        'ticker': ticker, 'form': form_desc, 'label': label,
+                        'title': f'{entity} — {form_desc}',
+                        'date':  filing_date,
+                        'fresh': filing_date >= today,
+                    })
+            except Exception:
+                pass
+    with _sec_lock:
+        _sec_cache['data'] = alerts
+        _sec_cache['ts']   = time.time()
+    return alerts
+
+
+# ── Wirtschaftskalender via Polygon ──────────────────────────────────────────
+def get_earnings_calendar_polygon(tickers: list) -> dict:
+    """Earnings-Termine für Ticker via Polygon Reference. Gibt {ticker: date} zurück."""
+    result = {}
+    today = datetime.now().strftime('%Y-%m-%d')
+    cutoff = (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
+    for t in tickers[:20]:
+        try:
+            url = f'https://api.polygon.io/vX/reference/financials?ticker={t}&limit=1&apiKey={API}'
+            d = poly_fetch(url)
+            for r in d.get('results', []):
+                ed = r.get('end_date', '')
+                if today <= ed <= cutoff:
+                    result[t] = ed
+        except Exception:
+            pass
+    return result
+
+
 # ── Dark Pool / Block Trade Detection (Polygon Trades API) ───────────────────
 def get_darkpool_signal(ticker: str, today: str) -> dict:
     """
