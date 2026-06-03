@@ -340,13 +340,13 @@ def load_learning():
     """Lädt Hermes Lernparameter. Standard wenn nicht vorhanden."""
     default = {
         'weights': {
-            'vol_ratio_threshold': 3.0,   # ab wann Vol-Anomalie zählt
-            'vol_ratio_bonus':     2.0,   # Bonus-Multiplikator
-            'dp_threshold_m':      1.0,   # Dark Pool Minimum in Mio
-            'min_score_long':      4,     # Mindest-Score für LONG
-            'min_score_short':     4,     # Mindest-Score für SHORT
-            'earnings_bonus':      4,     # Bonus wenn Earnings erkannt
-            'small_cap_boost':     0,     # Boost für Aktien unter $50
+            'vol_ratio_threshold': 3.0,
+            'vol_ratio_bonus':     2.0,
+            'dp_threshold_m':      1.0,
+            'min_score_long':      4,
+            'min_score_short':     4,
+            'earnings_bonus':      4,
+            'small_cap_boost':     0,
         },
         'performance': {
             'total_signals':   0,
@@ -355,10 +355,70 @@ def load_learning():
             'missed_moves':    0,
             'win_rate':        0.0,
         },
-        'missed_trades': [],    # was verpasst wurde
-        'hit_trades':    [],    # was korrekt war
-        'improvement_log': [],  # was geändert wurde und warum
-        'last_review':   None,
+        # Pattern-Datenbank: was funktioniert, was nicht
+        'patterns': [
+            {
+                'id': 'polygon_confirmed_long',
+                'name': 'Polygon + News bestätigen LONG',
+                'signal_basis': 'POLYGON_CONFIRMED', 'direction': 'LONG',
+                'success_rate': 0.78, 'samples': 0,
+                'examples': [], 'lesson': 'Vol/OI + News beide bullisch = hohe Zuverlässigkeit'
+            },
+            {
+                'id': 'polygon_confirmed_short',
+                'name': 'Polygon + News bestätigen SHORT',
+                'signal_basis': 'POLYGON_CONFIRMED', 'direction': 'SHORT',
+                'success_rate': 0.82, 'samples': 0,
+                'examples': [], 'lesson': 'PUT Vol/OI + neg. News = sehr zuverlässig'
+            },
+            {
+                'id': 'secondary_offering_short',
+                'name': 'Verwässerung unter Marktpreis → SHORT',
+                'signal_basis': 'POLYGON_CONFIRMED', 'direction': 'SHORT',
+                'trigger': ['secondary offering','dilution','share offering'],
+                'success_rate': 0.88, 'samples': 1,
+                'examples': ['GOOGL 2026-06-03: -4.6% nach S-3 bei $350'],
+                'lesson': 'Ausgabepreis unter Kurs = Kurs fällt zum Ausgabepreis. 88% Erfolg.'
+            },
+            {
+                'id': 'ceo_endorsement_long',
+                'name': 'NVDA/Tech CEO Endorsement → LONG',
+                'signal_basis': 'NEWS_ONLY', 'direction': 'LONG',
+                'trigger': ['jensen huang','nvidia ceo','endorsement'],
+                'success_rate': 0.85, 'samples': 1,
+                'examples': ['MRVL 2026-06-03: +37.5% nach Jensen Huang Endorsement'],
+                'lesson': 'Jensen Huang nennt Firma = fast immer großer Move. Sofort LONG.'
+            },
+            {
+                'id': 'high_call_falling_stock',
+                'name': 'Hohe CALL Vol/OI aber Kurs fällt → KONFLIKT',
+                'signal_basis': 'CONFLICT', 'direction': 'LONG',
+                'trigger': ['call_voi>20', 'prev_chg<-4'],
+                'success_rate': 0.28, 'samples': 1,
+                'examples': ['DELL 2026-06-03: CALL 76x aber -9.6% — Calls waren Short-Absicherung'],
+                'lesson': 'Sehr hohe CALL Vol/OI bei fallendem Kurs = Short-Seller hedgen sich. Nicht LONG!'
+            },
+            {
+                'id': 'pentagon_gov_contract',
+                'name': 'Pentagon/Gov Vertrag → LONG',
+                'signal_basis': 'NEWS_ONLY', 'direction': 'LONG',
+                'trigger': ['pentagon','government contract','dod','military contract'],
+                'success_rate': 0.75, 'samples': 0,
+                'examples': [], 'lesson': 'Regierungsverträge = fast immer LONG. Warnung: prüfe ob Vertrag bestätigt.'
+            },
+            {
+                'id': 'news_only_weak',
+                'name': 'Nur News, kein Polygon Signal → SCHWACH',
+                'signal_basis': 'NEWS_ONLY', 'direction': 'LONG',
+                'success_rate': 0.42, 'samples': 0,
+                'examples': [], 'lesson': 'Nur News ohne Options-Bestätigung = Retail reagiert. Zu spät einsteigen.'
+            },
+        ],
+        'missed_trades':    [],
+        'hit_trades':       [],
+        'improvement_log':  [],
+        'last_review':      None,
+        'daily_context':    {},   # was Hermes täglich weiß über den Markt
     }
     try:
         if os.path.exists(LEARNING_FILE):
@@ -587,6 +647,83 @@ def hermes_self_review(scan_data: dict, poly_key: str):
         for c in changes:
             lines.append(f'  → {c}')
     tg_send('\n'.join(lines))
+
+    # 9) PATTERN LEARNING — Conviction-Raten aus heutigem Tag aktualisieren
+    patterns = learn.get('patterns', [])
+    pat_updates = []
+
+    for sym, rec in recommended.items():
+        mv    = real_movers.get(sym, {})
+        chg   = mv.get('chg', 0)
+        basis = rec.get('signal_basis', 'WEAK')
+        sig   = rec.get('signal', 'WATCH')
+        if sig == 'WATCH' or not chg:
+            continue
+
+        correct = (sig == 'LONG' and chg > 3) or (sig == 'SHORT' and chg < -3)
+        wrong   = (sig == 'LONG' and chg < -5) or (sig == 'SHORT' and chg > 5)
+
+        for pat in patterns:
+            if pat.get('signal_basis') == basis and pat.get('direction') == sig:
+                old_rate = pat['success_rate']
+                n = pat['samples']
+                # Bayesian update: neuer Wert fließt mit Gewicht 1/(n+1) ein
+                if correct:
+                    pat['success_rate'] = round((old_rate * n + 1.0) / (n + 1), 3)
+                elif wrong:
+                    pat['success_rate'] = round((old_rate * n + 0.0) / (n + 1), 3)
+                pat['samples'] = n + 1
+                # Letztes Beispiel speichern
+                ex = f'{sym} {today}: {chg:+.1f}% ({"RICHTIG" if correct else "FALSCH" if wrong else "NEUTRAL"})'
+                pat.setdefault('examples', []).insert(0, ex)
+                pat['examples'] = pat['examples'][:5]
+                if correct or wrong:
+                    pat_updates.append(f'{pat["name"]}: {old_rate:.0%} → {pat["success_rate"]:.0%}')
+                break
+
+    # Spezifische Patterns aus Signal-Basis lernen (DELL, MRVL, GOOGL Typ)
+    for fs in false_signals:
+        sym = fs['sym']
+        rec = recommended.get(sym, {})
+        basis = rec.get('signal_basis','')
+        max_call_voi = rec.get('smart_money', {}).get('max_call_voi', 0)
+        prev_chg_rec = rec.get('prev_chg', 0)
+        # DELL-Muster: hohe CALL Vol/OI bei fallendem Kurs
+        if basis == 'CONFLICT' or (max_call_voi >= 20 and prev_chg_rec <= -4):
+            for pat in patterns:
+                if pat.get('id') == 'high_call_falling_stock':
+                    n = pat['samples']
+                    pat['success_rate'] = round((pat['success_rate'] * n + 0.0) / (n + 1), 3)
+                    pat['samples'] = n + 1
+                    pat.setdefault('examples', []).insert(0, f'{sym} {today}: {fs["chg"]:+.1f}% — FALSCH')
+                    pat['examples'] = pat['examples'][:5]
+                    pat_updates.append(f'KONFLIKT-Pattern bestätigt: {sym} {fs["chg"]:+.1f}%')
+                    break
+
+    # Tages-Kontext speichern (was Hermes morgen wissen soll)
+    daily_ctx = learn.setdefault('daily_context', {})
+    daily_ctx[today] = {
+        'date': today,
+        'win_rate': win_r,
+        'hits': [f'{s} {d["chg"]:+.1f}%' for s,d in list(hits.items())[:6]],
+        'misses': [f'{m["sym"]} {m["chg"]:+.1f}% ({m.get("reason_missed","")[:40]})' for m in miss_patterns[:5]],
+        'false_signals': [f'{f["sym"]} {f["chg"]:+.1f}%' for f in false_signals[:4]],
+        'market_summary': f'{len(hits)} richtig, {len(miss_patterns)} verpasst, {len(false_signals)} falsch',
+        'key_lesson': pat_updates[0] if pat_updates else 'Keine Pattern-Änderung heute',
+    }
+    # Nur letzten 30 Tage behalten
+    if len(daily_ctx) > 30:
+        oldest = sorted(daily_ctx.keys())[0]
+        del daily_ctx[oldest]
+
+    learn['patterns'] = patterns
+    save_learning(learn)
+
+    if pat_updates:
+        lines.append(f'\n🔄 Pattern-Updates:')
+        for pu in pat_updates[:4]:
+            lines.append(f'  → {pu}')
+        tg_send('\n'.join(lines[-6:]))  # nur Pattern-Teil nochmal senden
 
     # Hermes AI schreibt seine eigenen neuen Regeln
     try:
@@ -1457,6 +1594,19 @@ function renderCard(r, cls, isNew) {
       else katBadge = '<span class="badge badge-kat" style="background:#2a0a0a;color:#ff8080">NEGATIV NEWS</span>';
     }
   }
+  // Conviction + Signal-Basis Badge
+  let basis = r.signal_basis || '';
+  let conv  = r.conviction ? Math.round(r.conviction * 100) : 0;
+  let convBadge = '';
+  if (basis === 'POLYGON_CONFIRMED') {
+    convBadge = '<span class="badge" style="background:#0a2a0a;color:#00ff88;border:1px solid #00cc66;font-weight:bold">✅ POLYGON+NEWS ' + conv + '%</span>';
+  } else if (basis === 'POLYGON_ONLY') {
+    convBadge = '<span class="badge" style="background:#0a1a2a;color:#40a0ff;border:1px solid #2060aa">📊 SMART MONEY ' + conv + '%</span>';
+  } else if (basis === 'NEWS_ONLY') {
+    convBadge = '<span class="badge" style="background:#1a1a0a;color:#c0c040;border:1px solid #808020">📰 NEWS ' + conv + '%</span>';
+  } else if (basis === 'CONFLICT') {
+    convBadge = '<span class="badge" style="background:#2a1a00;color:#ff8000;border:1px solid #aa5000;font-weight:bold">⚡ KONFLIKT — nicht traden</span>';
+  }
   let conflictBadge = r.conflict
     ? '<span class="badge" style="background:#3a2000;color:#ffa500;border:1px solid #a06000">⚠ PULLBACK</span>' : '';
   let socialBadge = r.is_social || r.social_score > 20
@@ -1490,7 +1640,7 @@ function renderCard(r, cls, isNew) {
     + '<div class="card-header">'
     +   '<div><span class="ticker">' + r.t + '</span>'
     +   '<span class="price ' + sigColor + '" style="margin-left:10px">$' + r.price + '</span></div>'
-    +   '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' + katBadge + conflictBadge + socialBadge + dpBadge + swBadge
+    +   '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' + convBadge + katBadge + conflictBadge + socialBadge + dpBadge + swBadge
     +   '<span class="badge ' + badge + '">' + r.signal + (r.score > 0 ? ' ' + r.score : '') + '</span></div>'
     + '</div>'
     + '<div class="card-body">'

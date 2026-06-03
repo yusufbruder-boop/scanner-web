@@ -8,6 +8,23 @@ ALPACA_KEY    = os.environ.get('ALPACA_API_KEY',    '')
 ALPACA_SECRET = os.environ.get('ALPACA_SECRET_KEY', '')
 NOUS_KEY      = os.environ.get('NOUS_API_KEY',      '')
 
+_LEARNING_FILE = 'hermes_learning.json'
+_patterns_cache = {'data': None, 'ts': 0}
+
+def _load_patterns():
+    """Lädt Pattern-Datenbank aus hermes_learning.json (gecacht 5 Min)."""
+    global _patterns_cache
+    if time.time() - _patterns_cache['ts'] < 300 and _patterns_cache['data']:
+        return _patterns_cache['data']
+    try:
+        if os.path.exists(_LEARNING_FILE):
+            d = json.load(open(_LEARNING_FILE, encoding='utf-8'))
+            _patterns_cache = {'data': d, 'ts': time.time()}
+            return d
+    except Exception:
+        pass
+    return {'patterns': []}
+
 # ── Social Trending (Reddit WSB + Stocktwits) ────────────────────────────────
 _TICKER_RE = re.compile(r'\b([A-Z]{2,5})\b')
 _SKIP_WORDS = {'THE','AND','FOR','ARE','YOU','NOT','BUT','HAS','WAS','ALL','CAN',
@@ -1268,6 +1285,74 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
 
         conflict = signal == 'SHORT' and trend_pct > 15 and short_trend > -5
 
+        # ── CONVICTION SYSTEM — Polygon first, News bestätigt ────────────────
+        # Polygon-Signal: was sagen Options + Dark Pool?
+        poly_long  = max_call_voi >= 5 or (dp_dollar >= 3_000_000 and prev_chg > 0)
+        poly_short = max_put_voi  >= 5 or (dp_dollar >= 3_000_000 and prev_chg < 0)
+        news_long  = katalysator == 'POSITIV'
+        news_short = katalysator == 'NEGATIV'
+
+        # KONFLIKT ERKENNUNG (DELL-Fall: CALL 76x aber Kurs fällt stark)
+        # Hohe Call Vol/OI bei fallendem Kurs = Calls sind Short-Absicherung, kein echter Kauf
+        hedge_calls = max_call_voi >= 20 and prev_chg <= -4
+        hedge_puts  = max_put_voi  >= 20 and prev_chg >= 4
+        if hedge_calls:
+            long_score  = max(0, long_score - 6)
+            reasons_long.append(f'WARNUNG: CALL {max_call_voi:.0f}x aber Kurs {prev_chg:+.1f}% — Short-Absicherung')
+            poly_long = False
+        if hedge_puts:
+            short_score = max(0, short_score - 6)
+            reasons_short.append(f'WARNUNG: PUT {max_put_voi:.0f}x aber Kurs {prev_chg:+.1f}% — Long-Absicherung')
+            poly_short = False
+
+        # Signal-Basis bestimmen
+        if signal == 'LONG':
+            if poly_long and news_long:
+                signal_basis = 'POLYGON_CONFIRMED'  # beide einig → höchste Conviction
+                conviction   = 0.85
+            elif poly_long and not news_long:
+                signal_basis = 'POLYGON_ONLY'       # Smart Money weiß was, News fehlt noch
+                conviction   = 0.65
+            elif news_long and not poly_long:
+                signal_basis = 'NEWS_ONLY'           # Retail reagiert, zu spät
+                conviction   = 0.40
+            elif hedge_calls:
+                signal_basis = 'CONFLICT'
+                conviction   = 0.25
+            else:
+                signal_basis = 'WEAK'
+                conviction   = 0.30
+        elif signal == 'SHORT':
+            if poly_short and news_short:
+                signal_basis = 'POLYGON_CONFIRMED'
+                conviction   = 0.88
+            elif poly_short and not news_short:
+                signal_basis = 'POLYGON_ONLY'
+                conviction   = 0.68
+            elif news_short and not poly_short:
+                signal_basis = 'NEWS_ONLY'
+                conviction   = 0.42
+            elif hedge_puts:
+                signal_basis = 'CONFLICT'
+                conviction   = 0.25
+            else:
+                signal_basis = 'WEAK'
+                conviction   = 0.30
+        else:
+            signal_basis = 'WATCH'
+            conviction   = 0.0
+
+        # Conviction aus gelernten Patterns anwenden
+        try:
+            patterns = _load_patterns()
+            for pat in patterns.get('patterns', []):
+                if pat.get('signal_basis') == signal_basis and pat.get('direction') == signal:
+                    hist_rate = pat.get('success_rate', conviction)
+                    conviction = round((conviction + hist_rate) / 2, 2)
+                    break
+        except Exception:
+            pass
+
         ziel = mult = None
         if best and signal != 'WATCH':
             ziel = (price + atr) if signal == 'LONG' else (price - atr)
@@ -1288,6 +1373,7 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
             'drop_high': round(drop_from_high, 1), 'short_trend': round(short_trend, 1),
             'long_score': long_score, 'short_score': short_score,
             'katalysator': katalysator, 'kat_strength': katalysator_strength, 'kat_text': kat_text_full,
+            'signal_basis': signal_basis, 'conviction': conviction,
             'best': best, 'otype': otype, 'ziel': ziel, 'mult': mult,
             'atr': round(atr, 2), 'today': today, 'conflict': conflict,
             'kat_url': kat_url, 'social_score': social_score,
