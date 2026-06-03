@@ -1915,6 +1915,56 @@ function renderTab2(data) {
     html += '</div>';
   }
 
+  // ── MT5 Bot Monitor ─────────────────────────────────────────────────────────
+  const mt5 = data.mt5_status || {};
+  if (mt5.balance !== undefined) {
+    let mt5Pl    = mt5.equity - mt5.balance;
+    let mt5PlCol = mt5Pl >= 0 ? '#4dff91' : '#ff4d6b';
+    let mt5PlPct = mt5.balance > 0 ? (mt5Pl / mt5.balance * 100).toFixed(2) : '0';
+    html += '<div style="margin:8px;background:linear-gradient(135deg,#0a1428,#0d1840);border:1px solid #2060aa44;border-radius:10px;padding:12px 14px">'
+      + '<div style="font-size:10px;font-weight:bold;color:#60a5fa;letter-spacing:2px;margin-bottom:8px">📊 MT5 DEMO BOT — ' + (mt5.received_at||'') + '</div>'
+      + '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px">'
+      +   '<div><div style="font-size:11px;color:#6b8cad">Balance</div><div style="font-size:18px;font-weight:bold;color:#fff">$' + (mt5.balance||0).toFixed(2) + '</div></div>'
+      +   '<div><div style="font-size:11px;color:#6b8cad">Equity</div><div style="font-size:16px;font-weight:bold;color:#94a3b8">$' + (mt5.equity||0).toFixed(2) + '</div></div>'
+      +   '<div><div style="font-size:11px;color:#6b8cad">P&L</div><div style="font-size:16px;font-weight:bold;color:' + mt5PlCol + '">' + (mt5Pl>=0?'+':'') + '$' + mt5Pl.toFixed(2) + ' (' + (mt5Pl>=0?'+':'') + mt5PlPct + '%)</div></div>'
+      + '</div>';
+    // Offene Positionen
+    let positions = mt5.positions || [];
+    if (positions.length > 0) {
+      html += '<div style="font-size:10px;color:#6b8cad;margin-bottom:4px">OFFENE POSITIONEN:</div>';
+      positions.forEach(p => {
+        let plCol = (p.profit||0) >= 0 ? '#4dff91' : '#ff4d6b';
+        let dir   = p.type === 0 ? 'BUY' : 'SELL';
+        let dirCol= p.type === 0 ? '#4dff91' : '#ff4d6b';
+        html += '<div style="display:flex;justify-content:space-between;padding:4px 0;border-top:1px solid #1a2a3a">'
+          + '<div><span style="font-size:13px;font-weight:bold;color:#fff">' + (p.symbol||'') + '</span> '
+          +   '<span style="font-size:10px;color:' + dirCol + '">' + dir + '</span><br>'
+          +   '<span style="font-size:9px;color:#6b8cad">' + (p.volume||0) + ' Lots @ ' + (p.price_open||0).toFixed(2) + '</span></div>'
+          + '<div style="text-align:right"><span style="color:#fff;font-size:12px">' + (p.price_current||0).toFixed(2) + '</span><br>'
+          +   '<span style="color:' + plCol + ';font-weight:bold">' + ((p.profit||0)>=0?'+':'') + '$' + (p.profit||0).toFixed(2) + '</span></div>'
+          + '</div>';
+      });
+    }
+    // Letzter Trade
+    if (mt5.last_trade) {
+      let lt = mt5.last_trade;
+      html += '<div style="margin-top:6px;padding:4px 8px;background:#0a0a20;border-radius:6px;font-size:10px;color:#6b8cad">'
+        + 'Letzter Trade: <span style="color:#fff">' + (lt.symbol||'') + ' ' + (lt.type||'') + ' ' + (lt.volume||'') + ' Lots</span>'
+        + ' → <span style="color:' + ((lt.profit||0)>=0?'#4dff91':'#ff4d6b') + '">' + ((lt.profit||0)>=0?'+':'') + '$' + (lt.profit||0).toFixed(2) + '</span>'
+        + ' <span style="color:#4a6a8a">(' + (lt.time||'') + ')</span></div>';
+    }
+    // Bot Status
+    let botSt   = mt5.bot_status || 'unbekannt';
+    let botCol  = botSt === 'running' ? '#4dff91' : '#ff4d6b';
+    html += '<div style="margin-top:6px;font-size:10px">'
+      + 'Bot: <span style="color:' + botCol + ';font-weight:bold">' + botSt.toUpperCase() + '</span>'
+      + ' | Symbole: <span style="color:#94a3b8">' + (mt5.symbols||['XAUUSD','NAS100']).join(', ') + '</span>'
+      + ' | Signal: <span style="color:#ffa040">' + (mt5.last_signal||'–') + '</span></div>';
+    html += '</div>';
+  } else {
+    html += '<div style="margin:8px;background:#0a1428;border:1px solid #2060aa22;border-radius:10px;padding:10px 14px;font-size:11px;color:#4a6a8a">📊 MT5 Bot — Kein Signal empfangen (läuft der Bot?)</div>';
+  }
+
   // ── Hermes Learning — Selbst-Optimierung ────────────────────────────────────
   const lrn = data.hermes_learning || {};
   const lw  = lrn.weights || {};
@@ -2353,6 +2403,7 @@ def results():
             out['hermes_alerts']       = state.get('hermes_alerts', [])
             out['hermes_running']      = state.get('hermes_running', False)
             out['running']             = state.get('running', False)
+            out['mt5_status']          = state.get('mt5_status', {})
             out['hermes_picks']        = state.get('hermes_picks', [])
             out['hermes_ts']           = state.get('hermes_ts', '')
             out['hermes_ai']           = state.get('hermes_ai', '')
@@ -3105,6 +3156,19 @@ def alpaca_order_api():
 @app.route('/alpaca/portfolio')
 def alpaca_portfolio_api():
     return jsonify(get_alpaca_portfolio())
+
+# ── MT5 Bot Monitor ──────────────────────────────────────────────────────────
+@app.route('/mt5/status', methods=['POST'])
+def mt5_status_post():
+    """MT5 Bot sendet seinen Status alle 60s hierher."""
+    data = request.get_json(force=True) or {}
+    data['received_at'] = datetime.now().strftime('%H:%M:%S')
+    state['mt5_status'] = data
+    return jsonify({'ok': True})
+
+@app.route('/mt5/status')
+def mt5_status_get():
+    return jsonify(state.get('mt5_status') or {'error': 'Noch kein MT5 Status empfangen'})
 
 @app.route('/hermes/memory')
 def hermes_memory_api():
