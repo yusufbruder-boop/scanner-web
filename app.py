@@ -2009,16 +2009,25 @@ function updateHeader(d) {
     badge.style.borderColor = '#ffd700';
     badge.style.color = '#ffd700';
     badge.querySelector('span').style.background = '#ffd700';
+    badge.querySelector('span').style.boxShadow = '0 0 6px #ffd700';
     txt.textContent = 'HERMES läuft...';
+  } else if (d.running) {
+    badge.style.borderColor = '#ff8c00';
+    badge.style.color = '#ffa040';
+    badge.querySelector('span').style.background = '#ff8c00';
+    badge.querySelector('span').style.boxShadow = '0 0 6px #ff8c00';
+    txt.textContent = 'SCAN läuft...';
   } else if (ht) {
     badge.style.borderColor = '#2d9e57';
     badge.style.color = '#4dff91';
     badge.querySelector('span').style.background = '#4dff91';
+    badge.querySelector('span').style.boxShadow = '0 0 6px #4dff91';
     txt.textContent = 'HERMES ✓ ' + ht;
   } else {
     badge.style.borderColor = '#1e3a5f';
     badge.style.color = '#4a6a8a';
     badge.querySelector('span').style.background = '#4a6a8a';
+    badge.querySelector('span').style.boxShadow = 'none';
     txt.textContent = 'HERMES startet...';
   }
 }
@@ -2168,7 +2177,12 @@ def results():
     try:
         data = state['results'] or load_results()
         if not data:
-            return jsonify({'error': 'Noch kein Scan. Drücke SCAN STARTEN.'})
+            return jsonify({
+                'error':          'Noch kein Scan. Drücke SCAN STARTEN.',
+                'hermes_running': state.get('hermes_running', False),
+                'hermes_ts':      state.get('hermes_ts', ''),
+                'running':        state.get('running', False),
+            })
         out = {
             'time':    data.get('time'),
             'today':   data.get('today'),
@@ -2187,6 +2201,8 @@ def results():
             out['followup'] = state['followup']
         with _hermes_lock:
             out['hermes_alerts']       = state.get('hermes_alerts', [])
+            out['hermes_running']      = state.get('hermes_running', False)
+            out['running']             = state.get('running', False)
             out['hermes_picks']        = state.get('hermes_picks', [])
             out['hermes_ts']           = state.get('hermes_ts', '')
             out['hermes_ai']           = state.get('hermes_ai', '')
