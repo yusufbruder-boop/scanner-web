@@ -176,11 +176,17 @@ POS_KEYS = ['contract','government','deal','partnership','upgrade','raised','bea
             'record','billion','trump','invest','breakthrough','ai','quantum','launch',
             'buyback','dividend','acquisition','target','infrastructure','pivot',
             'revenue','earnings','profit','surge','soar','stake','award','fda',
-            'approval','patent','merger','spin','ipo','buyout','license','guidance']
+            'approval','patent','merger','spin','ipo','buyout','license','guidance',
+            'custom silicon','custom asic','inference','hyperscaler','data center',
+            'ai chip','ai revenue','compute','semiconductor design']
 NEG_KEYS = ['lawsuit','downgrade','miss','cut','investigation','fraud',
             'recall','ban','warning','below','probe','short seller','loss',
             'decline','disappoint','weak','concern','risk','violation','delay',
-            'bankruptcy','default','dilut','offering','withdrew']
+            'bankruptcy','default','dilut','offering','withdrew',
+            'secondary','share issuance','equity raise','stock offering','new shares']
+# Starke negative Keywords die IMMER NEGATIV setzen, auch wenn POS-News davor steht
+HARD_NEG_KEYS = ['dilut','secondary offering','share offering','equity offering',
+                 'stock offering','new shares','share issuance','equity raise']
 
 # ── Macro Context (VIX, Yields, Indices, Fed) ────────────────────────────────
 _macro_cache = {'data': {}, 'ts': 0}
@@ -421,7 +427,7 @@ def hermes_24h_scan() -> list:
         try:
             url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/{direction}?apiKey={API}'
             d   = poly_fetch(url)
-            for t in d.get('tickers', [])[:25]:
+            for t in d.get('tickers', [])[:50]:
                 sym   = t.get('ticker', '')
                 day   = t.get('day', {})
                 prev  = t.get('prevDay', {})
@@ -963,7 +969,7 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         dp_thread.start()
 
         # Polygon News
-        news_data = poly_fetch(f'https://api.polygon.io/v2/reference/news?ticker={ticker}&limit=8&apiKey={API}')
+        news_data = poly_fetch(f'https://api.polygon.io/v2/reference/news?ticker={ticker}&limit=10&apiKey={API}')
         katalysator = 'KEIN'
         kat_text = kat_url = ''
         al_news_text = ''
@@ -972,13 +978,20 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
                 continue
             title_l = n.get('title', '').lower()
             sent = next((i.get('sentiment', '') for i in n.get('insights', []) if i.get('ticker') == ticker), '')
+            has_hard_neg = any(k in title_l for k in HARD_NEG_KEYS)
             has_pos = any(k in title_l for k in POS_KEYS)
             has_neg = any(k in title_l for k in NEG_KEYS)
-            if has_pos and sent in ('positive', 'neutral', ''):
-                katalysator = 'POSITIV'
+            # Dilution/secondary offering überschreibt immer positive Signale
+            if has_hard_neg:
+                katalysator = 'NEGATIV'
                 kat_text = n.get('title', '')[:70]
                 kat_url  = n.get('article_url', '')
                 break
+            elif has_pos and sent in ('positive', 'neutral', '') and not has_neg:
+                katalysator = 'POSITIV'
+                kat_text = n.get('title', '')[:70]
+                kat_url  = n.get('article_url', '')
+                # Kein break — weiter prüfen ob HARD_NEG News folgt
             elif has_neg or sent == 'negative':
                 if katalysator != 'POSITIV':
                     katalysator = 'NEGATIV'
@@ -1208,7 +1221,7 @@ def run_scan(progress_cb=None):
     """
     today      = datetime.now().strftime('%Y-%m-%d')
     exp_cutoff = (datetime.now() + timedelta(days=35)).strftime('%Y-%m-%d')
-    news_cutoff= (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
+    news_cutoff= (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
 
     # Social Trending für Universe-Erweiterung + Score-Boost (aus Cache — kein Fetch)
     social_tickers, _ = get_cached_social()
