@@ -184,9 +184,38 @@ NEG_KEYS = ['lawsuit','downgrade','miss','cut','investigation','fraud',
             'decline','disappoint','weak','concern','risk','violation','delay',
             'bankruptcy','default','dilut','offering','withdrew',
             'secondary','share issuance','equity raise','stock offering','new shares']
-# Starke negative Keywords die IMMER NEGATIV setzen, auch wenn POS-News davor steht
+# Dilution/Secondary — überschreibt immer positive News
 HARD_NEG_KEYS = ['dilut','secondary offering','share offering','equity offering',
                  'stock offering','new shares','share issuance','equity raise']
+
+# ── HIGH-IMPACT News-Katalysatoren (Score +5) ────────────────────────────────
+# Regierungs- und Militärverträge
+HIGH_IMPACT_GOV = ['pentagon','department of defense','dod contract','military contract',
+                   'government contract','federal contract','awarded contract',
+                   'defense contract','national security','air force','navy contract',
+                   'army contract','nato','space force','doge contract','white house deal']
+# CEO/Analyst Endorsement + Next Big Thing
+HIGH_IMPACT_ENDORSE = ['next trillion','next billion dollar','ceo predicts','nvidia ceo',
+                       'jensen huang','elon musk','tim cook','satya nadella',
+                       'next $1 billion','next 1 trillion','names as next',
+                       'will be next','biggest winner','top pick 2025','top pick 2026',
+                       'best ai play','number one ai','dominant ai']
+# Insider-Kauf (stark bullish)
+HIGH_IMPACT_INSIDER = ['trump bought','trump buys','trump purchased','congressman bought',
+                       'senator bought','insider purchased','ceo bought shares',
+                       'ceo purchased','executive bought','board member bought',
+                       'trump administration buys','white house purchased']
+
+# ── EXTREME-IMPACT: Insider-Kauf + Gov-Vertrag (Score +7) ────────────────────
+EXTREME_COMBO_GOV   = HIGH_IMPACT_GOV
+EXTREME_COMBO_BUY   = HIGH_IMPACT_INSIDER
+
+# ── HIGH-IMPACT Short Katalysatoren (Score +5) ────────────────────────────────
+HIGH_IMPACT_NEG = ['sec charges','doj investigation','class action','criminal charges',
+                   'going concern','chapter 11','chapter 7','fda rejection',
+                   'clinical failure','trial failed','missed revenue','massive loss',
+                   'accounting fraud','restatement','deregistered','delisted',
+                   'short seller report']
 
 # ── Macro Context (VIX, Yields, Indices, Fed) ────────────────────────────────
 _macro_cache = {'data': {}, 'ts': 0}
@@ -968,9 +997,10 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         dp_thread = threading.Thread(target=_fetch_dp, daemon=True)
         dp_thread.start()
 
-        # Polygon News
+        # Polygon News — mit HIGH/EXTREME Impact Erkennung
         news_data = poly_fetch(f'https://api.polygon.io/v2/reference/news?ticker={ticker}&limit=10&apiKey={API}')
         katalysator = 'KEIN'
+        katalysator_strength = 'NORMAL'  # NORMAL / HIGH / EXTREME
         kat_text = kat_url = ''
         al_news_text = ''
         for n in news_data.get('results', []):
@@ -978,41 +1008,98 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
                 continue
             title_l = n.get('title', '').lower()
             sent = next((i.get('sentiment', '') for i in n.get('insights', []) if i.get('ticker') == ticker), '')
-            has_hard_neg = any(k in title_l for k in HARD_NEG_KEYS)
-            has_pos = any(k in title_l for k in POS_KEYS)
-            has_neg = any(k in title_l for k in NEG_KEYS)
-            # Dilution/secondary offering überschreibt immer positive Signale
+            has_hard_neg  = any(k in title_l for k in HARD_NEG_KEYS)
+            has_high_neg  = any(k in title_l for k in HIGH_IMPACT_NEG)
+            has_gov       = any(k in title_l for k in HIGH_IMPACT_GOV)
+            has_endorse   = any(k in title_l for k in HIGH_IMPACT_ENDORSE)
+            has_insider   = any(k in title_l for k in HIGH_IMPACT_INSIDER)
+            has_pos       = any(k in title_l for k in POS_KEYS)
+            has_neg       = any(k in title_l for k in NEG_KEYS)
+
+            # HARD NEG überschreibt alles (Dilution, Secondary Offering)
             if has_hard_neg:
                 katalysator = 'NEGATIV'
+                katalysator_strength = 'HIGH'
                 kat_text = n.get('title', '')[:70]
                 kat_url  = n.get('article_url', '')
                 break
-            elif has_pos and sent in ('positive', 'neutral', '') and not has_neg:
+
+            # EXTREME: Insider-Kauf + Gov-Vertrag gleichzeitig
+            if has_insider and has_gov and katalysator != 'NEGATIV':
                 katalysator = 'POSITIV'
-                kat_text = n.get('title', '')[:70]
+                katalysator_strength = 'EXTREME'
+                kat_text = '🔥 EXTREME: ' + n.get('title', '')[:57]
                 kat_url  = n.get('article_url', '')
-                # Kein break — weiter prüfen ob HARD_NEG News folgt
+                continue  # weiter suchen ob HARD_NEG folgt
+
+            # HIGH: Gov-Vertrag oder CEO-Endorsement oder Insider-Kauf
+            if (has_gov or has_endorse or has_insider) and katalysator != 'NEGATIV':
+                katalysator = 'POSITIV'
+                if katalysator_strength != 'EXTREME':
+                    katalysator_strength = 'HIGH'
+                if has_gov:
+                    kat_text = '🏛️ GOV: ' + n.get('title', '')[:62]
+                elif has_endorse:
+                    kat_text = '⭐ ENDORSE: ' + n.get('title', '')[:58]
+                else:
+                    kat_text = '💰 INSIDER: ' + n.get('title', '')[:58]
+                kat_url = n.get('article_url', '')
+                continue
+
+            # HIGH NEG: SEC/DOJ/Criminal
+            if has_high_neg:
+                katalysator = 'NEGATIV'
+                katalysator_strength = 'HIGH'
+                kat_text = '⚠️ ' + n.get('title', '')[:67]
+                kat_url  = n.get('article_url', '')
+                break
+
+            # NORMAL positiv
+            if has_pos and sent in ('positive', 'neutral', '') and not has_neg:
+                if katalysator == 'KEIN':
+                    katalysator = 'POSITIV'
+                    kat_text = n.get('title', '')[:70]
+                    kat_url  = n.get('article_url', '')
             elif has_neg or sent == 'negative':
-                if katalysator != 'POSITIV':
+                if katalysator not in ('POSITIV',):
                     katalysator = 'NEGATIV'
                     kat_text = n.get('title', '')[:70]
                     kat_url  = n.get('article_url', '')
 
         # Alpaca News als zweite Quelle (nur wenn Polygon nichts hat)
         if katalysator == 'KEIN':
-            for an in get_alpaca_news([ticker], limit=3):
+            for an in get_alpaca_news([ticker], limit=5):
                 h = an.get('headline', '')
                 hl = h.lower()
-                if any(k in hl for k in POS_KEYS):
+                has_gov_al     = any(k in hl for k in HIGH_IMPACT_GOV)
+                has_endorse_al = any(k in hl for k in HIGH_IMPACT_ENDORSE)
+                has_insider_al = any(k in hl for k in HIGH_IMPACT_INSIDER)
+                has_hard_neg_al= any(k in hl for k in HARD_NEG_KEYS)
+                if has_hard_neg_al:
+                    katalysator = 'NEGATIV'
+                    katalysator_strength = 'HIGH'
+                    kat_text = h[:70]; kat_url = an.get('url', '')
+                    al_news_text = '[Alpaca] '
+                    break
+                elif has_insider_al and has_gov_al:
+                    katalysator = 'POSITIV'; katalysator_strength = 'EXTREME'
+                    kat_text = '🔥 EXTREME: ' + h[:57]; kat_url = an.get('url', '')
+                    al_news_text = '[Alpaca] '
+                    break
+                elif has_gov_al or has_endorse_al or has_insider_al:
+                    katalysator = 'POSITIV'; katalysator_strength = 'HIGH'
+                    prefix = '🏛️ GOV: ' if has_gov_al else ('⭐ ENDORSE: ' if has_endorse_al else '💰 INSIDER: ')
+                    kat_text = prefix + h[:62]; kat_url = an.get('url', '')
+                    al_news_text = '[Alpaca] '
+                    break
+                elif any(k in hl for k in POS_KEYS):
                     katalysator = 'POSITIV'
-                    kat_text = h[:70]
-                    kat_url  = an.get('url', '')
+                    kat_text = h[:70]; kat_url = an.get('url', '')
                     al_news_text = '[Alpaca] '
                     break
                 elif any(k in hl for k in NEG_KEYS):
                     katalysator = 'NEGATIV'
-                    kat_text = h[:70]
-                    kat_url  = an.get('url', '')
+                    kat_text = h[:70]; kat_url = an.get('url', '')
                     al_news_text = '[Alpaca] '
 
         # Social momentum
@@ -1117,13 +1204,17 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
 
         # ── TIER 2: Katalysatoren (binäre Events) ───────────────────────────
 
-        # News-Katalysator
+        # News-Katalysator (Stärke: NORMAL=+3, HIGH=+5, EXTREME=+7)
         if katalysator == 'POSITIV':
-            long_score  += 3
-            reasons_long.append(f'News: {kat_text[:50]}')
+            kat_pts = 7 if katalysator_strength == 'EXTREME' else (5 if katalysator_strength == 'HIGH' else 3)
+            long_score += kat_pts
+            label = '🔥 EXTREME' if katalysator_strength == 'EXTREME' else ('🏛️ HIGH-IMPACT' if katalysator_strength == 'HIGH' else 'News')
+            reasons_long.append(f'{label}: {kat_text[:50]}')
         if katalysator == 'NEGATIV':
-            short_score += 3
-            reasons_short.append(f'Neg. News: {kat_text[:50]}')
+            kat_pts = 7 if katalysator_strength == 'EXTREME' else (5 if katalysator_strength == 'HIGH' else 3)
+            short_score += kat_pts
+            label = '⚠️ HIGH-IMPACT' if katalysator_strength in ('HIGH','EXTREME') else 'Neg. News'
+            reasons_short.append(f'{label}: {kat_text[:50]}')
 
         # Expected Move (hoch = Markt erwartet großen Swing)
         em = sm['expected_move']
@@ -1196,7 +1287,7 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
             'trend': round(trend_pct, 1), 'prev_chg': round(prev_chg, 1),
             'drop_high': round(drop_from_high, 1), 'short_trend': round(short_trend, 1),
             'long_score': long_score, 'short_score': short_score,
-            'katalysator': katalysator, 'kat_text': kat_text_full,
+            'katalysator': katalysator, 'kat_strength': katalysator_strength, 'kat_text': kat_text_full,
             'best': best, 'otype': otype, 'ziel': ziel, 'mult': mult,
             'atr': round(atr, 2), 'today': today, 'conflict': conflict,
             'kat_url': kat_url, 'social_score': social_score,

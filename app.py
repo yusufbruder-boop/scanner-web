@@ -1413,8 +1413,18 @@ function renderCard(r, cls, isNew) {
   let b = r.best;
   let sigColor = cls === 'long' ? 'signal-long' : (cls === 'short' ? 'signal-short' : 'signal-mover');
   let badge    = cls === 'long' ? 'badge-long'  : (cls === 'short' ? 'badge-short'  : 'badge-mover');
-  let katBadge = r.katalysator !== 'KEIN'
-    ? '<span class="badge badge-kat">' + (r.katalysator === 'POSITIV' ? 'POSITIV NEWS' : 'NEGATIV NEWS') + '</span>' : '';
+  let katStr = r.kat_strength || 'NORMAL';
+  let katBadge = '';
+  if (r.katalysator !== 'KEIN') {
+    if (r.katalysator === 'POSITIV') {
+      if (katStr === 'EXTREME') katBadge = '<span class="badge" style="background:#3a0a00;color:#ff6020;border:1px solid #ff4000;font-weight:bold">🔥 EXTREME CATALYST</span>';
+      else if (katStr === 'HIGH') katBadge = '<span class="badge" style="background:#1a0a30;color:#c080ff;border:1px solid #8040cc;font-weight:bold">🏛️ HIGH-IMPACT</span>';
+      else katBadge = '<span class="badge badge-kat">POSITIV NEWS</span>';
+    } else {
+      if (katStr === 'HIGH' || katStr === 'EXTREME') katBadge = '<span class="badge" style="background:#2a0000;color:#ff4040;border:1px solid #aa0000;font-weight:bold">⚠️ HIGH-IMPACT SHORT</span>';
+      else katBadge = '<span class="badge badge-kat" style="background:#2a0a0a;color:#ff8080">NEGATIV NEWS</span>';
+    }
+  }
   let conflictBadge = r.conflict
     ? '<span class="badge" style="background:#3a2000;color:#ffa500;border:1px solid #a06000">⚠ PULLBACK</span>' : '';
   let socialBadge = r.is_social || r.social_score > 20
@@ -1564,9 +1574,16 @@ function renderResults(data, isNew) {
   let newsItems = allCards.filter(r => r.katalysator !== 'KEIN' && r.kat_text);
   if (newsItems.length > 0) {
     html += '<div class="section"><div class="section-title news">NACHRICHTEN — Katalysatoren</div>';
+    newsItems.sort((a,b) => {
+      const rank = s => s === 'EXTREME' ? 3 : (s === 'HIGH' ? 2 : 1);
+      return rank(b.kat_strength||'NORMAL') - rank(a.kat_strength||'NORMAL');
+    });
     newsItems.slice(0, 15).forEach(n => {
       let cls   = n.katalysator === 'POSITIV' ? 'news-pos' : 'news-neg';
-      let label = n.katalysator === 'POSITIV' ? '▲ POSITIV' : '▼ NEGATIV';
+      let ks    = n.kat_strength || 'NORMAL';
+      let label = n.katalysator === 'POSITIV'
+        ? (ks === 'EXTREME' ? '🔥 EXTREME' : (ks === 'HIGH' ? '🏛️ HIGH-IMPACT' : '▲ POSITIV'))
+        : (ks === 'HIGH' || ks === 'EXTREME' ? '⚠️ HIGH-SHORT' : '▼ NEGATIV');
       let titleHtml = n.kat_url
         ? '<a href="' + n.kat_url + '" target="_blank" rel="noopener" style="color:#60a5fa;text-decoration:underline;text-decoration-color:#1e3a5f">' + n.kat_text + ' <span style="font-size:11px">↗</span></a>'
         : '<span style="color:#c0d4e8">' + n.kat_text + '</span>';
