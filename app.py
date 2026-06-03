@@ -1607,6 +1607,21 @@ function renderCard(r, cls, isNew) {
   } else if (basis === 'CONFLICT') {
     convBadge = '<span class="badge" style="background:#2a1a00;color:#ff8000;border:1px solid #aa5000;font-weight:bold">⚡ KONFLIKT — nicht traden</span>';
   }
+  // Earnings Wahrscheinlichkeit Badge
+  let earnBadge = '';
+  if (r.earnings) {
+    let ea = r.earnings;
+    if (ea.verdict === 'SELL-THE-NEWS') {
+      earnBadge = '<span class="badge" style="background:#2a0a00;color:#ff6040;border:1px solid #aa3000;font-weight:bold">'
+        + 'EARNINGS ' + ea.date + ' | DROP ' + ea.sell_prob + '% | Run-Up ' + ea.run5 + '%</span>';
+    } else if (ea.verdict === 'BEAT-ERWARTUNG') {
+      earnBadge = '<span class="badge" style="background:#0a2a0a;color:#40ff80;border:1px solid #00aa40;font-weight:bold">'
+        + 'EARNINGS ' + ea.date + ' | BEAT ' + ea.beat_prob + '%</span>';
+    } else {
+      earnBadge = '<span class="badge" style="background:#1a1a00;color:#ffd700;border:1px solid #aa9000">'
+        + 'EARNINGS ' + ea.date + ' | Offen ' + ea.sell_prob + '% DROP / ' + ea.beat_prob + '% BEAT</span>';
+    }
+  }
   let conflictBadge = r.conflict
     ? '<span class="badge" style="background:#3a2000;color:#ffa500;border:1px solid #a06000">⚠ PULLBACK</span>' : '';
   let socialBadge = r.is_social || r.social_score > 20
@@ -1640,7 +1655,7 @@ function renderCard(r, cls, isNew) {
     + '<div class="card-header">'
     +   '<div><span class="ticker">' + r.t + '</span>'
     +   '<span class="price ' + sigColor + '" style="margin-left:10px">$' + r.price + '</span></div>'
-    +   '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' + convBadge + katBadge + conflictBadge + socialBadge + dpBadge + swBadge
+    +   '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' + earnBadge + convBadge + katBadge + conflictBadge + socialBadge + dpBadge + swBadge
     +   '<span class="badge ' + badge + '">' + r.signal + (r.score > 0 ? ' ' + r.score : '') + '</span></div>'
     + '</div>'
     + '<div class="card-body">'

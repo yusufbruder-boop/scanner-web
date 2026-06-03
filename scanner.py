@@ -1007,6 +1007,79 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         period_high = max(highs[-10:]) if len(highs) >= 10 else max(highs)
         drop_from_high = ((closes[-1] - period_high) / period_high) * 100
 
+        # ── EARNINGS ANALYSE — Wahrscheinlichkeit steigen/fallen ─────────────
+        earnings_date, earnings_days = get_earnings_soon(ticker)
+        earnings_analysis = None
+        c5 = closes[-5:] if len(closes) >= 5 else closes
+        run5 = ((c5[-1]-c5[0])/c5[0]*100) if len(c5)>=2 else 0  # 5-Tage Run-Up
+        avg_vol5 = sum(b['v'] for b in bars[-5:])/5 if len(bars)>=5 else 0
+        last_vol  = bars[-1]['v'] if bars else 0
+        vol_spike = last_vol/avg_vol5 if avg_vol5 > 0 else 1
+
+        # Earnings in 0-3 Tagen → Wahrscheinlichkeitsanalyse
+        if earnings_days is not None and -1 <= earnings_days <= 3:
+            # Sell-the-News Wahrscheinlichkeit
+            sell_prob  = 50.0  # Basis
+            beat_prob  = 50.0
+
+            # +1) Pre-Earnings Run-Up > 8% = klassisches "Sell the News"
+            if run5 >= 15:
+                sell_prob += 25
+                beat_prob -= 25
+                runup_str = f'+{run5:.1f}% in 5T = Sell-the-News sehr wahrscheinlich'
+            elif run5 >= 8:
+                sell_prob += 15
+                beat_prob -= 15
+                runup_str = f'+{run5:.1f}% in 5T = Sell-the-News wahrscheinlich'
+            else:
+                runup_str = f'+{run5:.1f}% in 5T = normales Niveau'
+
+            # +2) Volumen-Spike auf dem Weg hoch = Distribution (Smart Money exit)
+            if vol_spike >= 2.5 and run5 > 5:
+                sell_prob += 10
+                beat_prob -= 10
+
+            # +3) PUT Vol/OI bei nahen Strikes = Absicherung gegen Drop
+            near_puts = [r for r in res if
+                         r.get('details',{}).get('contract_type') == 'put' and
+                         abs(r['details'].get('strike_price',0) - price) / price <= 0.12 and
+                         (r.get('day',{}).get('volume',0) or 0) > 50]
+            put_near_voi = max(
+                ((r.get('day',{}).get('volume',0) or 0) / max(r.get('open_interest',1),1))
+                for r in near_puts) if near_puts else 0
+            if put_near_voi >= 5:
+                sell_prob += 15
+                beat_prob -= 15
+            elif put_near_voi >= 3:
+                sell_prob += 8
+                beat_prob -= 8
+
+            # +4) Call Premium stark > Put Premium = Markt erwartet Beat
+            cp_ratio = sm.get('call_premium',0) / max(sm.get('put_premium',1),1)
+            if cp_ratio >= 4:
+                beat_prob += 10
+                sell_prob -= 10
+            elif cp_ratio <= 1.5:
+                sell_prob += 8
+                beat_prob -= 8
+
+            # Clampen 5-95%
+            sell_prob = min(95, max(5, sell_prob))
+            beat_prob = min(95, max(5, beat_prob))
+
+            earnings_analysis = {
+                'date':        earnings_date,
+                'days':        earnings_days,
+                'run5':        round(run5, 1),
+                'vol_spike':   round(vol_spike, 1),
+                'put_near_voi':round(put_near_voi, 1),
+                'sell_prob':   round(sell_prob, 0),
+                'beat_prob':   round(beat_prob, 0),
+                'runup_str':   runup_str,
+                'verdict':     ('SELL-THE-NEWS' if sell_prob >= 65 else
+                                'BEAT-ERWARTUNG' if beat_prob >= 65 else 'UNENTSCHIEDEN'),
+            }
+
         # Dark Pool parallel (Thread)
         dp_result = [{}]
         def _fetch_dp():
@@ -1152,13 +1225,29 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
             long_score  += _smallcap_bon
             short_score += _smallcap_bon
 
-        # Earnings-Erkennung mit gelerntem Bonus
+        # Earnings-Erkennung mit Wahrscheinlichkeitsanalyse
         has_earnings = any(k in (kat_text + al_news_text).lower()
                           for k in ['earnings','beat','guidance','raised','revenue','results'])
         if has_earnings:
             long_score  += _earnings_bon
             short_score += _earnings_bon
             reasons_long.append(f'EARNINGS/KATALYSATOR (+{_earnings_bon} gelernt)')
+
+        # Earnings in 0-3 Tagen → Wahrscheinlichkeit in Score einbauen
+        if earnings_analysis:
+            ea = earnings_analysis
+            if ea['verdict'] == 'SELL-THE-NEWS':
+                short_score += 5
+                reasons_short.append(
+                    f'EARNINGS {ea["date"]} | {ea["run5"]:+.0f}% Run-Up | '
+                    f'DROP {ea["sell_prob"]:.0f}% wahrscheinlich')
+                # Long Score senken wenn Sell-the-News wahrscheinlich
+                long_score = max(0, long_score - 3)
+            elif ea['verdict'] == 'BEAT-ERWARTUNG':
+                long_score += 4
+                reasons_long.append(
+                    f'EARNINGS {ea["date"]} | Beat {ea["beat_prob"]:.0f}% wahrscheinlich | '
+                    f'Call-Premium dominiert')
 
         # ── TIER 1: Smart Money Signale (höchste Priorität) ──────────────────
 
@@ -1374,6 +1463,7 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
             'long_score': long_score, 'short_score': short_score,
             'katalysator': katalysator, 'kat_strength': katalysator_strength, 'kat_text': kat_text_full,
             'signal_basis': signal_basis, 'conviction': conviction,
+            'earnings': earnings_analysis,
             'best': best, 'otype': otype, 'ziel': ziel, 'mult': mult,
             'atr': round(atr, 2), 'today': today, 'conflict': conflict,
             'kat_url': kat_url, 'social_score': social_score,
