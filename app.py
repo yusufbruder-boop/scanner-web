@@ -46,6 +46,8 @@ state = {
     'hermes_ts':           None,
     'hermes_running':      False,
     'hermes_running_since': None,
+    'hermes_last_success': None,   # letzter erfolgreicher Zyklus
+    'hermes_stuck_count':  0,      # wie oft Watchdog feuern musste
     'hermes_ai':           '',
     'hermes_signal_evals': {},
     'alpaca_portfolio':    {},
@@ -2546,17 +2548,37 @@ def hermes_monitor():
     time.sleep(30)
     while True:
         try:
-            # ── WATCHDOG: stuck hermes_running → reset ────────────────────────
+            # ── WATCHDOG: stuck hermes_running → reset + Self-Restart ─────────
             with _hermes_lock:
-                h_since = state.get('hermes_running_since')
+                h_since   = state.get('hermes_running_since')
                 h_running = state.get('hermes_running', False)
+                h_success = state.get('hermes_last_success')
+                h_stuck_n = state.get('hermes_stuck_count', 0)
+
             if h_running and h_since:
                 stuck_min = (datetime.now() - h_since).total_seconds() / 60
-                if stuck_min > 12:
+                if stuck_min > 20:
+                    h_stuck_n += 1
                     with _hermes_lock:
-                        state['hermes_running'] = False
+                        state['hermes_running']       = False
                         state['hermes_running_since'] = None
-                    tg_send('⚠️ <b>HERMES WATCHDOG</b>: stuck-Zustand zurückgesetzt')
+                        state['hermes_stuck_count']   = h_stuck_n
+                    tg_send(f'⚠️ <b>HERMES WATCHDOG</b>: {stuck_min:.0f}min stuck → reset (#{h_stuck_n})')
+                    # Nach 3x stuck in Folge → Process beenden, Railway startet automatisch neu
+                    if h_stuck_n >= 3:
+                        tg_send('🔄 <b>HERMES SELF-RESTART</b>: 3x stuck → Process Exit, Railway startet neu')
+                        os._exit(1)
+
+            # Kein stuck mehr → Counter zurücksetzen
+            elif not h_running and h_success:
+                success_min = (datetime.now() - h_success).total_seconds() / 60
+                if success_min < 10:
+                    with _hermes_lock:
+                        state['hermes_stuck_count'] = 0
+                # Kein erfolgreicher Zyklus seit >30 Min aber auch nicht running → force restart
+                elif success_min > 30 and not h_running:
+                    tg_send(f'⚠️ <b>HERMES</b>: Kein Zyklus seit {success_min:.0f}min → erzwinge Neustart')
+                    state['hermes_force'] = True
 
             # ── HERMES SCANNER KONTROLLE & SELF-HEALING ──────────────────────
             data = state['results'] or load_results()
@@ -2842,8 +2864,10 @@ Marktschluss-Zusammenfassung (Deutsch, max 150 Wörter):
 
                 finally:
                     with _hermes_lock:
-                        state['hermes_running'] = False
+                        state['hermes_running']       = False
                         state['hermes_running_since'] = None
+                        state['hermes_last_success']  = datetime.now()
+                        state['hermes_stuck_count']   = 0
 
                 prev_keys = {a['ticker'] for a in state.get('hermes_alerts', [])}
                 new_finds = [a for a in alerts if a['ticker'] not in prev_keys]
