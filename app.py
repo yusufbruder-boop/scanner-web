@@ -95,6 +95,20 @@ def _alpaca(path, method='GET', body=None):
     except Exception as e:
         return {'error': str(e)}
 
+def parse_occ_symbol(sym):
+    """Parst OCC Options Symbol: META260605C00630000 → {underlying, exp, type, strike}"""
+    import re
+    m = re.match(r'^([A-Z]{1,6})(\d{6})([CP])(\d{8})$', sym)
+    if not m:
+        return None
+    underlying, exp6, cp, strike8 = m.groups()
+    return {
+        'underlying': underlying,
+        'exp':        f'20{exp6[:2]}-{exp6[2:4]}-{exp6[4:]}',
+        'type':       'CALL' if cp == 'C' else 'PUT',
+        'strike':     round(int(strike8) / 1000, 2),
+    }
+
 def get_alpaca_portfolio():
     """Holt Alpaca Account + Positionen + Orders."""
     acc  = _alpaca('/v2/account')
@@ -104,15 +118,31 @@ def get_alpaca_portfolio():
     positions = []
     for p in pos:
         try:
+            sym = p['symbol']
+            occ = parse_occ_symbol(sym)
+            # Richtung: Long CALL = BULLISH, Long PUT = BEARISH, Short alles = umgekehrt
+            alpaca_side = p['side']  # 'long' oder 'short'
+            if occ:
+                if alpaca_side == 'long':
+                    direction = 'BULLISH' if occ['type'] == 'CALL' else 'BEARISH'
+                else:
+                    direction = 'BEARISH' if occ['type'] == 'CALL' else 'BULLISH'
+                display_side = f"{occ['type']} {occ['strike']} | {occ['exp']}"
+            else:
+                direction = 'BULLISH' if alpaca_side == 'long' else 'BEARISH'
+                display_side = alpaca_side
             positions.append({
-                'sym':      p['symbol'],
-                'side':     p['side'],
-                'qty':      float(p['qty']),
-                'entry':    round(float(p['avg_entry_price']), 2),
-                'price':    round(float(p['current_price']), 2),
-                'pl':       round(float(p['unrealized_pl']), 2),
-                'pl_pct':   round(float(p['unrealized_plpc']) * 100, 1),
-                'mkt_val':  round(float(p['market_value']), 2),
+                'sym':       sym,
+                'side':      display_side,
+                'direction': direction,
+                'is_option': occ is not None,
+                'opt_type':  occ['type'] if occ else None,
+                'qty':       float(p['qty']),
+                'entry':     round(float(p['avg_entry_price']), 2),
+                'price':     round(float(p['current_price']), 2),
+                'pl':        round(float(p['unrealized_pl']), 2),
+                'pl_pct':    round(float(p['unrealized_plpc']) * 100, 1),
+                'mkt_val':   round(float(p['market_value']), 2),
             })
         except Exception:
             pass
@@ -1707,14 +1737,27 @@ function renderTab2(data) {
       +   '<div><div style="font-size:11px;color:#6b8cad">Cash</div><div style="font-size:16px;font-weight:bold;color:#94a3b8">$' + ap.cash.toLocaleString() + '</div></div>'
       +   '<div><div style="font-size:11px;color:#6b8cad">P&L offen</div><div style="font-size:16px;font-weight:bold;color:' + plCol + '">' + (totalPL>=0?'+':'') + '$' + totalPL.toFixed(0) + '</div></div>'
       + '</div>';
-    (ap.positions||[]).forEach(p => {
-      let pc = p.pl_pct >= 0 ? '#4dff91' : '#ff4d6b';
-      html += '<div style="display:flex;justify-content:space-between;padding:5px 0;border-top:1px solid #1a2a1a">'
-        + '<div><span style="font-size:14px;font-weight:bold;color:#fff">' + p.sym + '</span>'
-        +   ' <span style="font-size:10px;color:#6b8cad">' + p.side + ' ' + p.qty + 'x @ $' + p.entry + '</span></div>'
+    (ap.positions||[]).sort((a,b) => b.pl - a.pl).forEach(p => {
+      let pc    = p.pl_pct >= 0 ? '#4dff91' : '#ff4d6b';
+      let dir   = p.direction || 'BULLISH';
+      let isOpt = p.is_option;
+      let optType = p.opt_type || '';
+      // Farbe: CALL=grün, PUT=rot, Aktie=blau
+      let dirColor  = dir === 'BULLISH' ? '#4dff91' : '#ff4d6b';
+      let typeLabel = isOpt
+        ? '<span style="font-size:10px;font-weight:bold;padding:1px 5px;border-radius:4px;background:' + (optType==='CALL'?'#0a2a0a':'#2a0a0a') + ';color:' + (optType==='CALL'?'#4dff91':'#ff4d6b') + ';border:1px solid ' + (optType==='CALL'?'#4dff9166':'#ff4d6b66') + '">' + optType + '</span> '
+        : '<span style="font-size:10px;color:#60a5fa">STOCK</span> ';
+      let dirBadge = '<span style="font-size:9px;color:' + dirColor + '">▲ ' + dir + '</span>';
+      if (dir === 'BEARISH') dirBadge = '<span style="font-size:9px;color:' + dirColor + '">▼ ' + dir + '</span>';
+      html += '<div style="display:flex;justify-content:space-between;padding:5px 0;border-top:1px solid #1a2a1a;align-items:center">'
+        + '<div>'
+        +   '<span style="font-size:13px;font-weight:bold;color:#fff">' + (isOpt ? p.sym.slice(0, p.sym.length-15) : p.sym) + '</span> '
+        +   typeLabel + dirBadge + '<br>'
+        +   '<span style="font-size:9px;color:#6b8cad">' + p.side + ' | ' + p.qty + 'x @ $' + p.entry + '</span>'
+        + '</div>'
         + '<div style="text-align:right">'
-        +   '<span style="color:#fff;font-size:13px">$' + p.price + '</span>'
-        +   ' <span style="color:' + pc + ';font-size:12px;font-weight:bold">' + (p.pl_pct>=0?'+':'') + p.pl_pct + '% ($' + p.pl.toFixed(0) + ')</span>'
+        +   '<span style="color:#fff;font-size:13px">$' + p.price + '</span><br>'
+        +   '<span style="color:' + pc + ';font-size:12px;font-weight:bold">' + (p.pl_pct>=0?'+':'') + p.pl_pct + '% ($' + p.pl.toFixed(0) + ')</span>'
         + '</div></div>';
     });
     html += '</div>';
