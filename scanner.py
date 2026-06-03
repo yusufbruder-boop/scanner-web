@@ -1343,26 +1343,57 @@ def run_scan(progress_cb=None):
     shorts = sorted([r for r in results if r['signal'] == 'SHORT'], key=lambda x: -x['score'])
     watch  = [r for r in results if r['signal'] == 'WATCH']
 
+    # PRE-MOVER: HIGH/EXTREME Katalysator → sofort auf Next-Mover Liste
+    # Auch wenn Options noch keine Anomalie zeigen — News-Setup ist genug
+    pre_movers_high = [
+        r for r in results
+        if r.get('kat_strength') in ('HIGH', 'EXTREME')
+        and r['katalysator'] == 'POSITIV'
+        and r['signal'] != 'SHORT'
+    ]
+
     # NEXT MOVER: Kleines Cap + Katalysator + billiger Call (Hauptziel: 10%+ Mover)
-    movers = sorted(
-        [r for r in watch + longs
-         if r['price'] < 200 and r['pc'] < 0.45
-         and r['katalysator'] == 'POSITIV' and r.get('best')
-         and r['best']['pr'] < 1.0],
-        key=lambda x: (x['pc'], -x['long_score'])
+    movers_classic = [
+        r for r in watch + longs
+        if r['price'] < 200 and r['pc'] < 0.45
+        and r['katalysator'] == 'POSITIV' and r.get('best')
+        and r['best']['pr'] < 1.0
+    ]
+
+    # Kombiniert: HIGH/EXTREME zuerst, dann classic, dedup
+    seen_movers = set()
+    movers_combined = []
+    for r in sorted(pre_movers_high, key=lambda x: (
+            0 if x.get('kat_strength') == 'EXTREME' else 1, -x['long_score'])):
+        if r['t'] not in seen_movers:
+            seen_movers.add(r['t'])
+            movers_combined.append(r)
+    for r in sorted(movers_classic, key=lambda x: (x['pc'], -x['long_score'])):
+        if r['t'] not in seen_movers:
+            seen_movers.add(r['t'])
+            movers_combined.append(r)
+    movers = movers_combined[:8]
+
+    # PRE-SHORT: HIGH/EXTREME negative Katalysator (Dilution, SEC, DOJ)
+    pre_shorts_high = sorted(
+        [r for r in results
+         if r.get('kat_strength') in ('HIGH', 'EXTREME')
+         and r['katalysator'] == 'NEGATIV'],
+        key=lambda x: -x['short_score']
     )[:5]
 
     for r in results:
         r['is_social'] = r['t'] in social_tickers
 
     return {
-        'longs':    longs[:10],
-        'shorts':   shorts[:10],
-        'watch':    watch,
-        'movers':   movers,
-        'social':   social_tickers[:10],
-        'scanned':  len(results),
-        'total':    len(universe),
-        'time':     datetime.now().strftime('%Y-%m-%d %H:%M'),
-        'today':    today,
+        'longs':         longs[:10],
+        'shorts':        shorts[:10],
+        'watch':         watch,
+        'movers':        movers,
+        'pre_shorts':    pre_shorts_high,
+        'social':        social_tickers[:10],
+        'scanned':       len(results),
+        'total':         len(universe),
+        'time':          datetime.now().strftime('%Y-%m-%d %H:%M'),
+        'today':         today,
     }

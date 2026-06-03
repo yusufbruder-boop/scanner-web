@@ -1548,7 +1548,7 @@ function renderResults(data, isNew) {
 
   // ── Hauptziel: Mover + Long + Short ─────────────────────────────────────
   if (data.movers && data.movers.length > 0) {
-    html += '<div class="section"><div class="section-title mover">🎯 NEXT MOVER — 10%+ Potenzial, Günstiger Call</div>';
+    html += '<div class="section"><div class="section-title mover">🎯 NEXT MOVER — Pre-Move Setup: News + Smart Money + Entscheidung</div>';
     data.movers.forEach(r => { html += renderCard(r, 'mover', isNew); });
     html += '</div>';
   }
@@ -1568,6 +1568,13 @@ function renderResults(data, isNew) {
     data.shorts.slice(0, 5).forEach(r => { html += renderCard(r, 'short', isNew); });
   }
   html += '</div>';
+
+  // PRE-SHORT: HIGH/EXTREME Neg-Katalysator (Dilution, SEC, DOJ)
+  if (data.pre_shorts && data.pre_shorts.length > 0) {
+    html += '<div class="section"><div class="section-title short" style="background:#2a0000;border-color:#aa0000">⚠️ PRE-SHORT — Starker Neg-Katalysator (Dilution/SEC/DOJ)</div>';
+    data.pre_shorts.forEach(r => { html += renderCard(r, 'short', isNew); });
+    html += '</div>';
+  }
 
   // Nachrichten
   let allCards = (data.longs || []).concat(data.shorts || []).concat(data.watch || []);
