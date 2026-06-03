@@ -2563,22 +2563,19 @@ def hermes_monitor():
                         state['hermes_running']       = False
                         state['hermes_running_since'] = None
                         state['hermes_stuck_count']   = h_stuck_n
-                    tg_send(f'⚠️ <b>HERMES WATCHDOG</b>: {stuck_min:.0f}min stuck → reset (#{h_stuck_n})')
-                    # Nach 3x stuck in Folge → Process beenden, Railway startet automatisch neu
-                    if h_stuck_n >= 3:
-                        tg_send('🔄 <b>HERMES SELF-RESTART</b>: 3x stuck → Process Exit, Railway startet neu')
+                        state['hermes_force']         = True   # sofort neu starten
+                    tg_send(f'🔄 <b>HERMES</b>: {stuck_min:.0f}min stuck → Reset & Neustart (#{h_stuck_n})')
+                    # Letzter Ausweg: nach 10x stuck → kompletter Railway-Neustart
+                    if h_stuck_n >= 10:
+                        tg_send('🆘 <b>HERMES</b>: 10x stuck, nichts hilft → Railway Neustart')
                         os._exit(1)
 
-            # Kein stuck mehr → Counter zurücksetzen
+            # Erfolgreicher Zyklus → Counter zurücksetzen
             elif not h_running and h_success:
                 success_min = (datetime.now() - h_success).total_seconds() / 60
                 if success_min < 10:
                     with _hermes_lock:
                         state['hermes_stuck_count'] = 0
-                # Kein erfolgreicher Zyklus seit >30 Min aber auch nicht running → force restart
-                elif success_min > 30 and not h_running:
-                    tg_send(f'⚠️ <b>HERMES</b>: Kein Zyklus seit {success_min:.0f}min → erzwinge Neustart')
-                    state['hermes_force'] = True
 
             # ── HERMES SCANNER KONTROLLE & SELF-HEALING ──────────────────────
             data = state['results'] or load_results()
