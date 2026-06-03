@@ -1980,6 +1980,27 @@ function renderTab2(data) {
     html += '<div style="margin:8px;background:#0a1428;border:1px solid #2060aa22;border-radius:10px;padding:10px 14px;font-size:11px;color:#4a6a8a">📊 MT5 Bot — Kein Signal empfangen (läuft der Bot?)</div>';
   }
 
+  // ── Sektor Rotation Monitor ─────────────────────────────────────────────────
+  const sr = data.sector_rotation || {};
+  if (sr.data && Object.keys(sr.data).length > 0) {
+    let srItems = Object.entries(sr.data).sort((a,b) => b[1].avg - a[1].avg);
+    html += '<div style="margin:8px;background:linear-gradient(135deg,#0a0a1e,#0d0d28);border:1px solid #3040aa44;border-radius:10px;padding:12px 14px">';
+    html += '<div style="font-size:10px;font-weight:bold;color:#8080ff;letter-spacing:2px;margin-bottom:8px">🔄 SEKTOR ROTATION — ' + (sr.ts||'') + '</div>';
+    srItems.forEach(([sektor, v]) => {
+      let avg = v.avg || 0;
+      let col = avg >= 2 ? '#4dff91' : (avg >= 0.5 ? '#a0c0ff' : (avg >= -1 ? '#6b8cad' : '#ff4d6b'));
+      let bar = avg >= 0 ? '▲'.repeat(Math.min(Math.floor(avg*2),8)) : '▼'.repeat(Math.min(Math.floor(Math.abs(avg)*2),8));
+      let label = avg >= 2 ? ' ← ROTATION ZIEL' : (avg <= -3 ? ' ← AUSVERKAUF' : '');
+      let topT = (v.tickers||[]).sort((a,b)=>b.chg-a.chg).slice(0,2)
+        .map(t => `${t.sym} ${t.chg >= 0?'+':''}${t.chg}%`).join(' · ');
+      html += '<div style="display:flex;justify-content:space-between;padding:3px 0;border-top:1px solid #1a1a30">'
+        + '<div style="font-size:11px;color:' + col + '">' + bar + ' ' + sektor + '<span style="font-size:9px;color:#4a5a8a"> ' + topT + '</span>' + label + '</div>'
+        + '<div style="font-size:12px;font-weight:bold;color:' + col + '">' + (avg>=0?'+':'') + avg + '%</div>'
+        + '</div>';
+    });
+    html += '</div>';
+  }
+
   // ── Hermes Learning — Selbst-Optimierung ────────────────────────────────────
   const lrn = data.hermes_learning || {};
   const lw  = lrn.weights || {};
@@ -2419,6 +2440,7 @@ def results():
             out['hermes_running']      = state.get('hermes_running', False)
             out['running']             = state.get('running', False)
             out['mt5_status']          = state.get('mt5_status', {})
+            out['sector_rotation']     = state.get('sector_rotation', {})
             out['hermes_picks']        = state.get('hermes_picks', [])
             out['hermes_ts']           = state.get('hermes_ts', '')
             out['hermes_ai']           = state.get('hermes_ai', '')
@@ -2894,7 +2916,6 @@ def hermes_monitor():
                         try:
                             sigs_24h = hermes_24h_scan()
                             state['hermes_24h'] = sigs_24h
-                            # Starke 24h Signale als Telegram Alert
                             top = [s for s in sigs_24h if s['score'] >= 7]
                             if top:
                                 lines = [f'<b>🔍 HERMES 24H INTELLIGENCE — {datetime.now().strftime("%H:%M")}</b>']
@@ -2905,6 +2926,68 @@ def hermes_monitor():
                         except Exception:
                             pass
                     threading.Thread(target=_bg_24h, daemon=True).start()
+
+                    # 0c) SEKTOR ROTATION MONITOR — wo geht das Geld hin?
+                    def _bg_sector_rotation():
+                        try:
+                            import urllib.request as _ur, json as _js, ssl as _sl
+                            _ctx = _sl.create_default_context()
+                            _ctx.check_hostname = False
+                            _ctx.verify_mode = _sl.CERT_NONE
+                            SEKTOREN = {
+                                'AI_CHIPS':   ['NVDA','AVGO','AMD','MRVL','SMH'],
+                                'SOFTWARE':   ['MSFT','SNOW','NOW','DDOG','CRM','PLTR'],
+                                'HEALTHCARE': ['XLV','LLY','UNH','ABBV'],
+                                'ENERGIE':    ['XLE','XOM','CVX','USO'],
+                                'FINANZEN':   ['XLF','JPM','GS','BAC'],
+                                'DEFENSIV':   ['XLP','WMT','KO','PG'],
+                                'GOLD':       ['GLD','GDX','SLV'],
+                                'DEFENSE':    ['LMT','RTX','NOC'],
+                                'MARKT':      ['QQQ','SPY','IWM'],
+                            }
+                            rotation = {}
+                            for sektor, tickers in SEKTOREN.items():
+                                chgs = []
+                                for sym in tickers:
+                                    try:
+                                        url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=3d'
+                                        req = _ur.Request(url, headers={'User-Agent':'Mozilla/5.0'})
+                                        with _ur.urlopen(req, context=_ctx, timeout=6) as r:
+                                            d = _js.loads(r.read())
+                                        meta = d['chart']['result'][0]['meta']
+                                        price = float(meta.get('regularMarketPrice',0))
+                                        prev  = float(meta.get('chartPreviousClose',price) or price)
+                                        chg   = round((price-prev)/prev*100,2) if prev else 0
+                                        chgs.append({'sym':sym,'price':price,'chg':chg})
+                                    except Exception:
+                                        pass
+                                if chgs:
+                                    avg = round(sum(x['chg'] for x in chgs)/len(chgs),2)
+                                    rotation[sektor] = {'avg':avg,'tickers':chgs}
+
+                            state['sector_rotation'] = {
+                                'ts': datetime.now().strftime('%H:%M'),
+                                'data': rotation,
+                            }
+
+                            # Rotation Alert: wenn AI Chips fallen und anderer Sektor stark steigt
+                            chips_chg = rotation.get('AI_CHIPS',{}).get('avg',0)
+                            if chips_chg <= -3:
+                                winners = [(s,v) for s,v in rotation.items()
+                                           if s != 'AI_CHIPS' and v['avg'] >= 1.5]
+                                winners.sort(key=lambda x: -x[1]['avg'])
+                                if winners:
+                                    lines = [f'<b>🔄 SEKTOR ROTATION ALERT — {datetime.now().strftime("%H:%M")}</b>']
+                                    lines.append(f'AI Chips: {chips_chg:+.1f}% — Geld fliesst ab')
+                                    lines.append('Profiteure:')
+                                    for s, v in winners[:3]:
+                                        top_t = sorted(v["tickers"], key=lambda x:-x["chg"])
+                                        t_str = ', '.join(f'{x["sym"]} {x["chg"]:+.1f}%' for x in top_t[:2])
+                                        lines.append(f'  {s}: {v["avg"]:+.1f}% ({t_str})')
+                                    tg_send('\n'.join(lines))
+                        except Exception:
+                            pass
+                    threading.Thread(target=_bg_sector_rotation, daemon=True).start()
 
                     # 1) Alpaca Portfolio + Memory P&L — im Hintergrund (nicht blockieren)
                     def _bg_alpaca_mem():
