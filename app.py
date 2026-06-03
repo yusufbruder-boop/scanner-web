@@ -41,8 +41,9 @@ state = {
     'followup_date':  None,
     # Hermes Agent
     'hermes_alerts':  [],
-    'hermes_picks':   [],        # direkt gescannte Karten
-    'hermes_universe': set(),    # dynamisch erweiterte Tickers
+    'hermes_picks':   [],
+    'hermes_universe': set(),
+    'live_feed':      [],        # Web Alert Feed (ersetzt Telegram für User)
     'hermes_ts':           None,
     'hermes_running':      False,
     'hermes_running_since': None,
@@ -864,7 +865,38 @@ Antworte NUR mit diesem JSON (kein anderer Text):
 
 # ── Hilfsfunktionen ──────────────────────────────────────────────────────────
 
+def _classify_alert(msg):
+    """Klassifiziert Alert-Typ für Icon und Farbe im Web Feed."""
+    m = msg.lower()
+    if any(x in m for x in ['rotation','sektor','geld fliesst']): return 'rotation', '#8080ff', '🔄'
+    if any(x in m for x in ['earnings','earning','sell-the-news','drop.*%']): return 'earnings', '#ffa040', '📊'
+    if any(x in m for x in ['extreme','mover','signal','long','short','pick']): return 'signal', '#4dff91', '🎯'
+    if any(x in m for x in ['watchdog','stuck','neustart','fehler','error']): return 'system', '#ff4d4d', '⚙️'
+    if any(x in m for x in ['selbst','learning','gelernt','pattern','win-rate']): return 'learning', '#ffd700', '🧠'
+    if any(x in m for x in ['intelligence','24h','gainer','loser']): return 'intel', '#60a5fa', '🔍'
+    if any(x in m for x in ['marktschluss','close','analyse']): return 'close', '#c084fc', '📈'
+    return 'info', '#94a3b8', '💬'
+
+def feed_push(msg, alert_type=None):
+    """Fügt Alert zum Web Live-Feed hinzu."""
+    import re
+    clean = re.sub(r'<[^>]+>', '', msg).strip()[:300]
+    if not clean:
+        return
+    atype, color, icon = _classify_alert(msg) if not alert_type else (alert_type, '#94a3b8', '💬')
+    entry = {
+        'ts':    datetime.now().strftime('%H:%M'),
+        'msg':   clean,
+        'type':  atype,
+        'color': color,
+        'icon':  icon,
+    }
+    feed = state.get('live_feed', [])
+    feed.insert(0, entry)
+    state['live_feed'] = feed[:80]  # max 80 Einträge
+
 def tg_send(msg):
+    feed_push(msg)   # immer auch in Web Feed
     try:
         ctx = ssl.create_default_context()
         url = f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage'
@@ -1699,6 +1731,31 @@ function renderCard(r, cls, isNew) {
 function renderResults(data, isNew) {
   let html = '';
 
+  // ── LIVE ALERT FEED (ersetzt Telegram) ───────────────────────────────────
+  let feed = (data.live_feed || []).slice(0, 12);
+  if (feed.length > 0) {
+    html += '<div style="margin:8px;background:#080812;border:1px solid #2030aa44;border-radius:10px;overflow:hidden">'
+      + '<div style="padding:8px 14px;background:linear-gradient(90deg,#0a0a20,#101030);border-bottom:1px solid #2030aa44;display:flex;justify-content:space-between;align-items:center">'
+      + '<span style="font-size:10px;font-weight:bold;color:#8080ff;letter-spacing:2px">⚡ LIVE ALERTS</span>'
+      + '<span style="font-size:9px;color:#4a5a8a">' + feed.length + ' Einträge</span>'
+      + '</div>';
+    feed.forEach(f => {
+      let bg = f.type === 'signal'   ? '#0a1a0a' :
+               f.type === 'earnings' ? '#1a0f00' :
+               f.type === 'rotation' ? '#0a0a1e' :
+               f.type === 'learning' ? '#1a1500' :
+               f.type === 'system'   ? '#1a0808' : '#0a0a0a';
+      html += '<div style="padding:6px 14px;border-top:1px solid #1a1a2a;background:' + bg + ';display:flex;gap:8px;align-items:flex-start">'
+        + '<span style="font-size:14px;flex-shrink:0">' + (f.icon||'💬') + '</span>'
+        + '<div style="flex:1">'
+        + '<span style="font-size:11px;color:' + (f.color||'#94a3b8') + '">' + f.msg + '</span>'
+        + '</div>'
+        + '<span style="font-size:9px;color:#4a5a8a;flex-shrink:0">' + f.ts + '</span>'
+        + '</div>';
+    });
+    html += '</div>';
+  }
+
   // ── Hermes AI Analyse (ganz oben wenn vorhanden) ─────────────────────────
   if (data.hermes_ai) {
     html += '<div style="margin:8px;background:linear-gradient(135deg,#0a1f2e,#0d2840);border:1px solid #00e5ff44;border-radius:10px;padding:12px 14px">'
@@ -2441,6 +2498,7 @@ def results():
             out['running']             = state.get('running', False)
             out['mt5_status']          = state.get('mt5_status', {})
             out['sector_rotation']     = state.get('sector_rotation', {})
+            out['live_feed']           = state.get('live_feed', [])
             out['hermes_picks']        = state.get('hermes_picks', [])
             out['hermes_ts']           = state.get('hermes_ts', '')
             out['hermes_ai']           = state.get('hermes_ai', '')
