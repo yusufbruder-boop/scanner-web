@@ -1473,10 +1473,58 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         except Exception:
             _ai_rules = []
 
-        # Regel-Parser: konkrete Regeln in Flags umwandeln
+        # Regel-Parser: KI-Regeln aus identity.json in Flags umwandeln
         _block_short_on_call_sweep = any('call-sweep' in r.lower() or 'call sweep' in r.lower() for r in _ai_rules)
         _block_put_hedge_largecap  = any('put' in r.lower() and 'large' in r.lower() for r in _ai_rules)
         _require_news_confirm      = any('news' in r.lower() and 'bestätig' in r.lower() for r in _ai_rules)
+
+        # Aktive Strategien aus identity.json laden und auf diesen Ticker anwenden
+        _strategies = _id_d.get('strategies', [])
+        _strat_long_bonus  = 0
+        _strat_short_bonus = 0
+        _strat_reasons_l   = []
+        _strat_reasons_s   = []
+        for strat in _strategies:
+            if strat.get('hit_rate', 0) < 0.55:
+                continue   # Nur Strategien mit >55% Trefferquote anwenden
+            rule = strat.get('rule', '').lower()
+            sid  = strat.get('id', '')
+            applies = strat.get('applies_to', 'alle')
+            # Einfacher Regel-Matcher: prüft ob Bedingungen erfüllt
+            match = False
+            bonus = int(round(strat.get('confidence', 0.6) * 3))   # max +3 Punkte
+            # LONG-Strategien
+            if 'long' in rule:
+                conds = []
+                if 'p/c' in rule and 'call_voi' in rule:
+                    conds.append(pc < 0.6 and max_call_voi >= 5)
+                if 'sweeps' in rule or 'sweep' in rule:
+                    conds.append(sc >= 3)
+                if 'volratio' in rule or 'vol_ratio' in rule:
+                    conds.append(vol_spike >= float(rule.split('volratio')[1].split()[0].replace('>','').replace('x','').strip()) if 'volratio' in rule else False)
+                if 'darkpool' in rule.replace(' ', '') or 'dark pool' in rule:
+                    conds.append(dp_dir == 'BUY')
+                if conds and all(conds):
+                    _strat_long_bonus += bonus
+                    _strat_reasons_l.append(f'Strategie [{sid}]: {strat.get("rule","")[:50]}')
+                    strat['samples'] = strat.get('samples', 0) + 1
+            # SHORT-Strategien
+            elif 'short' in rule:
+                conds = []
+                if 'p/c' in rule:
+                    try:
+                        thr = float([w for w in rule.split() if w.replace('.','').isdigit()][0])
+                        conds.append(pc > thr)
+                    except Exception:
+                        conds.append(pc > 1.2)
+                if 'sweeps' in rule or 'sweep' in rule:
+                    conds.append(sp >= 3)
+                if 'darkpool' in rule.replace(' ', '') or 'dark pool' in rule:
+                    conds.append(dp_dir == 'SELL')
+                if conds and all(conds):
+                    _strat_short_bonus += bonus
+                    _strat_reasons_s.append(f'Strategie [{sid}]: {strat.get("rule","")[:50]}')
+                    strat['samples'] = strat.get('samples', 0) + 1
 
         # SmallCap Boost (gelernt: kleine Aktien nicht ignorieren)
         if price < 50 and _smallcap_bon > 0:
@@ -1591,6 +1639,14 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         if sm['bear_flow']:
             short_score += 2
             reasons_short.append(f'Put Premium ${sm["put_premium"]/1e6:.1f}M dominiert')
+
+        # Eigene Strategien anwenden (aus Strategy Builder)
+        if _strat_long_bonus > 0:
+            long_score  += _strat_long_bonus
+            reasons_long.extend(_strat_reasons_l)
+        if _strat_short_bonus > 0:
+            short_score += _strat_short_bonus
+            reasons_short.extend(_strat_reasons_s)
 
         # ── TIER 2: Katalysatoren (binäre Events) ───────────────────────────
 

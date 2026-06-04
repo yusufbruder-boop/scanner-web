@@ -834,6 +834,265 @@ def save_identity(identity: dict):
         pass
 
 
+def hermes_strategy_builder(poly_key: str):
+    """
+    Hermes entwickelt taeglich eigene Handelsstrategien.
+    Fragt sich: 'Diese Aktien sind gestiegen / gefallen — warum hab ich das nicht gesehen?
+    Kann ich das mit meinen Daten (Options, Dark Pool, News) erkennen?'
+    Schreibt einfache IF→THEN Regeln die dann im Scanner aktiv sind.
+    """
+    if not NOUS_KEY:
+        return
+    today     = datetime.now().strftime('%Y-%m-%d')
+    identity  = load_identity()
+    if identity.get('last_strategy_build') == today:
+        return
+
+    ctx = ssl.create_default_context()
+
+    # 1) Was ist heute wirklich passiert? Top Gainer + Loser holen
+    movers = {}
+    for direction in ['gainers', 'losers']:
+        try:
+            url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/{direction}?apiKey={poly_key}'
+            with urllib.request.urlopen(urllib.request.Request(url), context=ctx, timeout=8) as r:
+                d = json.loads(r.read())
+            for t in d.get('tickers', [])[:15]:
+                sym   = t.get('ticker', '')
+                day   = t.get('day', {})
+                prev  = t.get('prevDay', {})
+                price = float(day.get('c') or 0)
+                pc    = float(prev.get('c') or price or 1)
+                chg   = round((price - pc) / pc * 100, 1) if pc else 0
+                vol   = int(day.get('v') or 0)
+                pvol  = int(prev.get('v') or 1)
+                if sym and abs(chg) >= 4 and price >= 5:
+                    movers[sym] = {
+                        'chg': chg, 'price': price,
+                        'vol_ratio': round(vol / pvol, 1) if pvol else 0,
+                        'direction': 'UP' if chg > 0 else 'DOWN',
+                    }
+        except Exception:
+            pass
+
+    if not movers:
+        return
+
+    # 2) Fuer jeden Mover: Options-Snapshot holen und Signale extrahieren
+    mover_signals = {}
+    for sym, mv in list(movers.items())[:12]:
+        try:
+            url = f'https://api.polygon.io/v3/snapshot/options/{sym}?limit=150&apiKey={poly_key}'
+            with urllib.request.urlopen(urllib.request.Request(url), context=ctx, timeout=6) as r:
+                opt = json.loads(r.read())
+            res   = opt.get('results', [])
+            if not res:
+                continue
+            calls = [r for r in res if r['details']['contract_type'] == 'call']
+            puts  = [r for r in res if r['details']['contract_type'] == 'put']
+            cv = sum(r['day'].get('volume', 0) for r in calls)
+            pv = sum(r['day'].get('volume', 0) for r in puts)
+            cp = sum(r['day'].get('volume',0) * (r['day'].get('close') or 0) * 100 for r in calls)
+            pp = sum(r['day'].get('volume',0) * (r['day'].get('close') or 0) * 100 for r in puts)
+            max_cv = max((r['day'].get('volume',0)/max(r.get('open_interest',1),1) for r in calls), default=0)
+            max_pv = max((r['day'].get('volume',0)/max(r.get('open_interest',1),1) for r in puts),  default=0)
+            sc = sum(1 for r in calls if r['day'].get('volume',0) > r.get('open_interest',0) * 2)
+            sp = sum(1 for r in puts  if r['day'].get('volume',0) > r.get('open_interest',0) * 2)
+            pc_r = round(pv / cv, 2) if cv > 0 else 99
+
+            mover_signals[sym] = {
+                'chg':         mv['chg'],
+                'direction':   mv['direction'],
+                'vol_ratio':   mv['vol_ratio'],
+                'pc_ratio':    pc_r,
+                'call_voi':    round(max_cv, 1),
+                'put_voi':     round(max_pv, 1),
+                'call_sweeps': sc,
+                'put_sweeps':  sp,
+                'call_prem_m': round(cp / 1e6, 2),
+                'put_prem_m':  round(pp / 1e6, 2),
+                'bull_signal': (max_cv >= 5 or sc >= 3 or (cp > pp * 2)),
+                'bear_signal': (max_pv >= 5 or sp >= 3 or (pp > cp * 2)),
+            }
+        except Exception:
+            continue
+
+    if not mover_signals:
+        return
+
+    # 3) Analyse: Signal vorhanden ja/nein?
+    correct_long  = []  # Kurs gestiegen UND bull signal war da
+    missed_long   = []  # Kurs gestiegen aber kein bull signal
+    correct_short = []  # Kurs gefallen UND bear signal war da
+    missed_short  = []  # Kurs gefallen aber kein bear signal
+    false_long    = []  # bull signal aber Kurs gefallen
+    false_short   = []  # bear signal aber Kurs gestiegen
+
+    for sym, s in mover_signals.items():
+        chg = s['chg']
+        if chg >= 4:
+            if s['bull_signal']:
+                correct_long.append(f'{sym} +{chg}% | CallVOI:{s["call_voi"]}x SC:{s["call_sweeps"]} P/C:{s["pc_ratio"]}')
+            else:
+                missed_long.append(f'{sym} +{chg}% | kein Signal | P/C:{s["pc_ratio"]} CallVOI:{s["call_voi"]}x VolRatio:{s["vol_ratio"]}x')
+            if s['bear_signal']:
+                false_short.append(f'{sym} +{chg}% aber BearSignal: PutVOI:{s["put_voi"]}x SP:{s["put_sweeps"]}')
+        elif chg <= -4:
+            if s['bear_signal']:
+                correct_short.append(f'{sym} {chg}% | PutVOI:{s["put_voi"]}x SP:{s["put_sweeps"]} P/C:{s["pc_ratio"]}')
+            else:
+                missed_short.append(f'{sym} {chg}% | kein Signal | P/C:{s["pc_ratio"]} PutVOI:{s["put_voi"]}x VolRatio:{s["vol_ratio"]}x')
+            if s['bull_signal']:
+                false_long.append(f'{sym} {chg}% aber BullSignal: CallVOI:{s["call_voi"]}x SC:{s["call_sweeps"]}')
+
+    # 4) Bestehende Strategien laden
+    strategies = identity.get('strategies', [])
+    strat_str  = '\n'.join(
+        f'  [{s["id"]}] {s["rule"]} | Treffer:{s["hits"]}/{s["samples"]} ({s.get("hit_rate",0):.0%})'
+        for s in strategies[:8]
+    ) or '  noch keine'
+
+    past_lessons = identity.get('lessons', [])[:5]
+    lessons_str  = '\n'.join(f'  [{l["date"]}] {l["lesson"][:80]}' for l in past_lessons) or '  keine'
+
+    # 5) KI fragt sich: Warum hab ich das nicht gesehen?
+    prompt = f"""Du bist Hermes, ein AI Trading-Agent der heute ({today}) folgendes beobachtet hat:
+
+=== MARKTBEWEGUNGEN HEUTE ===
+Richtig erkannt LONG ({len(correct_long)}):
+{chr(10).join(correct_long[:5]) or '  keine'}
+
+Richtig erkannt SHORT ({len(correct_short)}):
+{chr(10).join(correct_short[:5]) or '  keine'}
+
+VERPASST — haette LONG sein sollen ({len(missed_long)}):
+{chr(10).join(missed_long[:6]) or '  keine'}
+
+VERPASST — haette SHORT sein sollen ({len(missed_short)}):
+{chr(10).join(missed_short[:6]) or '  keine'}
+
+Falsch — BullSignal aber gefallen ({len(false_long)}):
+{chr(10).join(false_long[:4]) or '  keine'}
+
+Falsch — BearSignal aber gestiegen ({len(false_short)}):
+{chr(10).join(false_short[:4]) or '  keine'}
+
+=== MEINE BESTEHENDEN STRATEGIEN ===
+{strat_str}
+
+=== MEINE LEKTIONEN ===
+{lessons_str}
+
+=== DEINE AUFGABE ===
+Analysiere die VERPASSTEN Moves. Frage dich:
+- Welche Kombination von Signalen (P/C Ratio, CallVOI, Sweeps, VolRatio) war bei den Gewinnern?
+- Warum hab ich die SHORT-Kandidaten nicht gesehen? Was haette ich pruefen muessen?
+- Entwickle 2-3 einfache IF→THEN Regeln die ich beim NAECHSTEN Scan anwenden kann
+- Erklaere ob deine bestehenden Strategien noch funktionieren oder angepasst werden muessen
+
+Antworte NUR mit validem JSON (keine Backticks, kein anderer Text):
+{{
+  "new_strategies": [
+    {{
+      "id": "kurzer_eindeutiger_name",
+      "rule": "WENN [konkrete Bedingung z.B. P/C < 0.4 UND CallVOI > 8x UND VolRatio > 3x] DANN LONG",
+      "why": "Erklaerung warum diese Regel funktioniert",
+      "confidence": 0.7,
+      "applies_to": "alle | tech | small_cap | earnings | risk_off"
+    }}
+  ],
+  "update_strategies": [
+    {{"id": "bestehende_strategie_id", "new_hit_rate": 0.75, "note": "warum angepasst"}}
+  ],
+  "remove_strategies": ["id_der_nicht_mehr_gilt"],
+  "key_insight": "1-2 Saetze: was war heute das wichtigste Muster",
+  "missed_reason": "Warum hab ich die verpassten Moves nicht erkannt — fehlt mir ein Signal?"
+}}"""
+
+    resp = _nous_call(
+        prompt,
+        system='Du bist Hermes AI Trading Stratege. Entwickle einfache, testbare IF-THEN Handelsregeln aus echten Marktdaten. JSON only.',
+        max_tokens=800, temperature=0.4
+    )
+    if not resp:
+        identity['last_strategy_build'] = today
+        save_identity(identity)
+        return
+
+    try:
+        import re as _re
+        m = _re.search(r'\{[\s\S]*\}', resp)
+        if not m:
+            return
+        data = json.loads(m.group())
+
+        # Neue Strategien eintragen
+        existing_ids = {s['id'] for s in strategies}
+        for ns in data.get('new_strategies', []):
+            sid = ns.get('id', '').strip()
+            if not sid or sid in existing_ids:
+                continue
+            strategies.append({
+                'id':         sid,
+                'rule':       ns.get('rule', '')[:150],
+                'why':        ns.get('why', '')[:100],
+                'confidence': float(ns.get('confidence', 0.6)),
+                'applies_to': ns.get('applies_to', 'alle'),
+                'created':    today,
+                'hits':       0,
+                'samples':    0,
+                'hit_rate':   float(ns.get('confidence', 0.6)),
+            })
+
+        # Bestehende Strategien aktualisieren
+        strat_map = {s['id']: s for s in strategies}
+        for us in data.get('update_strategies', []):
+            sid = us.get('id', '')
+            if sid in strat_map:
+                strat_map[sid]['hit_rate'] = float(us.get('new_hit_rate', strat_map[sid]['hit_rate']))
+                strat_map[sid].setdefault('notes', []).insert(0, f'{today}: {us.get("note","")[:60]}')
+
+        # Alte Strategien entfernen
+        remove = set(data.get('remove_strategies', []))
+        strategies = [s for s in strategies if s['id'] not in remove][-20:]
+        identity['strategies'] = strategies
+
+        # Key Insight als Lektion speichern
+        insight = data.get('key_insight', '').strip()
+        missed  = data.get('missed_reason', '').strip()
+        if insight:
+            identity.setdefault('lessons', []).insert(0, {
+                'date':    today,
+                'lesson':  insight,
+                'pattern': 'strategy_builder',
+                'missed':  missed,
+            })
+            identity['lessons'] = identity['lessons'][:30]
+
+        identity['last_strategy_build'] = today
+        save_identity(identity)
+
+        # Telegram Report
+        new_strats = data.get('new_strategies', [])
+        lines = [f'<b>HERMES STRATEGIE-UPDATE {today}</b>']
+        if insight:
+            lines.append(insight)
+        if missed:
+            lines.append(f'Verpasst weil: {missed[:100]}')
+        if new_strats:
+            lines.append(f'\nNeue Regeln ({len(new_strats)}):')
+            for ns in new_strats[:3]:
+                lines.append(f'  → {ns.get("rule","")[:80]}')
+        lines.append(f'Aktive Strategien: {len(strategies)}')
+        tg_send('\n'.join(lines))
+
+    except Exception:
+        pass
+
+    identity['last_strategy_build'] = today
+    save_identity(identity)
+
+
 def hermes_ai_self_reflection(false_signals: list, hits: dict, misses: dict,
                                win_rate: float, today: str,
                                direction_flip: bool = False,
@@ -3363,11 +3622,15 @@ def hermes_monitor():
                     is_close = (now_utc.hour == 20 and now_utc.minute < 15)
                     is_review = (now_utc.hour == 20 and 15 <= now_utc.minute < 30)
 
-                    # Self-Review: Hermes lernt aus Fehlern
+                    # Self-Review + Strategy Builder: Hermes lernt und entwickelt eigene Regeln
                     if is_review:
                         def _bg_review():
                             try:
                                 hermes_self_review(data, POLY_KEY)
+                            except Exception:
+                                pass
+                            try:
+                                hermes_strategy_builder(POLY_KEY)
                             except Exception:
                                 pass
                         threading.Thread(target=_bg_review, daemon=True).start()
