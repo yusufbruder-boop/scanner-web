@@ -2321,19 +2321,44 @@ function renderResults(data, isNew) {
     ? ' <span style="font-size:10px;background:#1a0a2e;color:#a78bfa;padding:2px 7px;border-radius:3px;margin-left:6px">' + badgeTxt + ' INTELLIGENCE</span>'
     : '';
 
-  html += '<div class="section"><div class="section-title long">▲ TOP LONG — Options Flow + Katalysator' + ahBadge + '</div>';
-  if (!data.longs || data.longs.length === 0) {
-    html += '<div class="empty">Hermes scannt... kommt gleich.</div>';
+  // Fallback: wenn Scanner leer → Hermes Hunt Alerts als LONG/SHORT nutzen
+  const hermAlertsSorted = (data.hermes_alerts||[]).slice().sort((a,b)=>b.score-a.score);
+  const fallbackLongs  = hermAlertsSorted.filter(a => a.net_direction==='LONG'  || a.call_sweeps >= a.put_sweeps);
+  const fallbackShorts = hermAlertsSorted.filter(a => a.net_direction==='SHORT' || a.put_sweeps > a.call_sweeps);
+
+  // Hermes Hunt Alert → Scanner-Karten Format konvertieren
+  function alertToCard(a) {
+    return {
+      t:       a.ticker,
+      score:   a.score,
+      price:   a.price,
+      reasons: a.reasons || [],
+      signal:  a.net_direction || 'LONG',
+      label:   '🤖 Hermes Hunt',
+      best:    null,
+    };
+  }
+  const hermBadge = ' <span style="font-size:10px;background:#0a1f2e;color:#00e5ff;padding:2px 7px;border-radius:3px;margin-left:6px">🤖 HERMES HUNT</span>';
+
+  const displayLongs  = (data.longs  && data.longs.length  > 0) ? data.longs  : fallbackLongs.slice(0,5).map(alertToCard);
+  const displayShorts = (data.shorts && data.shorts.length > 0) ? data.shorts : fallbackShorts.slice(0,5).map(alertToCard);
+  const usingFallback = (!data.longs || data.longs.length === 0);
+
+  html += '<div class="section"><div class="section-title long">▲ TOP LONG — Options Flow + Katalysator'
+    + (usingFallback ? hermBadge : ahBadge) + '</div>';
+  if (displayLongs.length === 0) {
+    html += '<div class="empty">Morgen ab 13:30 UTC — Markt öffnet.</div>';
   } else {
-    data.longs.slice(0, 5).forEach(r => { html += renderCard(r, 'long', isNew); });
+    displayLongs.slice(0, 5).forEach(r => { html += renderCard(r, 'long', isNew); });
   }
   html += '</div>';
 
-  html += '<div class="section"><div class="section-title short">▼ TOP SHORT — Überbewertet / Fallend' + ahBadge + '</div>';
-  if (!data.shorts || data.shorts.length === 0) {
-    html += '<div class="empty">Hermes scannt... kommt gleich.</div>';
+  html += '<div class="section"><div class="section-title short">▼ TOP SHORT — Überbewertet / Fallend'
+    + (usingFallback ? hermBadge : ahBadge) + '</div>';
+  if (displayShorts.length === 0) {
+    html += '<div class="empty">Morgen ab 13:30 UTC — Markt öffnet.</div>';
   } else {
-    data.shorts.slice(0, 5).forEach(r => { html += renderCard(r, 'short', isNew); });
+    displayShorts.slice(0, 5).forEach(r => { html += renderCard(r, 'short', isNew); });
   }
   html += '</div>';
 
@@ -3570,44 +3595,68 @@ def hermes_monitor():
                                 time.sleep(10)
                                 if not state['running']: break
                             continue
-                    # Intelligence Scan — 3x pro Tag: Pre-Market, Mid-Day, After-Hours
-                    # Zeitfenster (UTC): 11:00-12:00 | 16:00-17:00 | 21:00-22:00
+                    # Intelligence Scan — 3x pro Tag FEST + kontinuierlich alle 2h wenn Scanner leer
                     _now_utc   = datetime.now(timezone.utc)
                     _h, _m     = _now_utc.hour, _now_utc.minute
+                    _today_str = _now_utc.strftime('%Y-%m-%d')
+                    # Feste Zeitfenster (UTC)
                     _windows   = [
-                        (11, 0,  12, 0,  'Pre-Market'),    # 11:00-12:00 UTC = 7-8 AM ET
-                        (16, 0,  17, 0,  'Mid-Day'),       # 16:00-17:00 UTC = 12-1 PM ET
-                        (21, 0,  22, 0,  'After-Hours'),   # 21:00-22:00 UTC = 5-6 PM ET
+                        (11, 0,  12, 30,  'Pre-Market'),   # 11:00-12:30 UTC = 7-8:30 AM ET
+                        (16, 0,  17, 30,  'Mid-Day'),      # 16:00-17:30 UTC = 12-1:30 PM ET
+                        (21, 0,  23, 59,  'After-Hours'),  # 21:00-24:00 UTC = 5-8 PM ET
+                        (0,  0,  4,  0,   'Late-Night'),   # 00:00-04:00 UTC = Asien/Europa
                     ]
                     _in_window = next(
                         (label for h_s, m_s, h_e, m_e, label in _windows
-                         if (_h == h_s and _m >= m_s) or (_h == h_e and _m < m_e)),
+                         if ((_h > h_s or (_h == h_s and _m >= m_s)) and
+                             (_h < h_e or (_h == h_e and _m < m_e)))),
                         None
                     )
-                    _last_intel = state.get('_last_intel_scan', {})
-                    _today_str  = _now_utc.strftime('%Y-%m-%d')
-                    _already_ran = _last_intel.get(f'{_today_str}_{_in_window}', False) if _in_window else True
+                    _last_intel    = state.get('_last_intel_scan', {})
+                    _already_ran   = _last_intel.get(f'{_today_str}_{_in_window}', False) if _in_window else True
+                    # Fallback: auch alle 2h neu scannen wenn Scanner noch leer
+                    _last_any      = state.get('_last_intel_any', 0)
+                    _needs_refresh = (time.time() - _last_any) > 7200  # 2h
 
-                    if _in_window and not _already_ran:
+                    if _in_window and (not _already_ran or _needs_refresh):
                         state.setdefault('_last_intel_scan', {})[f'{_today_str}_{_in_window}'] = True
+                        state['_last_intel_any'] = time.time()
                         _window_label = _in_window
                         def _bg_intel_scan(label=_window_label):
                             try:
                                 from scanner import hermes_afterhours_scan
                                 extra = [s['sym'] for s in state.get('social_deep_raw', [])]
+                                # Hermes Hunt Alerts auch als Extra-Kandidaten
+                                hunt_syms = [a['ticker'] for a in state.get('hermes_alerts', [])
+                                             if a.get('score', 0) >= 5]
+                                extra = list(set(extra + hunt_syms))
                                 ah_data = hermes_afterhours_scan(extra_tickers=extra)
-                                if not ah_data or (not ah_data.get('longs') and not ah_data.get('shorts')):
+                                if not ah_data:
                                     return
-                                # Label setzen
+                                # Auch wenn leer: Hermes Hunt Alerts als Fallback einsetzen
+                                if not ah_data.get('longs') and not ah_data.get('shorts'):
+                                    alerts = state.get('hermes_alerts', [])
+                                    if alerts:
+                                        s_alerts = sorted(alerts, key=lambda x: -x.get('score',0))
+                                        longs_fb  = [a for a in s_alerts if a.get('call_sweeps',0) >= a.get('put_sweeps',0)]
+                                        shorts_fb = [a for a in s_alerts if a.get('put_sweeps',0) > a.get('call_sweeps',0)]
+                                        ah_data['longs']  = [{'t':a['ticker'],'score':a['score'],'price':a.get('price',0),
+                                                               'reasons':a.get('reasons',[]),'signal':'LONG',
+                                                               'label':'Hermes Hunt','best':None}
+                                                              for a in longs_fb[:6]]
+                                        ah_data['shorts'] = [{'t':a['ticker'],'score':a['score'],'price':a.get('price',0),
+                                                               'reasons':a.get('reasons',[]),'signal':'SHORT',
+                                                               'label':'Hermes Hunt','best':None}
+                                                              for a in shorts_fb[:4]]
+                                # Label + Web-Scanner aktualisieren
                                 ah_data['label'] = f'{label} Intelligence'
-                                # Nur in Web-Scanner einsetzen — kein Telegram
                                 with _hermes_lock:
                                     cur = state.get('results') or {}
-                                    cur['longs']   = ah_data['longs']
-                                    cur['shorts']  = ah_data['shorts']
+                                    cur['longs']   = ah_data.get('longs', [])
+                                    cur['shorts']  = ah_data.get('shorts', [])
                                     cur['movers']  = ah_data.get('movers', [])
                                     cur['label']   = ah_data['label']
-                                    cur['time']    = ah_data['time']
+                                    cur['time']    = ah_data.get('time', datetime.now().strftime('%Y-%m-%d %H:%M'))
                                     state['results'] = cur
                                 save_results(cur)
                             except Exception:
