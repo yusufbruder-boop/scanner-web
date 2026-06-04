@@ -346,20 +346,31 @@ def get_earnings_calendar_polygon(tickers: list) -> dict:
 # ── Dark Pool / Block Trade Detection (Polygon Trades API) ───────────────────
 def get_darkpool_signal(ticker: str, today: str) -> dict:
     """
-    Sucht große Block-Trades und Dark Pool Prints via Polygon /v3/trades.
+    Dark Pool Direction: erkennt ob institutionelle KAUFEN oder VERKAUFEN.
+    Methode: Vergleich Trade-Preis mit Rolling-VWAP der Session.
+    - Großer Trade UEBER VWAP = Akkumulation (bullish)
+    - Großer Trade UNTER VWAP = Distribution (bearish)
     Dark pool conditions: 37=Large Block, 41=OTC/Dark Pool, 20, 29, 80, 81.
     """
     try:
         start = f'{today}T13:30:00Z'
         url   = (f'https://api.polygon.io/v3/trades/{ticker}'
-                 f'?timestamp.gte={start}&order=desc&limit=250&apiKey={API}')
+                 f'?timestamp.gte={start}&order=asc&limit=500&apiKey={API}')
         data   = poly_fetch(url)
         trades = data.get('results', [])
         if not trades:
             return {}
+
+        # VWAP berechnen aus allen Trades (Preis × Größe / Gesamtgröße)
+        total_vol = sum(t.get('size', 0) or 0 for t in trades)
+        total_pv  = sum((t.get('size', 0) or 0) * (t.get('price', 0) or 0) for t in trades)
+        vwap = total_pv / total_vol if total_vol > 0 else 0
+
         DP_CONDS = {20, 29, 37, 41, 80, 81}
         large_all = []
         dark_prints = []
+        buy_dollar = sell_dollar = 0   # Richtungs-Tracking
+
         for t in trades:
             size   = t.get('size', 0) or 0
             price  = t.get('price', 0.0) or 0.0
@@ -370,17 +381,234 @@ def get_darkpool_signal(ticker: str, today: str) -> dict:
                 large_all.append(dollar)
                 if is_dp or dollar >= 2_000_000:
                     dark_prints.append(dollar)
+                # Richtung: über VWAP = institutioneller Kauf, unter VWAP = Verkauf
+                if vwap > 0:
+                    if price >= vwap * 1.001:   # mindestens 0.1% über VWAP
+                        buy_dollar  += dollar
+                    elif price <= vwap * 0.999:
+                        sell_dollar += dollar
+                    else:                        # neutral (nahe VWAP)
+                        buy_dollar  += dollar * 0.5
+                        sell_dollar += dollar * 0.5
+
         if not large_all:
             return {}
+
+        total_dir = buy_dollar + sell_dollar
+        buy_pct   = round(buy_dollar  / total_dir * 100) if total_dir > 0 else 50
+        sell_pct  = round(sell_dollar / total_dir * 100) if total_dir > 0 else 50
+        # Richtung: klares Signal ab 60% in eine Richtung
+        if buy_pct >= 65:
+            direction = 'BUY'
+        elif sell_pct >= 65:
+            direction = 'SELL'
+        else:
+            direction = 'NEUTRAL'
+
         return {
-            'count':    len(large_all),
-            'dp_count': len(dark_prints),
-            'total':    int(sum(large_all)),
-            'dp_total': int(sum(dark_prints)),
-            'largest':  int(max(large_all)),
+            'count':     len(large_all),
+            'dp_count':  len(dark_prints),
+            'total':     int(sum(large_all)),
+            'dp_total':  int(sum(dark_prints)),
+            'largest':   int(max(large_all)),
+            'vwap':      round(vwap, 2),
+            'buy_pct':   buy_pct,
+            'sell_pct':  sell_pct,
+            'direction': direction,   # NEU: BUY / SELL / NEUTRAL
         }
     except Exception:
         return {}
+
+
+# ── MAG 7 Markt-Signal (führender Indikator für NASDAQ) ──────────────────────
+MAG7 = ['AAPL', 'MSFT', 'AMZN', 'META', 'GOOGL', 'NVDA', 'TSLA']
+
+_mag7_cache = {'data': None, 'ts': 0}
+
+def get_mag7_market_signal() -> dict:
+    """
+    Aggregiertes Options-Flow Signal der Magnificent 7.
+    Logik: 4+ von 7 bullish = NASDAQ steigt (Leading Indicator ~15-60 Min voraus).
+    4+ von 7 bearish = NASDAQ fällt oder dreht.
+    Divergenz: Index steigt aber Mag7 bearish = Distribution, Umkehr kommt.
+    """
+    global _mag7_cache
+    if time.time() - _mag7_cache['ts'] < 300 and _mag7_cache['data']:
+        return _mag7_cache['data']
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    results = {}
+
+    def _check_one(sym):
+        try:
+            opt = poly_fetch(f'https://api.polygon.io/v3/snapshot/options/{sym}?limit=200&apiKey={API}')
+            res = opt.get('results', [])
+            if not res:
+                return None
+            price = res[0].get('underlying_asset', {}).get('price', 0)
+            calls = [r for r in res if r['details']['contract_type'] == 'call']
+            puts  = [r for r in res if r['details']['contract_type'] == 'put']
+
+            cv = sum(r['day'].get('volume', 0) for r in calls)
+            pv = sum(r['day'].get('volume', 0) for r in puts)
+            # Call Premium vs Put Premium (Smart Money bevorzugt Prämie)
+            cp = sum(r['day'].get('volume', 0) * (r['day'].get('close') or 0) * 100 for r in calls)
+            pp = sum(r['day'].get('volume', 0) * (r['day'].get('close') or 0) * 100 for r in puts)
+
+            # Sweep Detektion
+            sweep = get_options_sweep(res)
+            sc = sweep.get('sweeps_call', 0)
+            sp = sweep.get('sweeps_put', 0)
+
+            # Ungewöhnliche Vol/OI
+            max_call_voi = max(
+                (r['day'].get('volume',0) / max(r.get('open_interest',1),1) for r in calls), default=0)
+            max_put_voi  = max(
+                (r['day'].get('volume',0) / max(r.get('open_interest',1),1) for r in puts),  default=0)
+
+            # Richtung bestimmen (mehrere Faktoren)
+            bull_pts = bear_pts = 0
+            reasons_b = []
+            reasons_s = []
+
+            pc = pv / cv if cv > 0 else 1
+            if pc < 0.4:
+                bull_pts += 2; reasons_b.append(f'P/C={pc:.2f}')
+            elif pc < 0.6:
+                bull_pts += 1
+            elif pc > 1.2:
+                bear_pts += 2; reasons_s.append(f'P/C={pc:.2f}')
+            elif pc > 0.9:
+                bear_pts += 1
+
+            if cp > pp * 1.5:
+                bull_pts += 2; reasons_b.append(f'CallPrem${cp/1e6:.1f}M')
+            elif pp > cp * 1.5:
+                bear_pts += 2; reasons_s.append(f'PutPrem${pp/1e6:.1f}M')
+
+            if sc >= 3:
+                bull_pts += 2; reasons_b.append(f'{sc}CallSweep')
+            elif sc >= 1:
+                bull_pts += 1
+            if sp >= 3:
+                bear_pts += 2; reasons_s.append(f'{sp}PutSweep')
+            elif sp >= 1:
+                bear_pts += 1
+
+            if max_call_voi >= 8:
+                bull_pts += 2; reasons_b.append(f'CallVOI{max_call_voi:.0f}x')
+            elif max_call_voi >= 4:
+                bull_pts += 1
+            if max_put_voi >= 8:
+                bear_pts += 2; reasons_s.append(f'PutVOI{max_put_voi:.0f}x')
+            elif max_put_voi >= 4:
+                bear_pts += 1
+
+            if bull_pts >= bear_pts + 2:
+                flow = 'BULL'
+            elif bear_pts >= bull_pts + 2:
+                flow = 'BEAR'
+            else:
+                flow = 'NEUTRAL'
+
+            return {
+                'sym': sym, 'price': price, 'flow': flow,
+                'bull_pts': bull_pts, 'bear_pts': bear_pts,
+                'pc': round(pc, 2), 'sc': sc, 'sp': sp,
+                'reasons_bull': reasons_b[:3], 'reasons_bear': reasons_s[:3],
+            }
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {ex.submit(_check_one, sym): sym for sym in MAG7}
+        for f in as_completed(futures):
+            r = f.result()
+            if r:
+                results[r['sym']] = r
+
+    if not results:
+        return {}
+
+    bull_count = sum(1 for r in results.values() if r['flow'] == 'BULL')
+    bear_count = sum(1 for r in results.values() if r['flow'] == 'BEAR')
+    neut_count = len(results) - bull_count - bear_count
+
+    # Markt-Signal: 4+ von 7 = klares Signal
+    if bull_count >= 4:
+        market_dir = 'BULL'
+        conf = round(bull_count / len(results), 2)
+    elif bear_count >= 4:
+        market_dir = 'BEAR'
+        conf = round(bear_count / len(results), 2)
+    else:
+        market_dir = 'MIXED'
+        conf = 0.0
+
+    # Stärkste Signale (die die Richtung führen)
+    leaders_bull = [s for s, r in results.items() if r['flow'] == 'BULL']
+    leaders_bear = [s for s, r in results.items() if r['flow'] == 'BEAR']
+
+    out = {
+        'direction':    market_dir,
+        'confidence':   conf,
+        'bull_count':   bull_count,
+        'bear_count':   bear_count,
+        'neutral_count':neut_count,
+        'checked':      len(results),
+        'leaders_bull': leaders_bull,
+        'leaders_bear': leaders_bear,
+        'details':      results,
+        'ts':           datetime.now().strftime('%H:%M'),
+        'summary': (f'Mag7: {bull_count}BULL/{bear_count}BEAR/{neut_count}MIX'
+                    + (f' → {market_dir} {conf:.0%}' if market_dir != 'MIXED' else '')),
+    }
+    _mag7_cache = {'data': out, 'ts': time.time()}
+    return out
+
+
+def detect_flow_divergence(prev_chg: float, cv: int, pv: int,
+                            sc: int, sp: int, dp_dir: str) -> dict:
+    """
+    Erkennt Divergenz zwischen Preis und Options-Flow.
+    Preis steigt aber PUT-Flow dominiert = Hidden Distribution (BEAR kommt).
+    Preis fällt aber CALL-Flow dominiert = Smart Accumulation (BULL kommt).
+    Das ist der wichtigste Leading Indicator — tritt 15-60 Min vor Preisumkehr auf.
+    """
+    if cv + pv == 0:
+        return {'type': 'NONE', 'strength': 0, 'msg': ''}
+
+    pc = pv / max(cv, 1)
+
+    # Preis STEIGT aber Institutionelle kaufen PUTS
+    if prev_chg > 0.3 and pc > 1.5:
+        strength = min(round(pc * prev_chg / 2, 1), 5)
+        dp_note  = ' + Dark Pool SELL' if dp_dir == 'SELL' else ''
+        return {
+            'type':     'BEAR_DIV',
+            'strength': strength,
+            'msg':      f'WARNUNG: Preis +{prev_chg:.1f}% aber P/C={pc:.2f} — Distribution{dp_note}',
+        }
+
+    # Preis FÄLLT aber Institutionelle kaufen CALLS
+    if prev_chg < -0.3 and pc < 0.5:
+        strength = min(round((1/pc) * abs(prev_chg) / 2, 1), 5)
+        dp_note  = ' + Dark Pool BUY' if dp_dir == 'BUY' else ''
+        return {
+            'type':     'BULL_DIV',
+            'strength': strength,
+            'msg':      f'REVERSAL: Preis {prev_chg:.1f}% aber P/C={pc:.2f} — Akkumulation{dp_note}',
+        }
+
+    # Dark Pool contra Preis (schwächeres Signal)
+    if prev_chg > 0.5 and dp_dir == 'SELL':
+        return {'type': 'BEAR_DIV_SOFT', 'strength': 1,
+                'msg': f'Dark Pool SELL bei Preis +{prev_chg:.1f}%'}
+    if prev_chg < -0.5 and dp_dir == 'BUY':
+        return {'type': 'BULL_DIV_SOFT', 'strength': 1,
+                'msg': f'Dark Pool BUY bei Preis {prev_chg:.1f}%'}
+
+    return {'type': 'NONE', 'strength': 0, 'msg': ''}
 
 
 # ── Options Sweep Detection ───────────────────────────────────────────────────
@@ -1080,7 +1308,7 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
                                 'BEAT-ERWARTUNG' if beat_prob >= 65 else 'UNENTSCHIEDEN'),
             }
 
-        # Dark Pool parallel (Thread)
+        # Dark Pool parallel (Thread) — jetzt mit Richtungserkennung
         dp_result = [{}]
         def _fetch_dp():
             dp_result[0] = get_darkpool_signal(ticker, today)
@@ -1201,9 +1429,14 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         dp_thread.join(timeout=8)
         dp = dp_result[0]
         dp_dollar = dp.get('dp_total', 0)
+        dp_dir    = dp.get('direction', 'NEUTRAL')  # NEU: BUY / SELL / NEUTRAL
         dp_score  = (3 if dp_dollar >= 5_000_000 else
                      2 if dp_dollar >= 1_000_000 else
                      1 if dp_dollar >= 500_000   else 0)
+
+        # Flow-Divergenz erkennen (Preis vs Options-Flow vs Dark Pool)
+        _pc_div   = pv / max(cv, 1)
+        divergence = detect_flow_divergence(prev_chg, cv, pv, sc, sp, dp_dir)
 
         long_score = short_score = 0
         reasons_long = []
@@ -1298,16 +1531,42 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
             short_score += 2
             reasons_short.append(f'Vol/OI PUT {max_put_voi:.0f}x')
 
-        # Dark Pool (Block Trades = institutionelle Accumulation)
-        if dp_dollar >= 10_000_000:
-            long_score += 5
-            reasons_long.append(f'Dark Pool ${dp_dollar/1e6:.0f}M — großer Block')
-        elif dp_dollar >= 5_000_000:
-            long_score += 4
-            reasons_long.append(f'Dark Pool ${dp_dollar/1e6:.0f}M')
-        elif dp_dollar >= 1_000_000:
-            long_score += 2
-            reasons_long.append(f'Dark Pool ${dp_dollar/1e6:.1f}M')
+        # Dark Pool — jetzt mit RICHTUNG
+        if dp_dollar >= 1_000_000:
+            dp_m = dp_dollar / 1e6
+            if dp_dir == 'BUY':
+                pts = 5 if dp_dollar >= 10_000_000 else (4 if dp_dollar >= 5_000_000 else 2)
+                long_score  += pts
+                reasons_long.append(f'Dark Pool ${dp_m:.1f}M KAUF ({dp.get("buy_pct",50)}% über VWAP)')
+            elif dp_dir == 'SELL':
+                pts = 5 if dp_dollar >= 10_000_000 else (4 if dp_dollar >= 5_000_000 else 2)
+                short_score += pts
+                reasons_short.append(f'Dark Pool ${dp_m:.1f}M VERKAUF ({dp.get("sell_pct",50)}% unter VWAP)')
+            else:
+                # Neutral: nur Volumen zählt (kein Richtungs-Bonus)
+                pts = 3 if dp_dollar >= 10_000_000 else (2 if dp_dollar >= 5_000_000 else 1)
+                long_score  += pts
+                reasons_long.append(f'Dark Pool ${dp_m:.1f}M neutral')
+
+        # Flow-Divergenz Score (Leading Indicator!)
+        div_type = divergence.get('type', 'NONE')
+        div_str  = divergence.get('strength', 0)
+        if div_type == 'BEAR_DIV':
+            short_score += min(int(div_str) + 2, 5)
+            reasons_short.append(f'DIVERGENZ: {divergence["msg"][:60]}')
+            # Wenn Divergenz: Long-Score reduzieren
+            long_score = max(0, long_score - 2)
+        elif div_type == 'BULL_DIV':
+            long_score  += min(int(div_str) + 2, 5)
+            reasons_long.append(f'DIVERGENZ: {divergence["msg"][:60]}')
+            short_score = max(0, short_score - 2)
+        elif div_type in ('BEAR_DIV_SOFT', 'BULL_DIV_SOFT'):
+            if 'BEAR' in div_type:
+                short_score += 1
+                reasons_short.append(divergence['msg'][:50])
+            else:
+                long_score  += 1
+                reasons_long.append(divergence['msg'][:50])
 
         # Options Sweep Cluster (koordiniertes Smart Money)
         sc = sweep.get('sweeps_call', 0)

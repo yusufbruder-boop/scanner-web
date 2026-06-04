@@ -2641,6 +2641,7 @@ def results():
             out['hermes_news']         = state.get('hermes_news', [])
             out['hermes_universe']     = list(state.get('hermes_universe', set()))
             out['hermes_signal_evals'] = state.get('hermes_signal_evals', {})
+            out['mag7_signal']         = _to_json_safe(state.get('mag7_signal', {}))
             out['alpaca_portfolio']    = state.get('alpaca_portfolio', {})
             out['hermes_memory']       = state.get('hermes_memory', {})
             out['hermes_24h']          = state.get('hermes_24h', [])
@@ -3213,6 +3214,41 @@ def hermes_monitor():
                             )
                         except Exception:
                             pass
+
+                    # 4b) MAG 7 Markt-Signal (Leading Indicator für NASDAQ)
+                    try:
+                        from scanner import get_mag7_market_signal
+                        mag7 = get_mag7_market_signal()
+                        state['mag7_signal'] = mag7
+                        mag7_dir  = mag7.get('direction', 'MIXED')
+                        mag7_conf = mag7.get('confidence', 0)
+                        mag7_sum  = mag7.get('summary', '')
+                        prev_mag7 = state.get('mag7_prev_dir', 'MIXED')
+
+                        # Richtungswechsel im Mag7 → Telegram Alert
+                        if mag7_dir != 'MIXED' and mag7_dir != prev_mag7 and prev_mag7 != 'MIXED':
+                            flip_emoji = '🔴' if mag7_dir == 'BEAR' else '🟢'
+                            tg_send(
+                                f'{flip_emoji} <b>MAG7 RICHTUNGSWECHSEL</b>\n'
+                                f'{prev_mag7} → {mag7_dir} ({mag7_conf:.0%} Konfidenz)\n'
+                                f'{mag7_sum}\n'
+                                f'Bull: {", ".join(mag7.get("leaders_bull",[])[:4])}\n'
+                                f'Bear: {", ".join(mag7.get("leaders_bear",[])[:4])}\n'
+                                f'<i>Leading Indicator — NASDAQ folgt 15-60 Min spaeter</i>',
+                                key=f'mag7_{datetime.now().strftime("%H%M")}'
+                            )
+                        # Neue Divergenz (Mag7 bearish aber Markt noch oben)
+                        elif mag7_dir == 'BEAR' and mag7_conf >= 0.7:
+                            tg_send(
+                                f'⚠️ <b>MAG7 BEAR SIGNAL {mag7_conf:.0%}</b>\n'
+                                f'{mag7_sum}\n'
+                                f'Bear: {", ".join(mag7.get("leaders_bear",[])[:5])}\n'
+                                f'<i>NASDAQ könnte drehen — Positionen prüfen</i>',
+                                key=f'mag7bear_{datetime.now().strftime("%H")}'
+                            )
+                        state['mag7_prev_dir'] = mag7_dir
+                    except Exception:
+                        mag7 = {}
 
                     # 5) Nachrichten — Polygon News + Alpaca Breaking
                     news_alerts = []
