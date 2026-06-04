@@ -3330,20 +3330,28 @@ def hermes_monitor():
                         if not state['running']: break
                     continue
 
-            # 4) Scan hat 0 Ergebnisse (leer) → neu starten
+            # 4) Scan hat 0 Ergebnisse (leer) → nur während Marktzeiten neu starten
+            # After-Hours (vor 13:30 oder nach 21:00 UTC): KEIN Neustart — sonst Endlosschleife
             if data and not state['running']:
                 if not data.get('longs') and not data.get('shorts') and not data.get('watch'):
-                    if _start_scan('leere-ergebnisse'):
-                        for _ in range(24):
-                            time.sleep(10)
-                            if not state['running']: break
-                        continue
+                    now_utc_h = datetime.now(timezone.utc)
+                    is_market_hours = (now_utc_h.hour >= 13 and now_utc_h.hour < 21)
+                    last_empty_restart = state.get('_last_empty_restart', 0)
+                    restart_cooldown_ok = (time.time() - last_empty_restart) > 3600  # max 1x/h
+                    if is_market_hours and restart_cooldown_ok:
+                        state['_last_empty_restart'] = time.time()
+                        if _start_scan('leere-ergebnisse'):
+                            for _ in range(24):
+                                time.sleep(10)
+                                if not state['running']: break
+                            continue
+                    # After-Hours oder Cooldown: Hermes trotzdem laufen lassen (News/Analyse)
 
             # 5) Social-Daten fehlen → enrich neu starten
             if data and not state.get('social_data') and not state['running']:
                 threading.Thread(target=enrich_background, args=(data,), daemon=True).start()
 
-            # 3) Hermes Analyse — läuft auch wenn Scan parallel läuft (nutzt letzte Ergebnisse)
+            # Hermes Analyse — läuft auch wenn Scan parallel läuft (nutzt letzte Ergebnisse)
             forced = state.pop('hermes_force', False)
             with _hermes_lock:
                 already_running = state.get('hermes_running', False)
