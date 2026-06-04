@@ -1629,6 +1629,231 @@ def best_option(contracts, is_call, price, today, exp_cutoff, atr=5.0):
     candidates.sort(key=lambda x: -x['vol'])
     return candidates[0] if candidates else None
 
+def hermes_afterhours_scan(extra_tickers: list = None) -> dict:
+    """
+    After-Hours Intelligence Scan — laeuft wenn Markt geschlossen ist.
+    Analysiert den KOMPLETTEN Tages-Flow (Options + Dark Pool) und
+    gibt immer LONG und SHORT Kandidaten zurueck.
+
+    Logik:
+    - Schaut den vollen Tages-Flow: welche Stocks hatten die groesste
+      institutionelle Aktivitaet HEUTE?
+    - LONG: hohe Call-Premium + Dark Pool BUY + bullische News
+    - SHORT: hohe Put-Premium + Dark Pool SELL + bearische News / Ueberdehnung
+    - Niedrigere Score-Schwelle (3 statt 4) — voller Datensatz nach Close
+    """
+    today      = datetime.now().strftime('%Y-%m-%d')
+    exp_cutoff = (datetime.now() + timedelta(days=45)).strftime('%Y-%m-%d')
+    news_cut   = (datetime.now() - timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    # Universe: Hauptkandidaten + Social Trending + Extra
+    universe_ah = list(UNIVERSE[:40])
+    if extra_tickers:
+        for t in extra_tickers:
+            if t not in universe_ah and 2 <= len(t) <= 5:
+                universe_ah.append(t)
+
+    # Social Trending Stocks auch scannen
+    try:
+        social_deep = get_social_deep_trending()
+        for s in social_deep[:10]:
+            t = s['sym']
+            if t not in universe_ah and 2 <= len(t) <= 5:
+                universe_ah.append(t)
+    except Exception:
+        pass
+
+    longs  = []
+    shorts = []
+
+    def _scan_one(ticker):
+        score_l = score_s = 0
+        rl = []  # long reasons
+        rs = []  # short reasons
+        price = 0
+        best_call = best_put = None
+
+        # 1) Options Flow (kompletter Tages-Flow)
+        try:
+            opt = poly_fetch(f'https://api.polygon.io/v3/snapshot/options/{ticker}?limit=200&apiKey={API}')
+            res = opt.get('results', [])
+            if not res:
+                return None
+            price = res[0].get('underlying_asset', {}).get('price', 0)
+            if price < 3:
+                return None
+
+            calls = [r for r in res if r['details']['contract_type'] == 'call']
+            puts  = [r for r in res if r['details']['contract_type'] == 'put']
+            cv = sum(r['day'].get('volume', 0) for r in calls)
+            pv = sum(r['day'].get('volume', 0) for r in puts)
+            cp = sum(r['day'].get('volume',0)*(r['day'].get('close') or 0)*100 for r in calls)
+            pp = sum(r['day'].get('volume',0)*(r['day'].get('close') or 0)*100 for r in puts)
+            pc = pv / max(cv, 1)
+
+            mc = max((r['day'].get('volume',0)/max(r.get('open_interest',1),1)
+                      for r in calls if r['day'].get('volume',0) > 50), default=0)
+            mp = max((r['day'].get('volume',0)/max(r.get('open_interest',1),1)
+                      for r in puts  if r['day'].get('volume',0) > 50), default=0)
+
+            sw = get_options_sweep(res)
+            sc = sw.get('sweeps_call', 0)
+            sp = sw.get('sweeps_put', 0)
+
+            # Call-Flow (LONG Signal)
+            if cp >= 5_000_000:
+                score_l += 4; rl.append(f'Call-Premium ${cp/1e6:.1f}M')
+            elif cp >= 2_000_000:
+                score_l += 3; rl.append(f'Call-Premium ${cp/1e6:.1f}M')
+            elif cp >= 1_000_000:
+                score_l += 2; rl.append(f'Call-Premium ${cp/1e6:.1f}M')
+
+            if mc >= 10:
+                score_l += 3; rl.append(f'Call VOI {mc:.0f}x (ungewöhnlich)')
+            elif mc >= 5:
+                score_l += 2; rl.append(f'Call VOI {mc:.0f}x')
+
+            if sc >= 5:
+                score_l += 3; rl.append(f'{sc} Call-Sweeps (koordiniert)')
+            elif sc >= 2:
+                score_l += 2; rl.append(f'{sc} Call-Sweeps')
+
+            if pc < 0.4:
+                score_l += 2; rl.append(f'P/C {pc:.2f} — stark bullisch')
+            elif pc < 0.6:
+                score_l += 1
+
+            # Put-Flow (SHORT Signal)
+            if pp >= 5_000_000:
+                score_s += 4; rs.append(f'Put-Premium ${pp/1e6:.1f}M')
+            elif pp >= 2_000_000:
+                score_s += 3; rs.append(f'Put-Premium ${pp/1e6:.1f}M')
+            elif pp >= 1_000_000:
+                score_s += 2; rs.append(f'Put-Premium ${pp/1e6:.1f}M')
+
+            if mp >= 10:
+                score_s += 3; rs.append(f'Put VOI {mp:.0f}x (ungewöhnlich)')
+            elif mp >= 5:
+                score_s += 2; rs.append(f'Put VOI {mp:.0f}x')
+
+            if sp >= 5:
+                score_s += 3; rs.append(f'{sp} Put-Sweeps')
+            elif sp >= 2:
+                score_s += 2; rs.append(f'{sp} Put-Sweeps')
+
+            if pc > 1.5:
+                score_s += 2; rs.append(f'P/C {pc:.2f} — stark bearisch')
+            elif pc > 1.0:
+                score_s += 1
+
+            # Beste Option für morgen finden (AH: niedrigere Anforderungen)
+            best_call = best_option(calls, True,  price, today, exp_cutoff, price * 0.02)
+            best_put  = best_option(puts,  False, price, today, exp_cutoff, price * 0.02)
+
+        except Exception:
+            return None
+
+        # 2) Dark Pool Richtung
+        try:
+            dp = get_darkpool_signal(ticker, today)
+            dp_dir = dp.get('direction', 'NEUTRAL')
+            dp_m   = dp.get('dp_total', 0) / 1e6
+            if dp_dir == 'BUY' and dp_m >= 0.5:
+                score_l += 3 if dp_m >= 5 else (2 if dp_m >= 1 else 1)
+                rl.append(f'Dark Pool KAUF ${dp_m:.1f}M')
+            elif dp_dir == 'SELL' and dp_m >= 0.5:
+                score_s += 3 if dp_m >= 5 else (2 if dp_m >= 1 else 1)
+                rs.append(f'Dark Pool VERKAUF ${dp_m:.1f}M')
+        except Exception:
+            pass
+
+        # 3) News (letzte 24h)
+        try:
+            nd = poly_fetch(f'https://api.polygon.io/v2/reference/news?ticker={ticker}&limit=5&apiKey={API}')
+            for n in nd.get('results', []):
+                if n.get('published_utc', '') < news_cut:
+                    continue
+                tl   = n.get('title', '').lower()
+                sent = next((i.get('sentiment','') for i in n.get('insights',[])
+                             if i.get('ticker') == ticker), '')
+                if any(k in tl for k in POS_KEYS) and sent != 'negative':
+                    score_l += 2; rl.append(f'News: {n.get("title","")[:50]}'); break
+                if any(k in tl for k in NEG_KEYS) or sent == 'negative':
+                    score_s += 2; rs.append(f'Neg.News: {n.get("title","")[:45]}'); break
+        except Exception:
+            pass
+
+        # 4) Ergebnis bauen (Schwelle: 3 statt 4)
+        result = None
+        if score_l >= 3 and score_l > score_s and best_call:
+            result = {
+                't': ticker, 'signal': 'LONG', 'score': score_l,
+                'price': round(price, 2),
+                'reasons': rl[:4],
+                'best': best_call,
+                'otype': 'CALL',
+                'label': 'AH-Setup',   # After-Hours Label
+            }
+        elif score_s >= 3 and score_s > score_l and best_put:
+            result = {
+                't': ticker, 'signal': 'SHORT', 'score': score_s,
+                'price': round(price, 2),
+                'reasons': rs[:4],
+                'best': best_put,
+                'otype': 'PUT',
+                'label': 'AH-Setup',
+            }
+        elif score_l >= 3 and not best_call:
+            # Kein best_option aber Signal stark — trotzdem zeigen (ohne Options-Details)
+            result = {
+                't': ticker, 'signal': 'LONG', 'score': score_l,
+                'price': round(price, 2),
+                'reasons': rl[:4],
+                'best': None,
+                'otype': 'CALL',
+                'label': 'AH-Flow',
+            }
+        elif score_s >= 3 and not best_put:
+            result = {
+                't': ticker, 'signal': 'SHORT', 'score': score_s,
+                'price': round(price, 2),
+                'reasons': rs[:4],
+                'best': None,
+                'otype': 'PUT',
+                'label': 'AH-Flow',
+            }
+        return result
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futs = [ex.submit(_scan_one, t) for t in universe_ah[:35]]
+        for f in as_completed(futs):
+            try:
+                r = f.result()
+                if not r:
+                    continue
+                if r['signal'] == 'LONG':
+                    longs.append(r)
+                else:
+                    shorts.append(r)
+            except Exception:
+                pass
+
+    # Nach Score sortieren
+    longs.sort(key=lambda x: -x['score'])
+    shorts.sort(key=lambda x: -x['score'])
+
+    return {
+        'longs':   longs[:8],
+        'shorts':  shorts[:8],
+        'time':    datetime.now().strftime('%Y-%m-%d %H:%M'),
+        'label':   'After-Hours Intelligence',
+        'movers':  [],
+        'watch':   [],
+        'scanned': len(universe_ah[:35]),
+        'today':   today,
+    }
+
+
 def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
     try:
         opt = poly_fetch(f'https://api.polygon.io/v3/snapshot/options/{ticker}?limit=250&apiKey={API}')

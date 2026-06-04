@@ -2202,17 +2202,20 @@ function renderResults(data, isNew) {
     html += '</div>';
   }
 
-  html += '<div class="section"><div class="section-title long">▲ TOP LONG — Options Flow + Katalysator</div>';
+  const isAH = data.label && data.label.includes('After-Hours');
+  const ahBadge = isAH ? ' <span style="font-size:10px;background:#1a0a2e;color:#a78bfa;padding:2px 7px;border-radius:3px;margin-left:6px">🌙 AFTER-HOURS FLOW</span>' : '';
+
+  html += '<div class="section"><div class="section-title long">▲ TOP LONG — Options Flow + Katalysator' + ahBadge + '</div>';
   if (!data.longs || data.longs.length === 0) {
-    html += '<div class="empty">Keine Long-Signale.</div>';
+    html += '<div class="empty">Hermes scannt... kommt gleich.</div>';
   } else {
     data.longs.slice(0, 5).forEach(r => { html += renderCard(r, 'long', isNew); });
   }
   html += '</div>';
 
-  html += '<div class="section"><div class="section-title short">▼ TOP SHORT — Überbewertet / Fallend</div>';
+  html += '<div class="section"><div class="section-title short">▼ TOP SHORT — Überbewertet / Fallend' + ahBadge + '</div>';
   if (!data.shorts || data.shorts.length === 0) {
-    html += '<div class="empty">Keine Short-Signale.</div>';
+    html += '<div class="empty">Hermes scannt... kommt gleich.</div>';
   } else {
     data.shorts.slice(0, 5).forEach(r => { html += renderCard(r, 'short', isNew); });
   }
@@ -3451,6 +3454,42 @@ def hermes_monitor():
                                 time.sleep(10)
                                 if not state['running']: break
                             continue
+                    # After-Hours Intelligence: Scanner-Ergebnisse befüllen
+                    last_ah_scan = state.get('_last_ah_scan', 0)
+                    if (time.time() - last_ah_scan) > 1800:  # alle 30 Min
+                        state['_last_ah_scan'] = time.time()
+                        def _bg_ah_scan():
+                            try:
+                                from scanner import hermes_afterhours_scan
+                                # Social Trending Stocks als Extra-Kandidaten
+                                extra = [s['sym'] for s in state.get('social_deep_raw', [])]
+                                ah_data = hermes_afterhours_scan(extra_tickers=extra)
+                                if ah_data and (ah_data.get('longs') or ah_data.get('shorts')):
+                                    # In state['results'] einsetzen — Seite zeigt echte Daten
+                                    with _hermes_lock:
+                                        cur = state.get('results') or {}
+                                        cur['longs']   = ah_data['longs']
+                                        cur['shorts']  = ah_data['shorts']
+                                        cur['movers']  = ah_data.get('movers', [])
+                                        cur['label']   = ah_data.get('label', 'After-Hours')
+                                        cur['time']    = ah_data['time']
+                                        state['results'] = cur
+                                    save_results(cur)
+                                    # Telegram kurz melden
+                                    ts_ah = datetime.now().strftime('%H:%M')
+                                    l_str = ', '.join(f'{r["t"]}({r["score"]})' for r in ah_data['longs'][:4])
+                                    s_str = ', '.join(f'{r["t"]}({r["score"]})' for r in ah_data['shorts'][:4])
+                                    tg_send(
+                                        f'🌙 <b>HERMES AFTER-HOURS {ts_ah}</b>\n'
+                                        f'🟢 LONG: {l_str or "—"}\n'
+                                        f'🔴 SHORT: {s_str or "—"}\n'
+                                        f'<i>Kompletter Tages-Flow · {ah_data["scanned"]} Aktien gescannt</i>',
+                                        key=f'ah_{ts_ah}'
+                                    )
+                            except Exception:
+                                pass
+                        threading.Thread(target=_bg_ah_scan, daemon=True).start()
+
                     # After-Hours: Social Deep Scan starten (Reddit + Stocktwits WHY)
                     last_social_scan = state.get('_last_social_deep_scan', 0)
                     if (time.time() - last_social_scan) > 1800:  # alle 30 Min
