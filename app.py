@@ -56,6 +56,7 @@ state = {
     'auto_trade_enabled':  AUTO_TRADE_ENABLED,
     'auto_trades':         [],
     'hermes_24h':          [],
+    'seen_news':           set(),   # dedup: bereits gesendete News-Headlines
     # Background threads: Social KI-Score + HF 13F
     'social_data':    [],
     'hf_data':        [],
@@ -3080,6 +3081,7 @@ def hermes_monitor():
 
                     # 5) Nachrichten — Polygon News + Alpaca Breaking
                     news_alerts = []
+                    _seen = state.get('seen_news', set())
                     all_tickers = list({r['t'] for r in
                                        data.get('longs',[]) + data.get('shorts',[]) +
                                        data.get('movers',[])})
@@ -3093,7 +3095,9 @@ def hermes_monitor():
                                 nd = json.loads(r.read())
                             for n in nd.get('results', []):
                                 if n.get('published_utc', '') >= news_cutoff_h:
-                                    news_alerts.append(f'{sym}: {n.get("title","")[:60]}')
+                                    entry = f'{sym}: {n.get("title","")[:60]}'
+                                    if entry not in _seen:
+                                        news_alerts.append(entry)
                                     break
                         except Exception:
                             pass
@@ -3101,12 +3105,15 @@ def hermes_monitor():
                     al_news = get_alpaca_market_news(limit=10)
                     al_breaking = []
                     from scanner import POS_KEYS, NEG_KEYS
+                    _seen = state.get('seen_news', set())
                     for n in al_news:
                         h = n.get('headline', '')
                         if any(k in h.lower() for k in POS_KEYS + NEG_KEYS):
                             syms = n.get('symbols', [])
                             if syms:
-                                al_breaking.append(f'{",".join(syms[:2])}: {h[:55]}')
+                                entry = f'{",".join(syms[:2])}: {h[:55]}'
+                                if entry not in _seen:
+                                    al_breaking.append(entry)
 
                     # 6) Starke Hermes-Funde direkt scannen (Score >= 6)
                     today      = datetime.now().strftime('%Y-%m-%d')
@@ -3277,6 +3284,14 @@ Marktschluss-Zusammenfassung (Deutsch, max 150 Wörter):
                             if b:
                                 lines.append(f'  {p.get("otype")} ${b.get("strike")} @ ${b.get("pr")}  Exp:{b.get("exp")}')
                     tg_send('\n'.join(lines))
+                    # Gesendete News als "gesehen" markieren
+                    _seen.update(news_alerts)
+                    _seen.update(al_breaking)
+                    # Set nicht unbegrenzt wachsen lassen
+                    if len(_seen) > 500:
+                        state['seen_news'] = set(list(_seen)[-300:])
+                    else:
+                        state['seen_news'] = _seen
 
             # Wenn Scan läuft: alle 15s prüfen ob er fertig ist
             if state['running']:
