@@ -2202,8 +2202,14 @@ function renderResults(data, isNew) {
     html += '</div>';
   }
 
-  const isAH = data.label && data.label.includes('After-Hours');
-  const ahBadge = isAH ? ' <span style="font-size:10px;background:#1a0a2e;color:#a78bfa;padding:2px 7px;border-radius:3px;margin-left:6px">🌙 AFTER-HOURS FLOW</span>' : '';
+  const lbl    = data.label || '';
+  const isAH   = lbl.includes('After-Hours');
+  const isPM   = lbl.includes('Pre-Market');
+  const isMD   = lbl.includes('Mid-Day');
+  const badgeTxt = isPM ? '🌅 PRE-MARKET' : (isMD ? '☀️ MID-DAY' : (isAH ? '🌙 AFTER-HOURS' : ''));
+  const ahBadge  = badgeTxt
+    ? ' <span style="font-size:10px;background:#1a0a2e;color:#a78bfa;padding:2px 7px;border-radius:3px;margin-left:6px">' + badgeTxt + ' INTELLIGENCE</span>'
+    : '';
 
   html += '<div class="section"><div class="section-title long">▲ TOP LONG — Options Flow + Katalysator' + ahBadge + '</div>';
   if (!data.longs || data.longs.length === 0) {
@@ -3454,41 +3460,49 @@ def hermes_monitor():
                                 time.sleep(10)
                                 if not state['running']: break
                             continue
-                    # After-Hours Intelligence: Scanner-Ergebnisse befüllen
-                    last_ah_scan = state.get('_last_ah_scan', 0)
-                    if (time.time() - last_ah_scan) > 1800:  # alle 30 Min
-                        state['_last_ah_scan'] = time.time()
-                        def _bg_ah_scan():
+                    # Intelligence Scan — 3x pro Tag: Pre-Market, Mid-Day, After-Hours
+                    # Zeitfenster (UTC): 11:00-12:00 | 16:00-17:00 | 21:00-22:00
+                    _now_utc   = datetime.now(timezone.utc)
+                    _h, _m     = _now_utc.hour, _now_utc.minute
+                    _windows   = [
+                        (11, 0,  12, 0,  'Pre-Market'),    # 11:00-12:00 UTC = 7-8 AM ET
+                        (16, 0,  17, 0,  'Mid-Day'),       # 16:00-17:00 UTC = 12-1 PM ET
+                        (21, 0,  22, 0,  'After-Hours'),   # 21:00-22:00 UTC = 5-6 PM ET
+                    ]
+                    _in_window = next(
+                        (label for h_s, m_s, h_e, m_e, label in _windows
+                         if (_h == h_s and _m >= m_s) or (_h == h_e and _m < m_e)),
+                        None
+                    )
+                    _last_intel = state.get('_last_intel_scan', {})
+                    _today_str  = _now_utc.strftime('%Y-%m-%d')
+                    _already_ran = _last_intel.get(f'{_today_str}_{_in_window}', False) if _in_window else True
+
+                    if _in_window and not _already_ran:
+                        state.setdefault('_last_intel_scan', {})[f'{_today_str}_{_in_window}'] = True
+                        _window_label = _in_window
+                        def _bg_intel_scan(label=_window_label):
                             try:
                                 from scanner import hermes_afterhours_scan
-                                # Social Trending Stocks als Extra-Kandidaten
                                 extra = [s['sym'] for s in state.get('social_deep_raw', [])]
                                 ah_data = hermes_afterhours_scan(extra_tickers=extra)
-                                if ah_data and (ah_data.get('longs') or ah_data.get('shorts')):
-                                    # In state['results'] einsetzen — Seite zeigt echte Daten
-                                    with _hermes_lock:
-                                        cur = state.get('results') or {}
-                                        cur['longs']   = ah_data['longs']
-                                        cur['shorts']  = ah_data['shorts']
-                                        cur['movers']  = ah_data.get('movers', [])
-                                        cur['label']   = ah_data.get('label', 'After-Hours')
-                                        cur['time']    = ah_data['time']
-                                        state['results'] = cur
-                                    save_results(cur)
-                                    # Telegram kurz melden
-                                    ts_ah = datetime.now().strftime('%H:%M')
-                                    l_str = ', '.join(f'{r["t"]}({r["score"]})' for r in ah_data['longs'][:4])
-                                    s_str = ', '.join(f'{r["t"]}({r["score"]})' for r in ah_data['shorts'][:4])
-                                    tg_send(
-                                        f'🌙 <b>HERMES AFTER-HOURS {ts_ah}</b>\n'
-                                        f'🟢 LONG: {l_str or "—"}\n'
-                                        f'🔴 SHORT: {s_str or "—"}\n'
-                                        f'<i>Kompletter Tages-Flow · {ah_data["scanned"]} Aktien gescannt</i>',
-                                        key=f'ah_{ts_ah}'
-                                    )
+                                if not ah_data or (not ah_data.get('longs') and not ah_data.get('shorts')):
+                                    return
+                                # Label setzen
+                                ah_data['label'] = f'{label} Intelligence'
+                                # Nur in Web-Scanner einsetzen — kein Telegram
+                                with _hermes_lock:
+                                    cur = state.get('results') or {}
+                                    cur['longs']   = ah_data['longs']
+                                    cur['shorts']  = ah_data['shorts']
+                                    cur['movers']  = ah_data.get('movers', [])
+                                    cur['label']   = ah_data['label']
+                                    cur['time']    = ah_data['time']
+                                    state['results'] = cur
+                                save_results(cur)
                             except Exception:
                                 pass
-                        threading.Thread(target=_bg_ah_scan, daemon=True).start()
+                        threading.Thread(target=_bg_intel_scan, daemon=True).start()
 
                     # After-Hours: Social Deep Scan starten (Reddit + Stocktwits WHY)
                     last_social_scan = state.get('_last_social_deep_scan', 0)
@@ -3538,11 +3552,7 @@ def hermes_monitor():
                                         if a.get('verdict_reason'):
                                             lines.append(f'  → {a["verdict_reason"][:80]}')
 
-                                if neutral:
-                                    neut_str = ', '.join(a['sym'] for a in neutral[:6])
-                                    lines.append(f'\n<b>⚪ NEUTRAL:</b> {neut_str}')
-
-                                tg_send('\n'.join(lines), key=f'social_{ts_now}')
+                                # Nur Web-Scanner aktualisieren — kein Telegram
                             except Exception:
                                 pass
                         threading.Thread(target=_bg_social_deep, daemon=True).start()
