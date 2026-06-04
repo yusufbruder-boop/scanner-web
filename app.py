@@ -2901,6 +2901,7 @@ def results():
             out['hermes_universe']     = list(state.get('hermes_universe', set()))
             out['hermes_signal_evals'] = state.get('hermes_signal_evals', {})
             out['mag7_signal']         = _to_json_safe(state.get('mag7_signal', {}))
+            out['social_deep']         = state.get('social_deep', [])
             out['alpaca_portfolio']    = state.get('alpaca_portfolio', {})
             out['hermes_memory']       = state.get('hermes_memory', {})
             out['hermes_24h']          = state.get('hermes_24h', [])
@@ -3345,7 +3346,35 @@ def hermes_monitor():
                                 time.sleep(10)
                                 if not state['running']: break
                             continue
-                    # After-Hours oder Cooldown: Hermes trotzdem laufen lassen (News/Analyse)
+                    # After-Hours: Social Deep Scan starten (Reddit + Stocktwits WHY)
+                    last_social_scan = state.get('_last_social_deep_scan', 0)
+                    if (time.time() - last_social_scan) > 1800:  # alle 30 Min
+                        state['_last_social_deep_scan'] = time.time()
+                        def _bg_social_deep():
+                            try:
+                                from scanner import get_social_deep_trending
+                                trending = get_social_deep_trending()
+                                state['social_deep'] = trending
+                                if not trending:
+                                    return
+                                # Telegram: Top 5 Trending mit WHY
+                                ts_now = datetime.now().strftime('%H:%M')
+                                lines  = [f'<b>📱 SOCIAL TRENDING — {ts_now}</b>']
+                                lines.append('<i>Reddit WSB + Stocktwits — was und WARUM</i>\n')
+                                for t in trending[:8]:
+                                    sym  = t['sym']
+                                    why  = ' | '.join(t['why'][:2])
+                                    sent = t['sentiment']
+                                    src  = ', '.join(t['sources'][:2])
+                                    sent_icon = '🟢' if sent=='BULLISH' else ('🔴' if sent=='BEARISH' else '⚪')
+                                    lines.append(f'{sent_icon} <b>{sym}</b> [{why}]')
+                                    if t.get('top_post'):
+                                        lines.append(f'   <i>"{t["top_post"][:80]}"</i>')
+                                    lines.append(f'   Quellen: {src}  Score:{t["score"]}')
+                                tg_send('\n'.join(lines), key=f'social_{ts_now}')
+                            except Exception:
+                                pass
+                        threading.Thread(target=_bg_social_deep, daemon=True).start()
 
             # 5) Social-Daten fehlen → enrich neu starten
             if data and not state.get('social_data') and not state['running']:

@@ -31,6 +31,190 @@ _SKIP_WORDS = {'THE','AND','FOR','ARE','YOU','NOT','BUT','HAS','WAS','ALL','CAN'
                'GET','ITS','TOO','NEW','BUY','PUT','CALL','CEO','IPO','SEC','ETF',
                'LOL','WSB','DD','YOLO','ATH','ATL','IMO','IMO','TBH','GBH'}
 
+def get_social_deep_trending() -> list:
+    """
+    Holt trending Tickers + erklaert WARUM sie trending sind.
+    Quellen: Reddit WSB/stocks/options, Stocktwits, Yahoo.
+    Gibt Liste zurueck: [{sym, score, sources, why, sentiment, top_posts}]
+    """
+    tickers  = {}   # sym → score
+    sources  = {}   # sym → set of sources
+    posts    = {}   # sym → list of top post titles
+    st_sent  = {}   # sym → 'bullish'/'bearish'/'neutral'
+
+    # ── 1) Reddit: Titel + Selftext lesen, WHY extrahieren ───────────────────
+    for sub, weight in [('wallstreetbets', 1.2), ('stocks', 0.7),
+                        ('options', 0.8), ('investing', 0.5)]:
+        try:
+            url = f'https://www.reddit.com/r/{sub}/hot.json?limit=40'
+            req = urllib.request.Request(url, headers={'User-Agent': 'HermesScanner/3.0'})
+            with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+                data = json.loads(r.read())
+            for post in data.get('data', {}).get('children', []):
+                d      = post.get('data', {})
+                title  = d.get('title', '')
+                body   = d.get('selftext', '')[:300]
+                score  = d.get('score', 0)
+                ratio  = d.get('upvote_ratio', 0.5)
+                comms  = d.get('num_comments', 0)
+                flair  = d.get('link_flair_text', '') or ''
+                text   = title + ' ' + body
+
+                for m in _TICKER_RE.findall(text):
+                    if m in _SKIP_WORDS or len(m) < 2:
+                        continue
+                    pts = int((score * ratio / 100 + comms * 0.2) * weight)
+                    tickers[m] = tickers.get(m, 0) + pts
+                    sources.setdefault(m, set()).add(f'r/{sub}')
+                    # Post-Titel als WHY speichern (top 3 pro Ticker)
+                    if title and len(posts.get(m, [])) < 3:
+                        posts.setdefault(m, []).append({
+                            'title': title[:100],
+                            'score': score,
+                            'sub':   sub,
+                            'flair': flair,
+                        })
+        except Exception:
+            pass
+
+    # ── 2) Stocktwits: Symbol + Sentiment (bullish/bearish) ──────────────────
+    try:
+        url2 = 'https://api.stocktwits.com/api/2/trending/symbols.json'
+        with urllib.request.urlopen(
+                urllib.request.Request(url2, headers={'User-Agent': 'HermesScanner/3.0'}),
+                context=ctx, timeout=8) as r:
+            d2 = json.loads(r.read())
+        for i, sym_data in enumerate(d2.get('symbols', [])[:20]):
+            sym = sym_data.get('symbol', '')
+            if not sym or sym in _SKIP_WORDS:
+                continue
+            tickers[sym] = tickers.get(sym, 0) + max(1, 20 - i) * 5
+            sources.setdefault(sym, set()).add('Stocktwits')
+    except Exception:
+        pass
+
+    # Stocktwits Stream mit Sentiment
+    try:
+        url3 = 'https://api.stocktwits.com/api/2/streams/trending.json?filter=all'
+        with urllib.request.urlopen(
+                urllib.request.Request(url3, headers={'User-Agent': 'HermesScanner/3.0'}),
+                context=ctx, timeout=8) as r:
+            d3 = json.loads(r.read())
+        for msg in d3.get('messages', [])[:40]:
+            sym_list = msg.get('symbols', [])
+            if not sym_list:
+                continue
+            sym  = sym_list[0].get('symbol', '')
+            sent = (msg.get('entities', {}).get('sentiment', {}) or {}).get('basic', '')
+            body = msg.get('body', '')[:100]
+            if sym and sym not in _SKIP_WORDS:
+                tickers[sym] = tickers.get(sym, 0) + 12
+                sources.setdefault(sym, set()).add('Stocktwits-Stream')
+                if sent in ('Bullish', 'Bearish'):
+                    cur = st_sent.get(sym, {})
+                    cur[sent] = cur.get(sent, 0) + 1
+                    st_sent[sym] = cur
+                if body and len(posts.get(sym, [])) < 3:
+                    posts.setdefault(sym, []).append({
+                        'title': body,
+                        'score': 0,
+                        'sub': 'Stocktwits',
+                        'flair': sent or '',
+                    })
+    except Exception:
+        pass
+
+    # ── 3) Yahoo Trending ─────────────────────────────────────────────────────
+    try:
+        url4 = 'https://query1.finance.yahoo.com/v1/finance/trending/US?count=25'
+        with urllib.request.urlopen(
+                urllib.request.Request(url4, headers={'User-Agent': 'Mozilla/5.0'}),
+                context=ctx, timeout=8) as r:
+            d4 = json.loads(r.read())
+        quotes = d4.get('finance', {}).get('result', [{}])[0].get('quotes', [])
+        for i, q in enumerate(quotes[:25]):
+            sym = q.get('symbol', '').split('.')[0].split('-')[0]
+            if sym and sym not in _SKIP_WORDS and len(sym) <= 5:
+                tickers[sym] = tickers.get(sym, 0) + max(1, 25 - i) * 3
+                sources.setdefault(sym, set()).add('Yahoo')
+    except Exception:
+        pass
+
+    # ── 4) WHY-Analyse: Warum ist der Ticker trending? ───────────────────────
+    WHY_PATTERNS = [
+        # Earnings
+        (['earnings', 'eps', 'beat', 'miss', 'guidance', 'revenue', 'quarter', 'q1','q2','q3','q4'],
+         'EARNINGS'),
+        # Analyst
+        (['upgrade', 'downgrade', 'price target', 'pt ', 'overweight', 'buy rating', 'analyst'],
+         'ANALYST'),
+        # News/Deal
+        (['acquisition', 'merger', 'deal', 'partnership', 'contract', 'buyout', 'acquired'],
+         'M&A/DEAL'),
+        # Short Squeeze
+        (['short squeeze', 'short interest', 'gamma squeeze', 'squeeze', 'yolo', 'puts', 'calls expiring'],
+         'SHORT-SQUEEZE'),
+        # Technical
+        (['breakout', 'all-time high', 'ath', 'support', 'resistance', 'moving average', 'rsi'],
+         'TECHNICAL'),
+        # FDA/Gov
+        (['fda', 'approval', 'trial', 'phase', 'drug', 'clinical'],
+         'FDA/BIOTECH'),
+        # AI/Tech hype
+        (['ai ', 'artificial intelligence', 'nvidia', 'chip', 'data center', 'llm', 'chatgpt'],
+         'AI-HYPE'),
+        # Macro
+        (['fed', 'interest rate', 'inflation', 'recession', 'tariff', 'china', 'war', 'oil'],
+         'MAKRO'),
+    ]
+
+    result = []
+    sorted_t = sorted(tickers.items(), key=lambda x: -x[1])
+
+    for sym, score in sorted_t[:20]:
+        if score < 5:
+            continue
+        sym_posts = posts.get(sym, [])
+        all_text  = ' '.join(p['title'].lower() for p in sym_posts)
+
+        # WHY bestimmen
+        why_tags = []
+        for keywords, tag in WHY_PATTERNS:
+            if any(k in all_text for k in keywords):
+                why_tags.append(tag)
+
+        # Sentiment aus Stocktwits
+        sent_data = st_sent.get(sym, {})
+        bull = sent_data.get('Bullish', 0)
+        bear = sent_data.get('Bearish', 0)
+        if bull > bear * 1.5:
+            sentiment = 'BULLISH'
+        elif bear > bull * 1.5:
+            sentiment = 'BEARISH'
+        elif bull or bear:
+            sentiment = 'MIXED'
+        else:
+            sentiment = 'NEUTRAL'
+
+        # Bester Post-Titel als Kurzgründung
+        top_title = ''
+        if sym_posts:
+            best = max(sym_posts, key=lambda p: p.get('score', 0))
+            top_title = best['title']
+
+        result.append({
+            'sym':       sym,
+            'score':     score,
+            'sources':   list(sources.get(sym, set())),
+            'why':       why_tags if why_tags else ['MENTIONS'],
+            'sentiment': sentiment,
+            'top_post':  top_title,
+            'post_count': len(sym_posts),
+        })
+
+    return result
+
+
 def get_social_trending():
     """Holt trending Tickers von Reddit WSB, r/stocks, Stocktwits, Yahoo Trending."""
     tickers = {}
