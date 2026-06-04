@@ -215,6 +215,208 @@ def get_social_deep_trending() -> list:
     return result
 
 
+def analyze_social_smart_money(trending_list: list) -> list:
+    """
+    Fuer jeden Trending-Stock: Smart Money Check + KI-Urteil.
+    - Dark Pool Richtung (BUY/SELL/NEUTRAL)
+    - Options Flow: Call vs Put Premium, Vol/OI, Sweeps
+    - Divergenz: Retail bullish aber Smart Money verkauft?
+    - KI-Urteil: LONG (Trend intakt) / SHORT (Trend erschoepft) / NEUTRAL
+    """
+    today = datetime.now().strftime('%Y-%m-%d')
+    results = []
+
+    def _check_sm(item):
+        sym      = item['sym']
+        why      = item.get('why', [])
+        ret_sent = item.get('sentiment', 'NEUTRAL')  # Retail-Sentiment
+        top_post = item.get('top_post', '')
+
+        sm_data = {
+            'sym':         sym,
+            'why':         why,
+            'ret_sent':    ret_sent,
+            'top_post':    top_post,
+            'sources':     item.get('sources', []),
+            'social_score':item.get('score', 0),
+            # Smart Money Felder
+            'dp_dir':      'NEUTRAL',
+            'dp_dollar':   0,
+            'call_prem':   0,
+            'put_prem':    0,
+            'pc_ratio':    1.0,
+            'call_voi':    0.0,
+            'put_voi':     0.0,
+            'call_sweeps': 0,
+            'put_sweeps':  0,
+            'price':       0,
+            'prev_chg':    0,
+            # Divergenz
+            'divergence':  '',
+            # Endergebnis
+            'verdict':     'NEUTRAL',
+            'verdict_score': 0,
+            'verdict_reason': '',
+        }
+
+        # 1) Options Snapshot
+        try:
+            opt = poly_fetch(f'https://api.polygon.io/v3/snapshot/options/{sym}?limit=200&apiKey={API}')
+            res = opt.get('results', [])
+            if res:
+                sm_data['price'] = res[0].get('underlying_asset', {}).get('price', 0)
+                calls = [r for r in res if r['details']['contract_type'] == 'call']
+                puts  = [r for r in res if r['details']['contract_type'] == 'put']
+                cv = sum(r['day'].get('volume', 0) for r in calls)
+                pv = sum(r['day'].get('volume', 0) for r in puts)
+                cp = sum(r['day'].get('volume',0)*(r['day'].get('close') or 0)*100 for r in calls)
+                pp = sum(r['day'].get('volume',0)*(r['day'].get('close') or 0)*100 for r in puts)
+                mc = max((r['day'].get('volume',0)/max(r.get('open_interest',1),1) for r in calls), default=0)
+                mp = max((r['day'].get('volume',0)/max(r.get('open_interest',1),1) for r in puts),  default=0)
+                sw = get_options_sweep(res)
+                sm_data.update({
+                    'call_prem':   round(cp / 1e6, 2),
+                    'put_prem':    round(pp / 1e6, 2),
+                    'pc_ratio':    round(pv / max(cv, 1), 3),
+                    'call_voi':    round(mc, 1),
+                    'put_voi':     round(mp, 1),
+                    'call_sweeps': sw.get('sweeps_call', 0),
+                    'put_sweeps':  sw.get('sweeps_put', 0),
+                })
+        except Exception:
+            pass
+
+        # 2) Dark Pool Richtung
+        try:
+            dp = get_darkpool_signal(sym, today)
+            sm_data['dp_dir']    = dp.get('direction', 'NEUTRAL')
+            sm_data['dp_dollar'] = dp.get('dp_total', 0)
+        except Exception:
+            pass
+
+        # 3) Kursveraenderung (Alpaca Snapshot)
+        try:
+            snap = get_alpaca_snapshot([sym]).get(sym, {})
+            d_bar  = snap.get('dailyBar', {})
+            p_bar  = snap.get('prevDailyBar', {})
+            price  = float(d_bar.get('c') or 0)
+            pprice = float(p_bar.get('c') or price or 1)
+            if price and pprice:
+                sm_data['prev_chg'] = round((price - pprice) / pprice * 100, 2)
+                if not sm_data['price']:
+                    sm_data['price'] = price
+        except Exception:
+            pass
+
+        # 4) Divergenz erkennen: Retail vs Smart Money
+        cp_val = sm_data['call_prem']
+        pp_val = sm_data['put_prem']
+        dp_dir = sm_data['dp_dir']
+        chg    = sm_data['prev_chg']
+        pc     = sm_data['pc_ratio']
+
+        if ret_sent == 'BULLISH' and pp_val > cp_val * 1.5:
+            sm_data['divergence'] = 'BEAR_DIV'   # Retail bullish aber Smart Money kauft Puts
+        elif ret_sent == 'BEARISH' and cp_val > pp_val * 1.5:
+            sm_data['divergence'] = 'BULL_DIV'   # Retail bearish aber Smart Money kauft Calls
+        elif ret_sent == 'BULLISH' and dp_dir == 'SELL':
+            sm_data['divergence'] = 'DP_SELL'    # Retail bullish aber Dark Pool verkauft
+        elif ret_sent == 'BEARISH' and dp_dir == 'BUY':
+            sm_data['divergence'] = 'DP_BUY'     # Retail bearish aber Dark Pool kauft
+
+        # 5) Scoring & Urteil
+        bull = bear = 0
+        reasons = []
+
+        # Call/Put Flow
+        if cp_val > pp_val * 1.5:
+            bull += 3; reasons.append(f'Call-Premium ${cp_val:.1f}M dominiert')
+        elif pp_val > cp_val * 1.5:
+            bear += 3; reasons.append(f'Put-Premium ${pp_val:.1f}M dominiert')
+
+        # Vol/OI
+        if sm_data['call_voi'] >= 8:
+            bull += 2; reasons.append(f'Call VOI {sm_data["call_voi"]:.0f}x')
+        elif sm_data['call_voi'] >= 4:
+            bull += 1
+        if sm_data['put_voi'] >= 8:
+            bear += 2; reasons.append(f'Put VOI {sm_data["put_voi"]:.0f}x')
+        elif sm_data['put_voi'] >= 4:
+            bear += 1
+
+        # Sweeps
+        if sm_data['call_sweeps'] >= 3:
+            bull += 2; reasons.append(f'{sm_data["call_sweeps"]} Call-Sweeps')
+        if sm_data['put_sweeps'] >= 3:
+            bear += 2; reasons.append(f'{sm_data["put_sweeps"]} Put-Sweeps')
+
+        # Dark Pool
+        if dp_dir == 'BUY' and sm_data['dp_dollar'] >= 1_000_000:
+            bull += 3; reasons.append(f'Dark Pool KAUF ${sm_data["dp_dollar"]/1e6:.1f}M')
+        elif dp_dir == 'SELL' and sm_data['dp_dollar'] >= 1_000_000:
+            bear += 3; reasons.append(f'Dark Pool VERKAUF ${sm_data["dp_dollar"]/1e6:.1f}M')
+
+        # Retail Sentiment leicht gewichten
+        if ret_sent == 'BULLISH':
+            bull += 1
+        elif ret_sent == 'BEARISH':
+            bear += 1
+
+        # WHY-Katalysatoren
+        if 'EARNINGS' in why:
+            bull += 1; bear += 1   # neutral — kann beide Richtungen
+        if 'SHORT-SQUEEZE' in why:
+            bull += 2; reasons.append('Short-Squeeze Signal')
+
+        # Divergenz: gegen Retail-Trend = stärkeres Signal
+        div = sm_data['divergence']
+        if div == 'BEAR_DIV':
+            bear += 2; reasons.append('Divergenz: Retail Bull aber Smart Money SHORT')
+        elif div == 'BULL_DIV':
+            bull += 2; reasons.append('Divergenz: Retail Bear aber Smart Money LONG')
+        elif div == 'DP_SELL':
+            bear += 1; reasons.append('Dark Pool verkauft trotz Retail-Euphorie')
+        elif div == 'DP_BUY':
+            bull += 1; reasons.append('Dark Pool kauft trotz Retail-Panik')
+
+        # Trend-Erschoepfung: Kurs bereits stark gestiegen + Put-Absicherung
+        if chg > 5 and pc > 1.0:
+            bear += 1; reasons.append(f'Kurs +{chg:.1f}% aber P/C={pc:.2f} — Absicherung läuft')
+        elif chg < -5 and pc < 0.6:
+            bull += 1; reasons.append(f'Kurs {chg:.1f}% aber Call-Käufer aktiv — Bounce?')
+
+        # Urteil
+        net = bull - bear
+        if net >= 3:
+            verdict = 'LONG'
+        elif net <= -3:
+            verdict = 'SHORT'
+        else:
+            verdict = 'NEUTRAL'
+
+        sm_data['verdict']        = verdict
+        sm_data['verdict_score']  = net
+        sm_data['verdict_reason'] = ' | '.join(reasons[:3])
+        sm_data['bull_pts']       = bull
+        sm_data['bear_pts']       = bear
+        return sm_data
+
+    # Parallel für Top 10 Trending
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(_check_sm, item): item for item in trending_list[:10]}
+        for f in as_completed(futs):
+            try:
+                r = f.result()
+                if r:
+                    results.append(r)
+            except Exception:
+                pass
+
+    # Sortieren: SHORT/LONG zuerst (stärkstes Signal vorne)
+    results.sort(key=lambda x: abs(x.get('verdict_score', 0)), reverse=True)
+    return results
+
+
 def get_social_trending():
     """Holt trending Tickers von Reddit WSB, r/stocks, Stocktwits, Yahoo Trending."""
     tickers = {}

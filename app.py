@@ -2297,27 +2297,94 @@ function renderResults(data, isNew) {
     html += '</div>';
   }
 
-  // ── Social Deep Trending (After-Hours) ────────────────────────────────────
+  // ── Social Trending + Smart Money Analyse ────────────────────────────────
   const socialDeep = data.social_deep || [];
   if (socialDeep.length > 0) {
-    html += '<div class="section"><div class="section-title" style="color:#a78bfa;border-left:3px solid #a78bfa">📱 SOCIAL TRENDING — Reddit · Stocktwits</div>';
-    socialDeep.slice(0,10).forEach(t => {
-      let sentCol = t.sentiment==='BULLISH' ? '#4dff91' : (t.sentiment==='BEARISH' ? '#ff4d6b' : '#94a3b8');
-      let sentIcon = t.sentiment==='BULLISH' ? '🟢' : (t.sentiment==='BEARISH' ? '🔴' : '⚪');
-      let whyStr  = (t.why||[]).slice(0,2).join(' · ');
-      let srcStr  = (t.sources||[]).slice(0,3).join(', ');
-      html += '<div style="padding:8px 14px;border-bottom:1px solid #0a1f30;display:flex;gap:10px;align-items:flex-start">'
-        + '<div style="min-width:36px;text-align:center;font-size:18px">' + sentIcon + '</div>'
-        + '<div style="flex:1">'
-        +   '<div style="display:flex;align-items:center;gap:8px">'
-        +     '<span style="font-size:15px;font-weight:bold;color:#fff">' + t.sym + '</span>'
-        +     '<span style="font-size:10px;color:#ffd700;background:#1a1200;padding:2px 6px;border-radius:3px">' + whyStr + '</span>'
-        +     '<span style="font-size:10px;color:' + sentCol + '">' + t.sentiment + '</span>'
-        +   '</div>'
-        +   (t.top_post ? '<div style="font-size:11px;color:#64748b;margin-top:3px;font-style:italic">"' + t.top_post.slice(0,90) + '"</div>' : '')
-        +   '<div style="font-size:10px;color:#4a6a8a;margin-top:2px">' + srcStr + ' · Score: ' + t.score + '</div>'
-        + '</div></div>';
-    });
+    const longPicks  = socialDeep.filter(a => a.verdict === 'LONG');
+    const shortPicks = socialDeep.filter(a => a.verdict === 'SHORT');
+    const neutPicks  = socialDeep.filter(a => a.verdict === 'NEUTRAL');
+
+    html += '<div class="section"><div class="section-title" style="color:#a78bfa;border-left:3px solid #a78bfa">'
+      + '📱 SOCIAL TRENDING + SMART MONEY'
+      + (longPicks.length  ? ' &nbsp;<span style="color:#4dff91;font-size:11px">● ' + longPicks.length + ' LONG</span>' : '')
+      + (shortPicks.length ? ' &nbsp;<span style="color:#ff4d6b;font-size:11px">● ' + shortPicks.length + ' SHORT</span>' : '')
+      + '</div>';
+
+    function renderSocialCard(a) {
+      const isLong  = a.verdict === 'LONG';
+      const isShort = a.verdict === 'SHORT';
+      const vCol  = isLong ? '#4dff91' : (isShort ? '#ff4d6b' : '#94a3b8');
+      const vIcon = isLong ? '🟢 LONG' : (isShort ? '🔴 SHORT' : '⚪ NEUTRAL');
+      const vBg   = isLong ? '#0a1f0f' : (isShort ? '#1f0a0a' : '#0d1628');
+
+      const why      = (a.why||[]).slice(0,2).join(' · ');
+      const retSent  = a.ret_sent || a.sentiment || '';
+      const retCol   = retSent==='BULLISH' ? '#4dff91' : (retSent==='BEARISH' ? '#ff4d6b' : '#94a3b8');
+      const dpDir    = a.dp_dir || 'NEUTRAL';
+      const dpCol    = dpDir==='BUY' ? '#4dff91' : (dpDir==='SELL' ? '#ff4d6b' : '#94a3b8');
+      const dpM      = a.dp_dollar ? '$' + (a.dp_dollar/1e6).toFixed(1) + 'M' : '';
+      const cpStr    = a.call_prem > 0 ? '$' + a.call_prem + 'M' : '—';
+      const ppStr    = a.put_prem  > 0 ? '$' + a.put_prem  + 'M' : '—';
+      const pc       = a.pc_ratio ? a.pc_ratio.toFixed(2) : '—';
+      const divWarn  = a.divergence ? '<span style="color:#ffd700;font-size:10px"> ⚠ ' + a.divergence + '</span>' : '';
+      const chgCol   = a.prev_chg > 0 ? '#4dff91' : (a.prev_chg < 0 ? '#ff4d6b' : '#94a3b8');
+      const chgStr   = a.prev_chg ? (a.prev_chg > 0 ? '+' : '') + a.prev_chg.toFixed(1) + '%' : '';
+
+      let card = '<div style="padding:12px 14px;border-bottom:1px solid #0a1f30;background:' + vBg + '">';
+
+      // Header: Symbol + Verdict + Preis
+      card += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'
+        + '<div style="display:flex;align-items:center;gap:8px">'
+        +   '<span style="font-size:17px;font-weight:bold;color:#fff">' + a.sym + '</span>'
+        +   (a.price ? '<span style="font-size:12px;color:#6b8cad">$' + a.price.toFixed(2) + '</span>' : '')
+        +   (chgStr ? '<span style="font-size:11px;color:' + chgCol + '">' + chgStr + '</span>' : '')
+        +   divWarn
+        + '</div>'
+        + '<div style="font-size:13px;font-weight:bold;color:' + vCol + ';background:rgba(0,0,0,0.3);padding:3px 10px;border-radius:4px">' + vIcon + '</div>'
+        + '</div>';
+
+      // WHY + Retail Sentiment
+      card += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px">'
+        + '<span style="font-size:10px;color:#ffd700;background:#1a1200;padding:2px 7px;border-radius:3px">' + (why||'SOCIAL') + '</span>'
+        + '<span style="font-size:10px;color:' + retCol + ';background:#0d1220;padding:2px 7px;border-radius:3px">Reddit/ST: ' + (retSent||'—') + '</span>'
+        + '</div>';
+
+      // Smart Money Grid
+      card += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin-bottom:6px">';
+      card += smBox('Dark Pool', dpDir, dpCol, dpM);
+      card += smBox('Calls', cpStr, '#4dff91', (a.call_sweeps ? a.call_sweeps + ' Sweeps' : ''));
+      card += smBox('Puts', ppStr, '#ff4d6b', (a.put_sweeps ? a.put_sweeps + ' Sweeps' : ''));
+      card += smBox('P/C Ratio', pc, pc > 1.2 ? '#ff4d6b' : (pc < 0.6 ? '#4dff91' : '#94a3b8'), a.call_voi >= 4 ? 'CallVOI ' + a.call_voi + 'x' : '');
+      card += '</div>';
+
+      // Verdict Begründung
+      if (a.verdict_reason) {
+        card += '<div style="font-size:10px;color:#64748b;padding:4px 0">→ ' + a.verdict_reason + '</div>';
+      }
+      // Top Post
+      if (a.top_post) {
+        card += '<div style="font-size:10px;color:#475569;font-style:italic;margin-top:3px">"' + a.top_post.slice(0,90) + '"</div>';
+      }
+      card += '</div>';
+      return card;
+    }
+
+    function smBox(label, val, col, sub) {
+      return '<div style="background:#0a1420;border-radius:4px;padding:5px 6px;text-align:center">'
+        + '<div style="font-size:9px;color:#4a6a8a;margin-bottom:2px">' + label + '</div>'
+        + '<div style="font-size:12px;font-weight:bold;color:' + col + '">' + val + '</div>'
+        + (sub ? '<div style="font-size:9px;color:#4a6a8a">' + sub + '</div>' : '')
+        + '</div>';
+    }
+
+    // LONGs zuerst
+    longPicks.forEach(a => { html += renderSocialCard(a); });
+    shortPicks.forEach(a => { html += renderSocialCard(a); });
+    // Neutral kompakt
+    if (neutPicks.length > 0) {
+      html += '<div style="padding:8px 14px;color:#4a6a8a;font-size:11px">⚪ Neutral: '
+        + neutPicks.map(a => a.sym).join(', ') + '</div>';
+    }
     html += '</div>';
   }
 
@@ -3390,25 +3457,52 @@ def hermes_monitor():
                         state['_last_social_deep_scan'] = time.time()
                         def _bg_social_deep():
                             try:
-                                from scanner import get_social_deep_trending
+                                from scanner import get_social_deep_trending, analyze_social_smart_money
                                 trending = get_social_deep_trending()
-                                state['social_deep'] = trending
                                 if not trending:
                                     return
-                                # Telegram: Top 5 Trending mit WHY
+                                state['social_deep_raw'] = trending
+
+                                # Smart Money Analyse für jeden Trend-Stock
+                                analyzed = analyze_social_smart_money(trending)
+                                state['social_deep'] = analyzed
+
                                 ts_now = datetime.now().strftime('%H:%M')
-                                lines  = [f'<b>📱 SOCIAL TRENDING — {ts_now}</b>']
-                                lines.append('<i>Reddit WSB + Stocktwits — was und WARUM</i>\n')
-                                for t in trending[:8]:
-                                    sym  = t['sym']
-                                    why  = ' | '.join(t['why'][:2])
-                                    sent = t['sentiment']
-                                    src  = ', '.join(t['sources'][:2])
-                                    sent_icon = '🟢' if sent=='BULLISH' else ('🔴' if sent=='BEARISH' else '⚪')
-                                    lines.append(f'{sent_icon} <b>{sym}</b> [{why}]')
-                                    if t.get('top_post'):
-                                        lines.append(f'   <i>"{t["top_post"][:80]}"</i>')
-                                    lines.append(f'   Quellen: {src}  Score:{t["score"]}')
+                                lines  = [f'<b>📱 SOCIAL TRENDING + SMART MONEY — {ts_now}</b>']
+
+                                long_picks  = [a for a in analyzed if a['verdict'] == 'LONG']
+                                short_picks = [a for a in analyzed if a['verdict'] == 'SHORT']
+                                neutral     = [a for a in analyzed if a['verdict'] == 'NEUTRAL']
+
+                                if long_picks:
+                                    lines.append('\n<b>🟢 LONG — Smart Money bestätigt:</b>')
+                                    for a in long_picks[:4]:
+                                        why = ' · '.join(a.get('why', [])[:2])
+                                        lines.append(
+                                            f'  <b>{a["sym"]}</b> ${a.get("price",0):.0f}'
+                                            f'  [{why}]  Score:+{a["bull_pts"]}/{a["bear_pts"]}'
+                                        )
+                                        if a.get('verdict_reason'):
+                                            lines.append(f'  → {a["verdict_reason"][:80]}')
+                                        if a.get('top_post'):
+                                            lines.append(f'  <i>"{a["top_post"][:70]}"</i>')
+
+                                if short_picks:
+                                    lines.append('\n<b>🔴 SHORT — Trend erschöpft:</b>')
+                                    for a in short_picks[:4]:
+                                        why = ' · '.join(a.get('why', [])[:2])
+                                        div = f' ⚠️{a["divergence"]}' if a.get('divergence') else ''
+                                        lines.append(
+                                            f'  <b>{a["sym"]}</b> ${a.get("price",0):.0f}'
+                                            f'  [{why}]{div}  Score:{a["bull_pts"]}/{a["bear_pts"]}'
+                                        )
+                                        if a.get('verdict_reason'):
+                                            lines.append(f'  → {a["verdict_reason"][:80]}')
+
+                                if neutral:
+                                    neut_str = ', '.join(a['sym'] for a in neutral[:6])
+                                    lines.append(f'\n<b>⚪ NEUTRAL:</b> {neut_str}')
+
                                 tg_send('\n'.join(lines), key=f'social_{ts_now}')
                             except Exception:
                                 pass
