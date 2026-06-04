@@ -10,6 +10,113 @@ RESULTS_FILE   = 'results.json'
 MEMORY_FILE    = 'hermes_memory.json'
 LEARNING_FILE  = 'hermes_learning.json'
 IDENTITY_FILE  = 'hermes_identity.json'
+
+# ── GitHub Gist Persistenz — Memory überlebt Railway-Deployments ──────────────
+_GH_TOKEN   = os.environ.get('GITHUB_TOKEN', '')
+_GIST_ID    = os.environ.get('HERMES_GIST_ID', '')   # wird beim ersten Start erstellt
+_GIST_LOCK  = threading.Lock()
+_GIST_FILES = {
+    MEMORY_FILE:   'hermes_memory.json',
+    LEARNING_FILE: 'hermes_learning.json',
+    IDENTITY_FILE: 'hermes_identity.json',
+}
+
+def _gist_request(method: str, path: str, body: dict = None) -> dict:
+    url  = f'https://api.github.com{path}'
+    data = json.dumps(body).encode() if body else None
+    req  = urllib.request.Request(url, data=data, method=method, headers={
+        'Authorization': f'Bearer {_GH_TOKEN}',
+        'Accept':        'application/vnd.github+json',
+        'Content-Type':  'application/json',
+        'X-GitHub-Api-Version': '2022-11-28',
+    })
+    try:
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+            return json.loads(r.read())
+    except Exception:
+        return {}
+
+def gist_restore():
+    """Beim App-Start: Memory-Dateien aus GitHub Gist laden."""
+    global _GIST_ID
+    gist_id = _GIST_ID or os.environ.get('HERMES_GIST_ID', '')
+    if not gist_id or not _GH_TOKEN:
+        return
+    try:
+        g = _gist_request('GET', f'/gists/{gist_id}')
+        files = g.get('files', {})
+        for local_path, gist_name in _GIST_FILES.items():
+            if gist_name in files:
+                content = files[gist_name].get('content', '')
+                if content and content.strip() not in ('{}', 'null', ''):
+                    with open(local_path, 'w', encoding='utf-8') as f:
+                        f.write(content)
+        _GIST_ID = gist_id
+    except Exception:
+        pass
+
+def gist_save(changed_file: str = None):
+    """Nach jedem Memory-Save: Dateien in GitHub Gist sichern."""
+    global _GIST_ID
+    if not _GH_TOKEN:
+        return
+    with _GIST_LOCK:
+        try:
+            files_payload = {}
+            targets = [changed_file] if changed_file else list(_GIST_FILES.keys())
+            for local_path in targets:
+                gist_name = _GIST_FILES.get(local_path, local_path)
+                if os.path.exists(local_path):
+                    with open(local_path, encoding='utf-8') as f:
+                        files_payload[gist_name] = {'content': f.read()}
+            if not files_payload:
+                return
+
+            gist_id = _GIST_ID or os.environ.get('HERMES_GIST_ID', '')
+            if gist_id:
+                _gist_request('PATCH', f'/gists/{gist_id}', {'files': files_payload})
+            else:
+                # Erstmaliges Erstellen
+                resp = _gist_request('POST', '/gists', {
+                    'description': 'Hermes Trading Memory — auto-backup',
+                    'public': False,
+                    'files': {k: {'content': v['content'] or '{}'} for k, v in files_payload.items()},
+                })
+                new_id = resp.get('id', '')
+                if new_id:
+                    _GIST_ID = new_id
+                    # Gist-ID als Env-Var für nächsten Start speichern (Railway)
+                    try:
+                        _set_railway_env('HERMES_GIST_ID', new_id)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+def _set_railway_env(key: str, value: str):
+    """Setzt Railway Env-Var via GraphQL damit Gist-ID zwischen Deployments erhalten bleibt."""
+    rail_token = os.environ.get('RAILWAY_TOKEN', '')
+    if not rail_token:
+        return
+    service_id = os.environ.get('RAILWAY_SERVICE_ID', '')
+    env_id     = os.environ.get('RAILWAY_ENVIRONMENT_ID', '')
+    if not service_id or not env_id:
+        return
+    query = '''mutation($input: VariableUpsertInput!) {
+        variableUpsert(input: $input) { id }
+    }'''
+    body  = json.dumps({'query': query, 'variables': {
+        'input': {'name': key, 'value': value,
+                  'serviceId': service_id, 'environmentId': env_id}
+    }}).encode()
+    req = urllib.request.Request(
+        'https://backboard.railway.com/graphql/v2',
+        data=body, method='POST',
+        headers={'Authorization': f'Bearer {rail_token}',
+                 'Content-Type': 'application/json'}
+    )
+    urllib.request.urlopen(req, timeout=8)
 TG_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 TG_CHAT  = os.environ.get('TELEGRAM_CHAT',  '')
 
@@ -275,6 +382,7 @@ def load_memory():
 def save_memory(mem):
     try:
         json.dump(mem, open(MEMORY_FILE, 'w', encoding='utf-8'), indent=2)
+        threading.Thread(target=gist_save, args=(MEMORY_FILE,), daemon=True).start()
     except Exception:
         pass
 
@@ -444,6 +552,7 @@ def load_learning():
 def save_learning(data):
     try:
         json.dump(data, open(LEARNING_FILE, 'w', encoding='utf-8'), indent=2)
+        threading.Thread(target=gist_save, args=(LEARNING_FILE,), daemon=True).start()
     except Exception:
         pass
 
@@ -830,6 +939,7 @@ def load_identity() -> dict:
 def save_identity(identity: dict):
     try:
         json.dump(identity, open(IDENTITY_FILE, 'w', encoding='utf-8'), indent=2)
+        threading.Thread(target=gist_save, args=(IDENTITY_FILE,), daemon=True).start()
     except Exception:
         pass
 
@@ -4069,6 +4179,12 @@ if saved:
     state['last_results_hash'] = results_hash(saved)
 
 state['next_scan'] = next_scan_time()
+
+# Memory aus GitHub Gist wiederherstellen (überlebt Railway-Deployments)
+try:
+    gist_restore()
+except Exception:
+    pass
 
 # Auto-Scheduler im Hintergrund starten
 sched = threading.Thread(target=auto_scheduler, daemon=True)
