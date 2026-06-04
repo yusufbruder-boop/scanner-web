@@ -421,6 +421,9 @@ def load_learning():
         'improvement_log':  [],
         'last_review':      None,
         'daily_context':    {},   # was Hermes täglich weiß über den Markt
+        'market_bias_log':  {},   # tägl. Marktbias (BULL/BEAR/NEUTRAL) + QQQ-Chg
+        'sweep_short_blocks': 0,  # wie oft Call-Sweep-SHORT blockiert wurde
+        'put_hedge_blocks':   0,  # wie oft Large-Cap-PUT-Hedge blockiert wurde
     }
     try:
         if os.path.exists(LEARNING_FILE):
@@ -576,9 +579,70 @@ def hermes_self_review(scan_data: dict, poly_key: str):
         elif rec.get('signal') == 'SHORT' and chg >= 8:
             false_signals.append({'sym': sym, 'signal': 'SHORT', 'chg': chg, 'date': today,
                                    'reason': f'SHORT empfohlen aber +{chg:.1f}% gestiegen'})
+        # Call-Sweep SHORT Muster: SHORT empfohlen obwohl Call-Sweeps dominierten
+        elif rec.get('signal') == 'SHORT' and chg >= 3:
+            smart = rec.get('smart_money', {})
+            sweeps_call = rec.get('call_sweeps', 0)
+            if sweeps_call >= 3:
+                false_signals.append({'sym': sym, 'signal': 'SHORT', 'chg': chg, 'date': today,
+                    'reason': f'SHORT mit {sweeps_call} Call-Sweeps — Widerspruch, Kurs +{chg:.1f}%',
+                    'pattern': 'call_sweep_short'})
+                learn['sweep_short_blocks'] = learn.get('sweep_short_blocks', 0) + 1
+        # Large-Cap PUT Hedge Muster: SHORT auf teuren Aktien die gestiegen sind
+        elif rec.get('signal') == 'SHORT' and chg >= 2:
+            price_rec = mv.get('price', 0)
+            max_put_voi = rec.get('smart_money', {}).get('max_put_vol_oi', 0)
+            if price_rec > 80 and max_put_voi >= 15:
+                false_signals.append({'sym': sym, 'signal': 'SHORT', 'chg': chg, 'date': today,
+                    'reason': f'PUT {max_put_voi:.0f}x auf ${price_rec:.0f} Large-Cap — war Hedge, Kurs +{chg:.1f}%',
+                    'pattern': 'put_hedge_misread'})
+                learn['put_hedge_blocks'] = learn.get('put_hedge_blocks', 0) + 1
+
     if false_signals:
         learn.setdefault('false_signals', [])
         learn['false_signals'] = (false_signals + learn['false_signals'])[:40]
+
+    # 5c) Marktbias heute speichern (QQQ-Bewegung als Proxy)
+    qqq_chg = 0.0
+    try:
+        url_qqq = f'https://data.alpaca.markets/v2/stocks/snapshots?symbols=QQQ&feed=iex'
+        req_qqq = urllib.request.Request(url_qqq, headers={
+            'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET
+        })
+        with urllib.request.urlopen(req_qqq, context=ctx, timeout=8) as r:
+            snp = json.loads(r.read())
+        daily_q = snp.get('QQQ', {}).get('dailyBar', {})
+        prev_q  = snp.get('QQQ', {}).get('prevDailyBar', {})
+        if daily_q and prev_q:
+            qqq_chg = round((float(daily_q.get('c',0)) - float(prev_q.get('c',1))) / float(prev_q.get('c',1)) * 100, 2)
+    except Exception:
+        pass
+    market_bias = 'BULL' if qqq_chg > 0.5 else ('BEAR' if qqq_chg < -0.5 else 'NEUTRAL')
+    learn.setdefault('market_bias_log', {})[today] = {
+        'qqq_chg': qqq_chg,
+        'bias': market_bias,
+        'win_rate': win_r,
+        'hits': list(hits.keys())[:5],
+        'false': [f['sym'] for f in false_signals[:3]],
+    }
+    # Nur 30 Tage behalten
+    mb_log = learn['market_bias_log']
+    if len(mb_log) > 30:
+        oldest = sorted(mb_log.keys())[0]
+        del mb_log[oldest]
+
+    # 5d) Richtungswechsel erkennen: gestern BULL, heute BEAR (oder umgekehrt)
+    direction_flip = False
+    flip_context = ''
+    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    if yesterday in mb_log:
+        prev_bias = mb_log[yesterday].get('bias', 'NEUTRAL')
+        if prev_bias == 'BULL' and market_bias == 'BEAR':
+            direction_flip = True
+            flip_context = f'Gestern BULL (QQQ {mb_log[yesterday]["qqq_chg"]:+.1f}%) → heute BEAR (QQQ {qqq_chg:+.1f}%)'
+        elif prev_bias == 'BEAR' and market_bias == 'BULL':
+            direction_flip = True
+            flip_context = f'Gestern BEAR (QQQ {mb_log[yesterday]["qqq_chg"]:+.1f}%) → heute BULL (QQQ {qqq_chg:+.1f}%)'
 
     # 6) Gewichtung automatisch anpassen
     changes = []
@@ -727,9 +791,13 @@ def hermes_self_review(scan_data: dict, poly_key: str):
             lines.append(f'  → {pu}')
         tg_send('\n'.join(lines[-6:]))  # nur Pattern-Teil nochmal senden
 
-    # Hermes AI schreibt seine eigenen neuen Regeln
+    # Hermes AI schreibt seine eigenen neuen Regeln (mit 14-Tage-Kontext + Flip-Analyse)
     try:
-        hermes_ai_self_reflection(false_signals, hits, misses, win_r, today)
+        hermes_ai_self_reflection(false_signals, hits, misses, win_r, today,
+                                   direction_flip=direction_flip,
+                                   flip_context=flip_context,
+                                   market_bias_log=learn.get('market_bias_log', {}),
+                                   daily_ctx=learn.get('daily_context', {}))
     except Exception:
         pass
 
@@ -767,10 +835,15 @@ def save_identity(identity: dict):
 
 
 def hermes_ai_self_reflection(false_signals: list, hits: dict, misses: dict,
-                               win_rate: float, today: str) -> str:
+                               win_rate: float, today: str,
+                               direction_flip: bool = False,
+                               flip_context: str = '',
+                               market_bias_log: dict = None,
+                               daily_ctx: dict = None) -> str:
     """
-    Hermes AI analysiert seine eigenen Fehler und schreibt neue Regeln in hermes_identity.json.
-    Läuft nach jedem Self-Review — Hermes lernt täglich dazu.
+    Hermes AI analysiert seine eigenen Fehler mit 14-Tage-Gedächtnis.
+    Bei Richtungswechsel fragt Hermes: 'Was habe ich verpasst?'
+    Schreibt neue Regeln in hermes_identity.json.
     """
     import re as _re
     if not NOUS_KEY:
@@ -779,46 +852,87 @@ def hermes_ai_self_reflection(false_signals: list, hits: dict, misses: dict,
     if identity.get('last_reflection') == today:
         return ''
 
-    past_lessons = identity.get('lessons', [])[:5]
-    past_rules   = identity.get('rules', [])[:8]
+    past_lessons = identity.get('lessons', [])[:8]
+    past_rules   = identity.get('rules', [])[:12]
 
     false_str   = '\n'.join(f'  - {f["sym"]}: {f["signal"]} empfohlen aber {f["chg"]:+.1f}% ({f["reason"]})'
-                            for f in false_signals[:5]) or '  keine'
+                            for f in false_signals[:6]) or '  keine'
     hit_str     = ', '.join(f'{s} {d["chg"]:+.1f}%' for s, d in list(hits.items())[:5]) or 'keine'
     miss_str    = ', '.join(f'{s} {d["chg"]:+.1f}%' for s, d in list(misses.items())[:5]) or 'keine'
     lessons_str = '\n'.join(f'  [{l["date"]}] {l["lesson"][:90]}'
                             for l in past_lessons) or '  noch keine'
     rules_str   = '\n'.join(f'  - {r}' for r in past_rules) or '  noch keine'
 
+    # 14-Tage-Kontext aufbauen
+    bias_log = market_bias_log or {}
+    ctx_14   = daily_ctx or {}
+    last_14_dates = sorted(bias_log.keys())[-14:]
+    history_lines = []
+    for d in last_14_dates:
+        b  = bias_log.get(d, {})
+        dc = ctx_14.get(d, {})
+        wr = b.get('win_rate', dc.get('win_rate', '?'))
+        qqq = b.get('qqq_chg', 0)
+        bias = b.get('bias', '?')
+        hits_d = ', '.join(b.get('hits', dc.get('hits', [])) or [])[:60]
+        false_d = ', '.join(b.get('false', dc.get('false_signals', [])) or [])[:40]
+        history_lines.append(
+            f'  {d}: QQQ{qqq:+.1f}% [{bias}] WinRate:{wr}%'
+            + (f' | Richtig:{hits_d}' if hits_d else '')
+            + (f' | FALSCH:{false_d}' if false_d else '')
+        )
+    history_str = '\n'.join(history_lines) or '  kein Verlauf'
+
+    # Spezifische Frage bei Richtungswechsel
+    flip_section = ''
+    if direction_flip and flip_context:
+        flip_section = f"""
+=== RICHTUNGSWECHSEL ERKANNT ===
+{flip_context}
+Frage an dich selbst: Was habe ich gestern verpasst?
+Welche Warnsignale hat der Markt gegeben, die ich ignoriert oder falsch bewertet habe?
+War das Geopolitik, Earnings, Makro, oder ein technisches Muster?
+"""
+
     prompt = f"""Du bist Hermes, ein AI Trading-Agent der sich täglich selbst verbessert.
+Du hast Zugriff auf 14 Tage deines eigenen Gedächtnisses und analysierst Muster ueber mehrere Tage.
 
 === HEUTE ({today}) ===
-Win-Rate: {win_rate}%
+Win-Rate: {win_rate:.1f}%
 Richtige Signale: {hit_str}
 Verpasste Moves: {miss_str}
 Falsche Signale (empfohlen aber falsch):
 {false_str}
+{flip_section}
+=== 14-TAGE VERLAUF ===
+{history_str}
 
-=== DEINE BISHERIGEN REGELN ===
+=== MEINE REGELN (aktuell) ===
 {rules_str}
 
-=== DEINE BISHERIGEN LEKTIONEN ===
+=== MEINE LEKTIONEN (aus Fehlern) ===
 {lessons_str}
 
-Aufgabe: Analysiere die Fehler von heute und schreibe neue Regeln für dich selbst.
+Aufgabe:
+1. Erkenne Muster ueber mehrere Tage (nicht nur heute)
+2. Bei Richtungswechsel: was habe ich STRUKTURELL verpasst?
+3. Schreibe konkrete, umsetzbare neue Regeln
+4. Erklaere in 2-3 Saetzen deine wichtigste Erkenntnis
 
-Antworte NUR mit diesem JSON (kein anderer Text):
+Antworte NUR mit diesem JSON:
 {{
-  "new_rules": ["max 3 konkrete Regeln wie: Keine LONG-Signale wenn prev_chg < -15%"],
-  "new_lesson": "1-2 Sätze was du heute gelernt hast",
-  "pattern": "Welches Muster steckt hinter den Fehlern (z.B. Biotech, Momentum, Makro)",
-  "remove_rules": ["Regel die nicht mehr gilt (oder leer)"]
+  "new_rules": ["max 3 Regeln, sehr konkret: z.B. 'Keine SHORTs wenn >= 5 Call-Sweeps erkannt'"],
+  "new_lesson": "2-3 Saetze: was heute + im Verlauf der letzten Tage gelernt",
+  "pattern": "Muster-Name hinter den Fehlern (z.B. 'Geopolitik-Flip', 'Hedge-Misread', 'Momentum-Blindspot')",
+  "what_i_missed": "Konkret: welche Signale habe ich bei Richtungswechsel ignoriert",
+  "remove_rules": ["veraltete Regeln entfernen oder leer lassen"],
+  "weight_adjustments": {{"min_score_long": 0, "min_score_short": 0}}
 }}"""
 
     response = _nous_call(
         prompt,
-        system='Du bist Hermes AI Trading Agent. Du schreibst deine eigenen Handelsregeln basierend auf echten Marktdaten. Antworte AUSSCHLIESSLICH mit validem JSON.',
-        max_tokens=500, temperature=0.3
+        system='Du bist Hermes AI Trading Agent mit 14-Tage-Gedaechtnis. Analysiere Muster ueber mehrere Tage. Schreibe deine eigenen Handelsregeln. Antworte AUSSCHLIESSLICH mit validem JSON ohne Backticks.',
+        max_tokens=700, temperature=0.3
     )
     if not response:
         return ''
@@ -839,26 +953,47 @@ Antworte NUR mit diesem JSON (kein anderer Text):
         remove = set(data.get('remove_rules', []))
         identity['rules'] = [r for r in identity.get('rules', []) if r not in remove][-15:]
 
-        # Neue Lektion
-        lesson = data.get('new_lesson', '').strip()
+        # Neue Lektion + "Was habe ich verpasst?"
+        lesson      = data.get('new_lesson', '').strip()
+        what_missed = data.get('what_i_missed', '').strip()
+        pattern     = data.get('pattern', '')
         if lesson:
             identity.setdefault('lessons', []).insert(0, {
-                'date':       today,
-                'lesson':     lesson,
-                'pattern':    data.get('pattern', ''),
-                'win_rate':   win_rate,
-                'false_count': len(false_signals),
+                'date':         today,
+                'lesson':       lesson,
+                'pattern':      pattern,
+                'what_missed':  what_missed,
+                'win_rate':     win_rate,
+                'false_count':  len(false_signals),
+                'direction_flip': direction_flip,
             })
             identity['lessons'] = identity['lessons'][:30]
+
+        # Gewichtungen aus KI-Vorschlag anwenden
+        w_adj = data.get('weight_adjustments', {})
+        if w_adj:
+            learn = load_learning()
+            for k, v in w_adj.items():
+                if k in learn.get('weights', {}) and isinstance(v, (int, float)) and v != 0:
+                    old_v = learn['weights'][k]
+                    learn['weights'][k] = max(1, old_v + int(v))
+            save_learning(learn)
 
         identity['last_reflection'] = today
         save_identity(identity)
 
-        tg_send(
-            f'🧠 <b>HERMES SELBST-REFLEXION {today}</b>\n'
-            f'{lesson}\n'
-            + (f'Neue Regeln: ' + ' | '.join(data.get("new_rules", [])[:2]) if data.get("new_rules") else '')
-        )
+        # Telegram Report
+        lines = [f'<b>HERMES LERNT — {today}</b>']
+        if lesson:
+            lines.append(lesson)
+        if what_missed and direction_flip:
+            lines.append(f'Was verpasst: {what_missed[:120]}')
+        if pattern:
+            lines.append(f'Muster: {pattern}')
+        new_rules = data.get('new_rules', [])
+        if new_rules:
+            lines.append('Neue Regeln: ' + ' | '.join(new_rules[:2]))
+        tg_send('\n'.join(lines))
         return lesson
     except Exception:
         return ''

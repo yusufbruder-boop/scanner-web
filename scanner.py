@@ -1209,16 +1209,41 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         reasons_long = []
         reasons_short = []
 
-        # Gelernte Gewichtungen laden (Hermes Self-Learning)
+        # Gelernte Gewichtungen + Regeln laden (Hermes Self-Learning 14-Tage)
         try:
             import json as _lj, os as _lo
             _lf = 'hermes_learning.json'
-            _lw = _lj.load(open(_lf)).get('weights', {}) if _lo.path.exists(_lf) else {}
+            _ld = _lj.load(open(_lf)) if _lo.path.exists(_lf) else {}
+            _lw = _ld.get('weights', {})
         except Exception:
-            _lw = {}
+            _ld, _lw = {}, {}
         _vol_thresh    = float(_lw.get('vol_ratio_threshold', 3.0))
         _earnings_bon  = int(_lw.get('earnings_bonus', 4))
         _smallcap_bon  = int(_lw.get('small_cap_boost', 0))
+
+        # Marktbias der letzten 3 Tage laden — konservativere Schwellen bei schlechtem Trend
+        try:
+            _bias_log = _ld.get('market_bias_log', {})
+            _recent_days = sorted(_bias_log.keys())[-3:]
+            _recent_wr   = [_bias_log[d].get('win_rate', 50) for d in _recent_days if _bias_log[d].get('win_rate')]
+            _avg_wr_3d   = sum(_recent_wr) / len(_recent_wr) if _recent_wr else 50
+            # Wenn Win-Rate < 40% über 3 Tage → Score-Schwellen erhöhen
+            _score_adj = 2 if _avg_wr_3d < 40 else (1 if _avg_wr_3d < 50 else 0)
+        except Exception:
+            _score_adj = 0
+
+        # Gelernte Regeln aus identity.json laden und als Filter anwenden
+        try:
+            _id_f = 'hermes_identity.json'
+            _id_d = _lj.load(open(_id_f)) if _lo.path.exists(_id_f) else {}
+            _ai_rules = _id_d.get('rules', [])
+        except Exception:
+            _ai_rules = []
+
+        # Regel-Parser: konkrete Regeln in Flags umwandeln
+        _block_short_on_call_sweep = any('call-sweep' in r.lower() or 'call sweep' in r.lower() for r in _ai_rules)
+        _block_put_hedge_largecap  = any('put' in r.lower() and 'large' in r.lower() for r in _ai_rules)
+        _require_news_confirm      = any('news' in r.lower() and 'bestätig' in r.lower() for r in _ai_rules)
 
         # SmallCap Boost (gelernt: kleine Aktien nicht ignorieren)
         if price < 50 and _smallcap_bon > 0:
@@ -1356,10 +1381,14 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         bc = best_option(calls, True,  price, today, exp_cutoff, atr)
         bp = best_option(puts,  False, price, today, exp_cutoff, atr)
 
-        tie_goes_short = drop_from_high < -8 and short_score >= 4
-        if short_score >= 4 and (short_score > long_score or tie_goes_short) and bp:
+        # Dynamische Schwellen: bei schlechter Win-Rate der letzten 3 Tage strenger werden
+        _min_long  = int(_lw.get('min_score_long',  4)) + _score_adj
+        _min_short = int(_lw.get('min_score_short', 4)) + _score_adj
+
+        tie_goes_short = drop_from_high < -8 and short_score >= _min_short
+        if short_score >= _min_short and (short_score > long_score or tie_goes_short) and bp:
             signal, score, best, otype = 'SHORT', short_score, bp, 'PUT'
-        elif long_score >= 4 and long_score > short_score and bc:
+        elif long_score >= _min_long and long_score > short_score and bc:
             signal, score, best, otype = 'LONG',  long_score,  bc, 'CALL'
         else:
             signal, score, best, otype = 'WATCH', 0, bc or bp, None
@@ -1371,6 +1400,22 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         # Verhindert SHORT auf Stocks die heute schon +10%+ gestiegen sind (falsche Richtung)
         elif signal == 'SHORT' and prev_chg >= 10:
             signal, score, best, otype = 'WATCH', 0, bc or bp, None
+
+        # Call-Sweep Widerspruch: viele Call-Sweeps = bullisches Signal
+        # SHORT bei >= 5 Call-Sweeps nur erlaubt wenn NEGATIV-Katalysator oder Crash
+        # Threshold: KI kann den Wert durch Lernen auf 3 senken
+        _sweep_block_thresh = 3 if _block_short_on_call_sweep else 5
+        if signal == 'SHORT' and sc >= _sweep_block_thresh and katalysator != 'NEGATIV' and prev_chg > -5:
+            signal, score, best, otype = 'WATCH', 0, bc or bp, None
+
+        # Large-Cap PUT Hedge Filter: bei teuren Aktien (>$80) ist hohes PUT-Volumen
+        # oft institutionelle Absicherung bestehender Longs, kein Direktional-Short
+        # KI kann diesen Filter durch Lernen verschärfen
+        _put_hedge_price = 60 if _block_put_hedge_largecap else 80
+        if signal == 'SHORT' and max_put_voi >= 20 and price > _put_hedge_price and prev_chg > -3:
+            short_score = max(0, short_score - 4)
+            if short_score < _min_short or short_score <= long_score:
+                signal, score, best, otype = 'WATCH', 0, bc or bp, None
 
         conflict = signal == 'SHORT' and trend_pct > 15 and short_trend > -5
 
