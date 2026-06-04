@@ -1059,15 +1059,27 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
     in_scan = {r['t'] for r in current_longs + current_shorts}
     today   = datetime.now().strftime('%Y-%m-%d')
 
-    # Kandidaten: UNIVERSE + Social + Yahoo Movers
+    # Kandidaten: UNIVERSE + Social Deep + Yahoo Movers
     candidates = [t for t in UNIVERSE if t not in in_scan]
+
+    # Social Deep Trending: Reddit + Stocktwits trending Stocks hinzufügen
+    _social_deep_map = {}  # sym → {why, sentiment, top_post}
     try:
-        social_t, _ = get_cached_social()
-        for t in social_t:
+        social_deep = get_social_deep_trending()
+        for s in social_deep:
+            t = s['sym']
+            _social_deep_map[t] = s
             if t not in in_scan and t not in candidates and 2 <= len(t) <= 5:
                 candidates.append(t)
     except Exception:
-        pass
+        # Fallback: altes System
+        try:
+            social_t, _ = get_cached_social()
+            for t in social_t:
+                if t not in in_scan and t not in candidates and 2 <= len(t) <= 5:
+                    candidates.append(t)
+        except Exception:
+            pass
 
     # Yahoo Movers: Aktien die sich heute bereits stark bewegen
     movers_today = get_market_movers()
@@ -1192,13 +1204,50 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
                 reasons.append(f'Alpaca: {h[:50]}')
                 break
 
+        # 6) Social Deep Trending Signal
+        social_info = _social_deep_map.get(ticker)
+        if social_info:
+            sc_score  = social_info.get('score', 0)
+            why_tags  = social_info.get('why', [])
+            sentiment = social_info.get('sentiment', 'NEUTRAL')
+            top_post  = social_info.get('top_post', '')
+            sources   = social_info.get('sources', [])
+
+            # Score-Bonus basierend auf Sentiment + Kategorie
+            if sentiment == 'BULLISH':
+                score += 3
+            elif sentiment == 'BEARISH':
+                score += 2
+            elif sc_score >= 50:
+                score += 1
+
+            # Kategorie-Bonus: Earnings/Squeeze sind stärkere Signale
+            if 'EARNINGS' in why_tags:
+                score += 2
+            if 'SHORT-SQUEEZE' in why_tags:
+                score += 2
+            if 'M&A/DEAL' in why_tags:
+                score += 2
+
+            # Reason aufbauen
+            why_str  = ' | '.join(why_tags[:2])
+            src_str  = ', '.join(sources[:2])
+            sent_str = f'{sentiment}' if sentiment != 'NEUTRAL' else ''
+            reason_parts = [f'Social [{why_str}]']
+            if sent_str:
+                reason_parts.append(sent_str)
+            reason_parts.append(f'({src_str})')
+            reasons.append(' '.join(reason_parts))
+            if top_post:
+                reasons.append(f'"{top_post[:60]}"')
+
         if score >= 4 and reasons:
-            price = price_from_opt or (mover['price'] if mover else 0)
+            price   = price_from_opt or (mover['price'] if mover else 0)
             net_dir = 'LONG' if call_sweeps_n >= put_sweeps_n else 'SHORT'
-            return {
+            out = {
                 'ticker':        ticker,
                 'score':         score,
-                'reasons':       reasons[:4],
+                'reasons':       reasons[:5],
                 'dp':            dp_info,
                 'price':         round(price, 2),
                 'ts':            datetime.now().strftime('%H:%M'),
@@ -1206,6 +1255,14 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
                 'put_sweeps':    put_sweeps_n,
                 'net_direction': net_dir,
             }
+            if social_info:
+                out['social'] = {
+                    'why':       social_info.get('why', []),
+                    'sentiment': social_info.get('sentiment', ''),
+                    'top_post':  social_info.get('top_post', '')[:80],
+                    'sources':   social_info.get('sources', []),
+                }
+            return out
         return None
 
     with ThreadPoolExecutor(max_workers=6) as ex:

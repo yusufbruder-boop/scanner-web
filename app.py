@@ -2278,7 +2278,45 @@ function renderResults(data, isNew) {
         + '<div style="flex:1">'
         +   '<div style="font-size:15px;font-weight:bold;color:#fff">' + a.ticker + ' <span style="color:#6b8cad;font-size:12px">' + px + '</span>' + dp + '</div>';
       (a.reasons||[]).forEach(r => { html += '<div style="font-size:11px;color:#94a3b8;margin-top:2px">• ' + r + '</div>'; });
+      // Social Trending Info
+      if (a.social) {
+        let sentCol = a.social.sentiment==='BULLISH' ? '#4dff91' : (a.social.sentiment==='BEARISH' ? '#ff4d6b' : '#94a3b8');
+        let whyStr  = (a.social.why||[]).join(' · ');
+        let srcStr  = (a.social.sources||[]).join(', ');
+        html += '<div style="margin-top:5px;padding:5px 8px;background:#0a1628;border-left:2px solid #2e6da4;border-radius:3px">'
+          + '<div style="font-size:10px;color:#60a5fa">📱 Social: <b style="color:' + sentCol + '">' + a.social.sentiment + '</b>'
+          + (whyStr ? ' · <span style="color:#ffd700">' + whyStr + '</span>' : '')
+          + ' <span style="color:#4a6a8a">(' + srcStr + ')</span></div>';
+        if (a.social.top_post) {
+          html += '<div style="font-size:10px;color:#64748b;margin-top:2px;font-style:italic">"' + a.social.top_post + '"</div>';
+        }
+        html += '</div>';
+      }
       html += '</div></div>';
+    });
+    html += '</div>';
+  }
+
+  // ── Social Deep Trending (After-Hours) ────────────────────────────────────
+  const socialDeep = data.social_deep || [];
+  if (socialDeep.length > 0) {
+    html += '<div class="section"><div class="section-title" style="color:#a78bfa;border-left:3px solid #a78bfa">📱 SOCIAL TRENDING — Reddit · Stocktwits</div>';
+    socialDeep.slice(0,10).forEach(t => {
+      let sentCol = t.sentiment==='BULLISH' ? '#4dff91' : (t.sentiment==='BEARISH' ? '#ff4d6b' : '#94a3b8');
+      let sentIcon = t.sentiment==='BULLISH' ? '🟢' : (t.sentiment==='BEARISH' ? '🔴' : '⚪');
+      let whyStr  = (t.why||[]).slice(0,2).join(' · ');
+      let srcStr  = (t.sources||[]).slice(0,3).join(', ');
+      html += '<div style="padding:8px 14px;border-bottom:1px solid #0a1f30;display:flex;gap:10px;align-items:flex-start">'
+        + '<div style="min-width:36px;text-align:center;font-size:18px">' + sentIcon + '</div>'
+        + '<div style="flex:1">'
+        +   '<div style="display:flex;align-items:center;gap:8px">'
+        +     '<span style="font-size:15px;font-weight:bold;color:#fff">' + t.sym + '</span>'
+        +     '<span style="font-size:10px;color:#ffd700;background:#1a1200;padding:2px 6px;border-radius:3px">' + whyStr + '</span>'
+        +     '<span style="font-size:10px;color:' + sentCol + '">' + t.sentiment + '</span>'
+        +   '</div>'
+        +   (t.top_post ? '<div style="font-size:11px;color:#64748b;margin-top:3px;font-style:italic">"' + t.top_post.slice(0,90) + '"</div>' : '')
+        +   '<div style="font-size:10px;color:#4a6a8a;margin-top:2px">' + srcStr + ' · Score: ' + t.score + '</div>'
+        + '</div></div>';
     });
     html += '</div>';
   }
