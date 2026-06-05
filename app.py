@@ -2122,7 +2122,7 @@ function renderCard(r, cls, isNew) {
   let badge    = cls === 'long' ? 'badge-long'  : (cls === 'short' ? 'badge-short'  : 'badge-mover');
   let katStr = r.kat_strength || 'NORMAL';
   let katBadge = '';
-  if (r.katalysator !== 'KEIN') {
+  if (r.katalysator && r.katalysator !== 'KEIN') {
     if (r.katalysator === 'POSITIV') {
       if (katStr === 'EXTREME') katBadge = '<span class="badge" style="background:#3a0a00;color:#ff6020;border:1px solid #ff4000;font-weight:bold">🔥 EXTREME CATALYST</span>';
       else if (katStr === 'HIGH') katBadge = '<span class="badge" style="background:#1a0a30;color:#c080ff;border:1px solid #8040cc;font-weight:bold">🏛️ HIGH-IMPACT</span>';
@@ -2200,8 +2200,8 @@ function renderCard(r, cls, isNew) {
     +   '<div class="row">'
     +     '<div class="stat"><span class="stat-label">Trend 10T</span><span class="stat-value">' + pct(r.trend) + '</span></div>'
     +     '<div class="stat"><span class="stat-label">Vortag</span><span class="stat-value">'    + pct(r.prev_chg) + '</span></div>'
-    +     '<div class="stat"><span class="stat-label">P/C</span><span class="stat-value">'       + r.pc + '</span></div>'
-    +     '<div class="stat"><span class="stat-label">Hoch-Abst.</span><span class="stat-value ' + (r.drop_high < -5 ? 'pct-neg' : '') + '">' + r.drop_high + '%</span></div>'
+    +     '<div class="stat"><span class="stat-label">P/C</span><span class="stat-value">'       + (r.pc != null ? r.pc : '—') + '</span></div>'
+    +     '<div class="stat"><span class="stat-label">Hoch-Abst.</span><span class="stat-value ' + (r.drop_high < -5 ? 'pct-neg' : '') + '">' + (r.drop_high != null ? r.drop_high + '%' : '—') + '</span></div>'
     +   '</div>'
     + (function() {
         let sm = r.smart_money || {};
