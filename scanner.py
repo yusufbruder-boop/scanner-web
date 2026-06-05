@@ -1327,12 +1327,12 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
             chg_abs = abs(mover['chg'])
             if chg_abs >= 10:
                 score += 6
+                reasons.append(f'{mover["chg"]:+.1f}% heute — EXTREMER MOVE')
+            elif chg_abs >= 7:
+                score += 5
                 reasons.append(f'{mover["chg"]:+.1f}% heute — STARKER MOVE')
-            elif chg_abs >= 8:
-                score += 4
-                reasons.append(f'Yahoo {mover["label"]}: {mover["chg"]:+.1f}% heute')
             elif chg_abs >= 5:
-                score += 2
+                score += 3
                 reasons.append(f'Yahoo {mover["label"]}: {mover["chg"]:+.1f}% heute')
 
         # 1) Dark Pool Print (Polygon /v3/trades)
@@ -1475,15 +1475,20 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
         if score >= 4 and reasons:
             price     = price_from_opt or (mover['price'] if mover else 0)
             chg_today = mover['chg'] if mover else (prev_chg or 0)
-            # Richtung: Sweeps haben Priorität. Ohne Sweeps: Kursrichtung entscheidet
-            if call_sweeps_n > 0 or put_sweeps_n > 0:
+            # Richtung: extremer Fall überschreibt Sweeps
+            # >7% runter = Trend ist SHORT, egal ob Dip-Käufer Calls kaufen
+            if chg_today <= -7:
+                net_dir = 'SHORT'
+            elif chg_today >= 7:
+                net_dir = 'LONG'
+            elif call_sweeps_n > 0 or put_sweeps_n > 0:
                 net_dir = 'LONG' if call_sweeps_n >= put_sweeps_n else 'SHORT'
             elif chg_today <= -4:
-                net_dir = 'SHORT'   # Klar fallend → SHORT
+                net_dir = 'SHORT'
             elif chg_today >= 4:
-                net_dir = 'LONG'    # Klar steigend → LONG
+                net_dir = 'LONG'
             else:
-                net_dir = 'LONG'    # Default
+                net_dir = 'LONG'
             out = {
                 'ticker':        ticker,
                 'score':         score,

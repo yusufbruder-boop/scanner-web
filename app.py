@@ -2324,8 +2324,17 @@ function renderResults(data, isNew) {
 
   // Fallback: wenn Scanner leer → Hermes Hunt Alerts als LONG/SHORT nutzen
   const hermAlertsSorted = (data.hermes_alerts||[]).slice().sort((a,b)=>b.score-a.score);
-  const fallbackLongs  = hermAlertsSorted.filter(a => a.net_direction==='LONG'  || a.call_sweeps >= a.put_sweeps);
-  const fallbackShorts = hermAlertsSorted.filter(a => a.net_direction==='SHORT' || a.put_sweeps > a.call_sweeps);
+  let fallbackLongs  = hermAlertsSorted.filter(a => a.net_direction==='LONG'  || a.call_sweeps >= a.put_sweeps);
+  let fallbackShorts = hermAlertsSorted.filter(a => a.net_direction==='SHORT' || a.put_sweeps > a.call_sweeps);
+  // Wenn keine Shorts: die stärksten Verlierer aus den Alerts nehmen
+  if (fallbackShorts.length === 0 && hermAlertsSorted.length > 0) {
+    const losers = hermAlertsSorted
+      .filter(a => (a.prev_chg || 0) < -2)
+      .sort((a,b) => (a.prev_chg||0) - (b.prev_chg||0));
+    if (losers.length > 0) {
+      fallbackShorts = losers.slice(0,3).map(a => Object.assign({}, a, {net_direction:'SHORT'}));
+    }
+  }
 
   // Hermes Hunt Alert → Scanner-Karten Format konvertieren
   function alertToCard(a) {
