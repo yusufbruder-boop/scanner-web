@@ -1339,14 +1339,19 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
         price_from_opt = 0
         call_sweeps_n = 0
         put_sweeps_n  = 0
+        pc_ratio      = None
         try:
             opt = poly_fetch(f'https://api.polygon.io/v3/snapshot/options/{ticker}?limit=100&apiKey={API}')
             res = opt.get('results', [])
             if res:
                 price_from_opt = res[0].get('underlying_asset', {}).get('price', 0)
                 calls  = [r for r in res if r['details']['contract_type'] == 'call']
+                puts   = [r for r in res if r['details']['contract_type'] == 'put']
                 cv     = sum(r['day'].get('volume', 0) for r in calls)
+                pv     = sum(r['day'].get('volume', 0) for r in puts)
                 oi_tot = sum(max(r.get('open_interest', 0) or 1, 1) for r in calls)
+                if cv > 0:
+                    pc_ratio = round(pv / cv, 2)
                 sw     = get_options_sweep(res)
                 call_sweeps_n = sw.get('sweeps_call', 0)
                 put_sweeps_n  = sw.get('sweeps_put', 0)
@@ -1365,7 +1370,9 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
         except Exception:
             pass
 
-        # 3) Alpaca Snapshot: ungewöhnliches Volumen?
+        # 3) Alpaca Snapshot: ungewöhnliches Volumen + prev_chg
+        prev_chg  = None
+        trend_10d = None
         if ticker in al_snap:
             snap = al_snap[ticker]
             dbar = snap.get('dailyBar', {})
@@ -1375,6 +1382,20 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
             if pvol and vol / pvol > 3:
                 score += 2
                 reasons.append(f'Alpaca Vol {vol/1e6:.1f}M vs Vortag {pvol/1e6:.1f}M ({vol/pvol:.1f}x)')
+            dc = float(dbar.get('c') or 0)
+            pc = float(prev.get('c') or 0)
+            if dc and pc:
+                prev_chg = round((dc - pc) / pc * 100, 2)
+        # 3b) Polygon 10-Tage Trend
+        try:
+            from_d = (datetime.now() - timedelta(days=14)).strftime('%Y-%m-%d')
+            to_d   = datetime.now().strftime('%Y-%m-%d')
+            bars_d = poly_fetch(f'https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{from_d}/{to_d}?adjusted=true&limit=12&apiKey={API}')
+            bars   = bars_d.get('results', [])
+            if len(bars) >= 2:
+                trend_10d = round((bars[-1]['c'] - bars[0]['c']) / bars[0]['c'] * 100, 2)
+        except Exception:
+            pass
 
         # 4) Polygon News (letzte 4h)
         try:
@@ -1456,6 +1477,9 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
                 'call_sweeps':   call_sweeps_n,
                 'put_sweeps':    put_sweeps_n,
                 'net_direction': net_dir,
+                'prev_chg':      prev_chg,
+                'trend':         trend_10d,
+                'pc':            pc_ratio,
             }
             if social_info:
                 out['social'] = {

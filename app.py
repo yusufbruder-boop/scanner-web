@@ -2330,13 +2330,17 @@ function renderResults(data, isNew) {
   // Hermes Hunt Alert → Scanner-Karten Format konvertieren
   function alertToCard(a) {
     return {
-      t:       a.ticker,
-      score:   a.score,
-      price:   a.price,
-      reasons: a.reasons || [],
-      signal:  a.net_direction || 'LONG',
-      label:   '🤖 Hermes Hunt',
-      best:    null,
+      t:        a.ticker,
+      score:    a.score,
+      price:    a.price,
+      prev_chg: a.prev_chg != null ? a.prev_chg : null,
+      trend:    a.trend    != null ? a.trend    : null,
+      pc:       a.pc       != null ? a.pc       : null,
+      drop_high: null,
+      reasons:  a.reasons || [],
+      signal:   a.net_direction || 'LONG',
+      label:    '🤖 Hermes Hunt',
+      best:     null,
     };
   }
   const hermBadge = ' <span style="font-size:10px;background:#0a1f2e;color:#00e5ff;padding:2px 7px;border-radius:3px;margin-left:6px">🤖 HERMES HUNT</span>';
