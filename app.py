@@ -2262,6 +2262,32 @@ function renderResults(data, isNew) {
     html += '</div>';
   }
 
+  // ── Markt-Sentiment (Put/Call Ratio Gesamtmarkt) ─────────────────────────
+  const ms = data.market_sentiment || {};
+  if (ms.signal) {
+    let pc    = ms.pc_total || 0;
+    let pcCol = pc > 1.5 ? '#ff4d6b' : (pc > 1.0 ? '#ffa040' : (pc < 0.7 ? '#4dff91' : '#ffd700'));
+    let botTxt = ms.bottom_signal
+      ? ' <span style="background:#0a2a0a;color:#4dff91;border:1px solid #2d9e57;padding:1px 7px;border-radius:5px;font-size:10px">⚡ BODEN-SIGNAL</span>'
+      : '';
+    html += '<div style="margin:8px;background:#080e1a;border:1px solid #1e3a5f;border-radius:10px;padding:10px 14px">'
+      + '<div style="font-size:10px;font-weight:bold;color:#4a8ab8;letter-spacing:2px;margin-bottom:6px">📊 MARKT-SENTIMENT — Put/Call Ratio' + botTxt + '</div>'
+      + '<div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center">'
+      +   '<div style="font-size:22px;font-weight:bold;color:'+pcCol+'">' + pc.toFixed(2) + ' P/C</div>'
+      +   '<div style="font-size:14px;font-weight:bold;color:'+pcCol+'">' + ms.emoji + ' ' + ms.signal + '</div>'
+      +   '<div style="font-size:11px;color:#4a6a8a">'
+      +     'SPY:' + (ms.pc_spy||0).toFixed(2)
+      +     ' &nbsp; QQQ:' + (ms.pc_qqq||0).toFixed(2)
+      +     ' &nbsp; IWM:' + (ms.pc_iwm||0).toFixed(2)
+      +   '</div>'
+      +   '<div style="font-size:10px;color:#2a4a6a">'
+      +     'Calls:' + ((ms.calls_total||0)/1e6).toFixed(1) + 'M'
+      +     ' | Puts:' + ((ms.puts_total||0)/1e6).toFixed(1) + 'M'
+      +   '</div>'
+      + '</div>'
+      + '</div>';
+  }
+
   // ── Hermes AI Analyse (ganz oben wenn vorhanden) ─────────────────────────
   if (data.hermes_ai) {
     html += '<div style="margin:8px;background:linear-gradient(135deg,#0a1f2e,#0d2840);border:1px solid #00e5ff44;border-radius:10px;padding:12px 14px">'
@@ -3154,6 +3180,7 @@ def results():
             out['hermes_alerts']       = state.get('hermes_alerts', [])
             out['hermes_running']      = state.get('hermes_running', False)
             out['running']             = state.get('running', False)
+            out['market_sentiment']    = state.get('market_sentiment', {})
             out['mt5_status']          = state.get('mt5_status', {})
             out['sector_rotation']     = state.get('sector_rotation', {})
             out['live_feed']           = state.get('live_feed', [])
@@ -3744,17 +3771,25 @@ def hermes_monitor():
                     state['hermes_running_since'] = datetime.now()
                 try:
                     from scanner import (hermes_hunt, scan_ticker, get_alpaca_market_news,
-                                         hermes_24h_scan, get_macro_context, get_sec_alerts)
+                                         hermes_24h_scan, get_macro_context, get_sec_alerts,
+                                         get_market_sentiment)
                     POLY_KEY = os.environ.get('POLYGON_API_KEY', '')
 
-                    # 0a) Makro + SEC im Hintergrund vorladen (für AI-Prompts später)
+                    # 0a) Makro + SEC + Markt-Sentiment im Hintergrund vorladen
                     def _bg_macro_sec():
                         try:
                             get_macro_context()
                             get_sec_alerts()
                         except Exception:
                             pass
-                    threading.Thread(target=_bg_macro_sec, daemon=True).start()
+                    def _bg_sentiment():
+                        try:
+                            sent = get_market_sentiment()
+                            state['market_sentiment'] = sent
+                        except Exception:
+                            pass
+                    threading.Thread(target=_bg_macro_sec,  daemon=True).start()
+                    threading.Thread(target=_bg_sentiment,  daemon=True).start()
 
                     # 0b) 24h Intelligence Scan — Polygon Gainers/Losers + Vol/OI + Dark Pool
                     def _bg_24h():

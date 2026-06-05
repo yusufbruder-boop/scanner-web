@@ -734,6 +734,72 @@ def get_earnings_calendar_polygon(tickers: list) -> dict:
 
 
 # ── Dark Pool / Block Trade Detection (Polygon Trades API) ───────────────────
+def get_market_sentiment() -> dict:
+    """
+    Gesamtmarkt-Sentiment via Put/Call Ratio (SPY + QQQ + IWM).
+    Ruft Calls und Puts separat ab um Polygon-Limit zu umgehen.
+    Gibt dict zurück: pc_total, pc_spy, pc_qqq, pc_iwm, signal, score, emoji
+    """
+    syms = ['SPY', 'QQQ', 'IWM']
+    total_c = total_p = 0
+    per_sym = {}
+
+    def _fetch_vol(sym, ctype):
+        url = f'https://api.polygon.io/v3/snapshot/options/{sym}?limit=250&contract_type={ctype}&apiKey={API}'
+        d = poly_fetch(url)
+        return sum(r['day'].get('volume', 0) for r in d.get('results', []))
+
+    try:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        tasks = [(s, t) for s in syms for t in ['call', 'put']]
+        vols = {}
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futs = {ex.submit(_fetch_vol, s, t): (s, t) for s, t in tasks}
+            for fut, key in as_completed(futs, timeout=20):
+                try:
+                    vols[key] = fut.result()
+                except Exception:
+                    vols[key] = 0
+
+        for sym in syms:
+            cv = vols.get((sym, 'call'), 0)
+            pv = vols.get((sym, 'put'),  0)
+            total_c += cv
+            total_p += pv
+            per_sym[sym] = {'calls': cv, 'puts': pv, 'pc': round(pv / cv, 2) if cv else 0}
+    except Exception:
+        pass
+
+    pc = round(total_p / total_c, 2) if total_c else 0
+
+    if   pc > 2.0: signal, emoji, score = 'EXTREME FEAR',     '🔴🔴', 10
+    elif pc > 1.5: signal, emoji, score = 'STARK BEARISH',    '🔴',    8
+    elif pc > 1.2: signal, emoji, score = 'BEARISH',          '🟠',    6
+    elif pc > 0.9: signal, emoji, score = 'LEICHT BEARISH',   '🟡',    4
+    elif pc > 0.7: signal, emoji, score = 'NEUTRAL',          '⚪',    2
+    elif pc > 0.5: signal, emoji, score = 'LEICHT BULLISH',   '🟢',    1
+    else:          signal, emoji, score = 'BULLISH',          '🟢🟢',  0
+
+    # Boden-Wahrscheinlichkeit: hohe P/C + QQQ Dip-Käufer = Reversal möglich
+    qqq_pc = per_sym.get('QQQ', {}).get('pc', 0)
+    spy_pc  = per_sym.get('SPY', {}).get('pc', 0)
+    bottom_signal = (pc > 1.3 and qqq_pc < spy_pc * 0.8)  # QQQ wird stärker gekauft als SPY
+
+    return {
+        'pc_total':      pc,
+        'pc_spy':        per_sym.get('SPY', {}).get('pc', 0),
+        'pc_qqq':        per_sym.get('QQQ', {}).get('pc', 0),
+        'pc_iwm':        per_sym.get('IWM', {}).get('pc', 0),
+        'calls_total':   total_c,
+        'puts_total':    total_p,
+        'signal':        signal,
+        'emoji':         emoji,
+        'score':         score,
+        'bottom_signal': bottom_signal,
+        'per_sym':       per_sym,
+    }
+
+
 def get_darkpool_signal(ticker: str, today: str) -> dict:
     """
     Dark Pool Direction: erkennt ob institutionelle KAUFEN oder VERKAUFEN.
