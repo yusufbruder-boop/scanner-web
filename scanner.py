@@ -1444,10 +1444,11 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
         except Exception:
             pass
 
-        # 3) Alpaca Snapshot: ungewöhnliches Volumen + prev_chg
+        # 3) Alpaca Snapshot: Volumen + Preise
         prev_chg      = None
         trend_10d     = None
         prev_close_al = None
+        live_price_al = None
         if ticker in al_snap:
             snap = al_snap[ticker]
             dbar = snap.get('dailyBar', {})
@@ -1457,36 +1458,31 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
             if pvol and vol / pvol > 3:
                 score += 2
                 reasons.append(f'Alpaca Vol {vol/1e6:.1f}M vs Vortag {pvol/1e6:.1f}M ({vol/pvol:.1f}x)')
-            dc = float(dbar.get('c') or 0)
+            # Live-Preis: latestTrade > dailyBar.c > 0
+            live_price_al = float(snap.get('latestTrade', {}).get('p', 0) or dbar.get('c', 0) or 0)
             pc = float(prev.get('c') or 0)
             if pc > 0:
                 prev_close_al = pc
-            if dc and pc:
-                prev_chg = round((dc - pc) / pc * 100, 2)
-        # 3b) Polygon 10-Tage Trend + prev_chg Fallback
+            if live_price_al and pc:
+                prev_chg = round((live_price_al - pc) / pc * 100, 2)
+        # 3b) Polygon 30-Tage Bars: Trend + drop_high + prev_chg Fallback
         try:
-            from_d = (datetime.now() - timedelta(days=14)).strftime('%Y-%m-%d')
+            from_d = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
             to_d   = datetime.now().strftime('%Y-%m-%d')
-            bars_d = poly_fetch(f'https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{from_d}/{to_d}?adjusted=true&limit=12&apiKey={API}')
+            bars_d = poly_fetch(f'https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{from_d}/{to_d}?adjusted=true&limit=25&apiKey={API}')
             bars   = bars_d.get('results', [])
+            curr_p = float(price_from_opt or live_price_al or 0)
             if len(bars) >= 2:
                 trend_10d = round((bars[-1]['c'] - bars[0]['c']) / bars[0]['c'] * 100, 2)
-                if prev_chg is None:
+                if prev_chg is None and len(bars) >= 2:
                     prev_c = float(bars[-2]['c'] or 0)
-                    curr_p = float(price_from_opt or bars[-1]['c'] or 0)
-                    if prev_c and curr_p:
-                        prev_chg = round((curr_p - prev_c) / prev_c * 100, 2)
-                # drop_high: Abstand vom 10-Tage Hoch
-                highs = [float(b.get('h', b['c'])) for b in bars[-10:]]
-                if highs:
-                    p_high = max(highs)
-                    curr_p2 = float(price_from_opt or bars[-1]['c'] or 0)
-                    if p_high and curr_p2:
-                        drop_high = round((curr_p2 - p_high) / p_high * 100, 2)
-                    else:
-                        drop_high = None
-                else:
-                    drop_high = None
+                    use_p  = curr_p or float(bars[-1]['c'] or 0)
+                    if prev_c and use_p:
+                        prev_chg = round((use_p - prev_c) / prev_c * 100, 2)
+                highs  = [float(b.get('h', b['c'])) for b in bars[-10:]]
+                p_high = max(highs) if highs else 0
+                use_p2 = curr_p or float(bars[-1]['c'] or 0)
+                drop_high = round((use_p2 - p_high) / p_high * 100, 2) if p_high and use_p2 else None
             else:
                 drop_high = None
         except Exception:
