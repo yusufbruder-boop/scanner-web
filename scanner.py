@@ -560,7 +560,11 @@ UNIVERSE = [
     'MU','INTC','AVGO','QCOM','MRVL','SMCI','ARM','AMAT',
     'PLTR','CRWD','NET','DDOG','SOUN',
     'IONQ','RGTI','IREN','WULF','DELL','HPE',
-    'GS','JPM','BAC','ASTS','LUNR','RKLB',
+    # Finanzwerte + Rotation
+    'GS','JPM','BAC','C','WFC','MS','V','MA','AXP','BX','KRE','XLF',
+    # Defensive + Rotation
+    'XLV','XLP','XLU','XLE','XLI',
+    'ASTS','LUNR','RKLB',
     'GLD','SLV','USO','AAL','DAL',
     'MSTR','COIN','HOOD','SOFI','ORCL','NOW',
     'XOM','CVX','LMT','RTX',
@@ -1317,13 +1321,17 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
         reasons = []
         dp_info = {}
 
-        # 0) Yahoo Mover Check — bereits heute +5%?
+        # 0) Yahoo Mover Check — bereits heute +/-5%?
         mover = next((m for m in movers_today if m['sym'] == ticker), None)
         if mover:
-            if abs(mover['chg']) >= 8:
+            chg_abs = abs(mover['chg'])
+            if chg_abs >= 10:
+                score += 6
+                reasons.append(f'{mover["chg"]:+.1f}% heute — STARKER MOVE')
+            elif chg_abs >= 8:
                 score += 4
                 reasons.append(f'Yahoo {mover["label"]}: {mover["chg"]:+.1f}% heute')
-            elif abs(mover['chg']) >= 5:
+            elif chg_abs >= 5:
                 score += 2
                 reasons.append(f'Yahoo {mover["label"]}: {mover["chg"]:+.1f}% heute')
 
@@ -1465,8 +1473,17 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
                 reasons.append(f'"{top_post[:60]}"')
 
         if score >= 4 and reasons:
-            price   = price_from_opt or (mover['price'] if mover else 0)
-            net_dir = 'LONG' if call_sweeps_n >= put_sweeps_n else 'SHORT'
+            price     = price_from_opt or (mover['price'] if mover else 0)
+            chg_today = mover['chg'] if mover else (prev_chg or 0)
+            # Richtung: Sweeps haben Priorität. Ohne Sweeps: Kursrichtung entscheidet
+            if call_sweeps_n > 0 or put_sweeps_n > 0:
+                net_dir = 'LONG' if call_sweeps_n >= put_sweeps_n else 'SHORT'
+            elif chg_today <= -4:
+                net_dir = 'SHORT'   # Klar fallend → SHORT
+            elif chg_today >= 4:
+                net_dir = 'LONG'    # Klar steigend → LONG
+            else:
+                net_dir = 'LONG'    # Default
             out = {
                 'ticker':        ticker,
                 'score':         score,
