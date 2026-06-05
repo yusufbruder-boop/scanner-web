@@ -2096,6 +2096,7 @@ let refreshInterval = null;
 let refreshCountdown = 60;
 
 function pct(v) {
+  if (v == null || isNaN(v)) return '<span style="color:#4a6a8a">—</span>';
   let cls = v >= 0 ? 'pct-pos' : 'pct-neg';
   return '<span class="' + cls + '">' + (v >= 0 ? '+' : '') + v.toFixed(1) + '%</span>';
 }
