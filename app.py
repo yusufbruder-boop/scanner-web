@@ -2288,6 +2288,34 @@ function renderResults(data, isNew) {
       + '</div>';
   }
 
+  // ── Markt-Regime (QQQ Gap, TLT Zinsen, VXX, Sektor-Rotation) ───────────
+  const mc = data.market_context || {};
+  if (mc.bias && mc.bias !== 'NEUTRAL') {
+    let biasCol = mc.bias === 'STRONG_BEAR' ? '#ff2244' :
+                  mc.bias === 'BEAR'        ? '#ff6644' :
+                  mc.bias === 'STRONG_BULL' ? '#00ff88' :
+                  mc.bias === 'BULL'        ? '#44ff99' : '#ffd700';
+    let biasEmoji = mc.bias === 'STRONG_BEAR' ? '🔴🔴' :
+                    mc.bias === 'BEAR'        ? '🔴' :
+                    mc.bias === 'STRONG_BULL' ? '🟢🟢' :
+                    mc.bias === 'BULL'        ? '🟢' : '🟡';
+    let border = mc.bias.includes('BEAR') ? '#ff224444' : '#00ff8844';
+    let bg     = mc.bias.includes('BEAR') ? '#1a0508' : '#051a0a';
+    html += '<div style="margin:8px;background:' + bg + ';border:1px solid ' + border + ';border-radius:10px;padding:10px 14px">'
+      + '<div style="font-size:10px;font-weight:bold;color:' + biasCol + ';letter-spacing:2px;margin-bottom:6px">'
+      + biasEmoji + ' MARKT-REGIME — ' + mc.bias + (mc.signals && mc.signals.length ? ' (' + mc.signals.length + ' Signale)' : '') + '</div>'
+      + '<div style="display:flex;gap:14px;flex-wrap:wrap;font-size:11px">'
+      + '<span style="color:#94a3b8">QQQ: <b style="color:' + (mc.qqq_chg>=0?'#4dff91':'#ff4d6b') + '">' + (mc.qqq_chg>=0?'+':'') + (mc.qqq_chg||0).toFixed(1) + '%</b></span>'
+      + (mc.qqq_gap ? '<span style="color:#94a3b8">Gap: <b style="color:#ff6644">' + (mc.qqq_gap>=0?'+':'') + (mc.qqq_gap||0).toFixed(1) + '%</b></span>' : '')
+      + '<span style="color:#94a3b8">VXX: <b style="color:' + (mc.vxx_chg>0?'#ff4d6b':'#4dff91') + '">' + (mc.vxx_chg>=0?'+':'') + (mc.vxx_chg||0).toFixed(1) + '%</b></span>'
+      + '<span style="color:#94a3b8">TLT: <b style="color:' + (mc.tlt_chg>=0?'#4dff91':'#ff4d6b') + '">' + (mc.tlt_chg>=0?'+':'') + (mc.tlt_chg||0).toFixed(1) + '%</b></span>'
+      + (mc.sector_rotation ? '<span style="color:#ffd700">' + mc.sector_rotation + '</span>' : '')
+      + '</div>'
+      + (mc.macro_event ? '<div style="margin-top:6px;font-size:11px;color:#ff9944;font-weight:bold">⚡ MAKRO: ' + mc.macro_event + '</div>' : '')
+      + (mc.signals && mc.signals.length ? '<div style="margin-top:5px;font-size:10px;color:#6a7a9a">' + mc.signals.slice(0,3).join(' &nbsp;|&nbsp; ') + '</div>' : '')
+      + '</div>';
+  }
+
   // ── Hermes AI Analyse (ganz oben wenn vorhanden) ─────────────────────────
   if (data.hermes_ai) {
     html += '<div style="margin:8px;background:linear-gradient(135deg,#0a1f2e,#0d2840);border:1px solid #00e5ff44;border-radius:10px;padding:12px 14px">'
@@ -3181,6 +3209,7 @@ def results():
             out['hermes_running']      = state.get('hermes_running', False)
             out['running']             = state.get('running', False)
             out['market_sentiment']    = state.get('market_sentiment', {})
+            out['market_context']      = state.get('market_context', {})
             out['mt5_status']          = state.get('mt5_status', {})
             out['sector_rotation']     = state.get('sector_rotation', {})
             out['live_feed']           = state.get('live_feed', [])
@@ -3772,7 +3801,7 @@ def hermes_monitor():
                 try:
                     from scanner import (hermes_hunt, scan_ticker, get_alpaca_market_news,
                                          hermes_24h_scan, get_macro_context, get_sec_alerts,
-                                         get_market_sentiment)
+                                         get_market_sentiment, get_market_context)
                     POLY_KEY = os.environ.get('POLYGON_API_KEY', '')
 
                     # 0a) Makro + SEC + Markt-Sentiment im Hintergrund vorladen
@@ -3788,8 +3817,15 @@ def hermes_monitor():
                             state['market_sentiment'] = sent
                         except Exception:
                             pass
+                    def _bg_market_ctx():
+                        try:
+                            ctx = get_market_context()
+                            state['market_context'] = ctx
+                        except Exception:
+                            pass
                     threading.Thread(target=_bg_macro_sec,  daemon=True).start()
                     threading.Thread(target=_bg_sentiment,  daemon=True).start()
+                    threading.Thread(target=_bg_market_ctx, daemon=True).start()
 
                     # 0b) 24h Intelligence Scan — Polygon Gainers/Losers + Vol/OI + Dark Pool
                     def _bg_24h():

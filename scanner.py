@@ -673,6 +673,142 @@ def get_macro_context() -> dict:
     return result
 
 
+# ── Markt-Kontext: QQQ Gap, TLT Zinsen, VXX, Sektor-Rotation ─────────────────
+_mkt_ctx_cache = {'data': {}, 'ts': 0}
+
+def get_market_context() -> dict:
+    """
+    Markt-Regime: QQQ Gap, TLT (Zinsen), VXX, Sektor-Rotation.
+    Erkennt ob Markt BEARISH/BULLISH/NEUTRAL ist → beeinflusst alle Signale.
+    Cache: 5 Minuten.
+    """
+    global _mkt_ctx_cache
+    if time.time() - _mkt_ctx_cache['ts'] < 300 and _mkt_ctx_cache['data']:
+        return _mkt_ctx_cache['data']
+
+    result = {
+        'bias': 'NEUTRAL', 'score': 0, 'bear_score': 0, 'bull_score': 0,
+        'qqq_gap': 0, 'qqq_chg': 0, 'spy_chg': 0,
+        'vxx_chg': 0, 'tlt_chg': 0,
+        'yield_rising': False, 'macro_event': '', 'macro_risk': 0,
+        'signals': [], 'sector_rotation': '',
+    }
+
+    try:
+        url = 'https://data.alpaca.markets/v2/stocks/snapshots?symbols=QQQ,SPY,VXX,TLT,XLV,XLP,XLF,XLE'
+        req = urllib.request.Request(url, headers={
+            'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET})
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+            snap = json.loads(r.read())
+
+        def _sym(sym):
+            s    = snap.get(sym, {})
+            p    = float(s.get('latestTrade', {}).get('p', 0) or 0)
+            prev = float(s.get('prevDailyBar', {}).get('c', 0) or 0)
+            op   = float(s.get('dailyBar', {}).get('o', 0) or 0)
+            chg  = round((p - prev) / prev * 100, 2) if prev else 0
+            gap  = round((op - prev) / prev * 100, 2) if prev and op else 0
+            return chg, gap, p
+
+        qqq_chg, qqq_gap, _ = _sym('QQQ')
+        spy_chg, spy_gap, _ = _sym('SPY')
+        vxx_chg, _, vxx_p   = _sym('VXX')
+        tlt_chg, _, _       = _sym('TLT')
+        xlv_chg, _, _       = _sym('XLV')
+        xlp_chg, _, _       = _sym('XLP')
+        xlf_chg, _, _       = _sym('XLF')
+        xle_chg, _, _       = _sym('XLE')
+
+        result.update({'qqq_chg': qqq_chg, 'qqq_gap': qqq_gap,
+                       'spy_chg': spy_chg, 'vxx_chg': vxx_chg,
+                       'tlt_chg': tlt_chg, 'yield_rising': tlt_chg < -0.5})
+
+        bear = bull = 0
+        sigs = []
+
+        # QQQ Gap-Down
+        if qqq_gap <= -1.5:   bear += 4; sigs.append(f'QQQ Gap-Down {qqq_gap:+.1f}% — Markt öffnet schwach')
+        elif qqq_gap <= -0.7: bear += 2; sigs.append(f'QQQ Gap-Down {qqq_gap:+.1f}%')
+        elif qqq_gap >= 1.0:  bull += 2; sigs.append(f'QQQ Gap-Up {qqq_gap:+.1f}%')
+
+        # Intraday QQQ
+        if qqq_chg <= -3:     bear += 4; sigs.append(f'QQQ {qqq_chg:+.1f}% — Starker Abverkauf')
+        elif qqq_chg <= -1.5: bear += 2; sigs.append(f'QQQ {qqq_chg:+.1f}%')
+        elif qqq_chg >= 2:    bull += 3; sigs.append(f'QQQ {qqq_chg:+.1f}% — Starke Rallye')
+        elif qqq_chg >= 1:    bull += 1; sigs.append(f'QQQ {qqq_chg:+.1f}%')
+
+        # VXX Fear
+        if vxx_chg >= 7:      bear += 4; sigs.append(f'VXX +{vxx_chg:.1f}% — Extreme Fear')
+        elif vxx_chg >= 3:    bear += 2; sigs.append(f'VXX +{vxx_chg:.1f}% — Fear steigt')
+        elif vxx_chg <= -4:   bull += 3; sigs.append(f'VXX {vxx_chg:.1f}% — Fear kollabiert (Bullish)')
+        elif vxx_chg <= -2:   bull += 1; sigs.append(f'VXX {vxx_chg:.1f}% — Fear sinkt')
+
+        # TLT / Treasury Yields
+        if tlt_chg <= -1.5:   bear += 3; sigs.append(f'TLT {tlt_chg:+.1f}% — Zinsen steigen stark (Tech-Druck)')
+        elif tlt_chg <= -0.7: bear += 1; sigs.append(f'TLT {tlt_chg:+.1f}% — Zinsen steigen')
+        elif tlt_chg >= 1.0:  bull += 2; sigs.append(f'TLT +{tlt_chg:.1f}% — Zinsen fallen (Bullish)')
+
+        # Sektor-Rotation: Defensive stark + Tech fällt = Risk-Off
+        rotation = ''
+        if xlv_chg > 0.5 and qqq_chg < -1:
+            bear += 2; sigs.append(f'Rotation → Healthcare XLV {xlv_chg:+.1f}%'); rotation = 'DEFENSIVE'
+        if xlp_chg > 0.5 and qqq_chg < -1:
+            bear += 1; sigs.append(f'Rotation → Staples XLP {xlp_chg:+.1f}%'); rotation = 'DEFENSIVE'
+        if xle_chg > 1 and qqq_chg < 0:
+            bear += 1; sigs.append(f'Rotation → Energie XLE {xle_chg:+.1f}% (Inflation)'); rotation = 'ENERGY/INFLATION'
+        if xlf_chg > xlv_chg and xlf_chg > 0.5 and qqq_chg > 0:
+            bull += 1; sigs.append(f'Rotation → Financials XLF {xlf_chg:+.1f}% (Risk-On)'); rotation = 'RISK_ON'
+        result['sector_rotation'] = rotation
+
+        # Bias bestimmen
+        net = bear - bull
+        result['bear_score'] = bear
+        result['bull_score'] = bull
+        result['score']      = net
+        result['signals']    = sigs[:6]
+        result['bias'] = ('STRONG_BEAR' if net >= 7 else 'BEAR'   if net >= 3 else
+                          'STRONG_BULL' if net <= -5 else 'BULL'  if net <= -2 else 'NEUTRAL')
+
+    except Exception:
+        pass
+
+    # Makro-Event aus Polygon News (Jobs, CPI, Fed, Yields)
+    try:
+        news = poly_fetch(f'https://api.polygon.io/v2/reference/news?limit=10&apiKey={API}')
+        MACRO_KEYS = {
+            'nonfarm': ('NFP / Jobs-Daten', 5), 'jobs report': ('Jobs-Bericht', 5),
+            'employment': ('Jobsdaten', 4), 'cpi': ('CPI Inflation', 5),
+            'inflation': ('Inflation', 3), 'fomc': ('Fed FOMC', 5),
+            'federal reserve': ('Fed Entscheidung', 4),
+            'interest rate': ('Zinsentscheidung', 5),
+            'treasury yield': ('Treasury Yields', 4), 'yield spike': ('Yield-Spike', 5),
+            'tariff': ('Zölle', 4), 'trade war': ('Handelskrieg', 5),
+            'gdp': ('BIP-Daten', 3), 'pce': ('PCE Inflation', 4),
+        }
+        for n in news.get('results', [])[:10]:
+            title = n.get('title', '').lower()
+            for key, (label, risk) in MACRO_KEYS.items():
+                if key in title:
+                    if risk > result['macro_risk']:
+                        result['macro_event'] = label
+                        result['macro_risk']  = risk
+                    if risk >= 4:
+                        result['bear_score'] += 2
+                        result['score']      += 2
+                        if f'⚡ MAKRO: {label}' not in result['signals']:
+                            result['signals'].insert(0, f'⚡ MAKRO EVENT: {label}')
+                    break
+        net2 = result['bear_score'] - result['bull_score']
+        if net2 >= 7:   result['bias'] = 'STRONG_BEAR'
+        elif net2 >= 3: result['bias'] = 'BEAR'
+    except Exception:
+        pass
+
+    _mkt_ctx_cache['data'] = result
+    _mkt_ctx_cache['ts']   = time.time()
+    return result
+
+
 # ── SEC EDGAR Alerts (8-K + Form 4 Insider) ──────────────────────────────────
 _sec_cache = {'data': [], 'ts': 0}
 _sec_lock  = threading.Lock()
@@ -2243,6 +2379,44 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         reasons_long = []
         reasons_short = []
 
+        # ── Markt-Regime (cached, kein extra API-Call) ────────────────────────
+        mkt = get_market_context()
+        mkt_bias = mkt.get('bias', 'NEUTRAL')
+        if mkt_bias == 'STRONG_BEAR':
+            short_score += 3
+            reasons_short.append(f'Markt STARK BEARISH — QQQ {mkt["qqq_chg"]:+.1f}% VXX +{mkt["vxx_chg"]:.1f}%')
+        elif mkt_bias == 'BEAR':
+            short_score += 2
+            reasons_short.append(f'Markt BEARISH — QQQ {mkt["qqq_chg"]:+.1f}%')
+        elif mkt_bias == 'STRONG_BULL':
+            long_score += 3
+            reasons_long.append(f'Markt STARK BULLISH — QQQ {mkt["qqq_chg"]:+.1f}%')
+        elif mkt_bias == 'BULL':
+            long_score += 2
+            reasons_long.append(f'Markt BULLISH — QQQ {mkt["qqq_chg"]:+.1f}%')
+        if mkt.get('yield_rising') and mkt.get('tlt_chg', 0) < -1:
+            short_score += 2
+            reasons_short.append(f'Zinsen steigen (TLT {mkt["tlt_chg"]:+.1f}%) — Tech-Druck')
+        if mkt.get('macro_event') and mkt.get('macro_risk', 0) >= 4:
+            short_score += 2
+            reasons_short.append(f'⚡ MAKRO EVENT: {mkt["macro_event"]}')
+        if mkt.get('qqq_gap', 0) <= -1.5:
+            short_score += 2
+            reasons_short.append(f'QQQ Gap-Down {mkt["qqq_gap"]:+.1f}% zum Open')
+
+        # ── Distribution Kerze (Oberschatten + Volumen = Smart Money verkauft) ──
+        if len(bars) >= 3:
+            lb = bars[-1]
+            candle_range = lb.get('h', 0) - lb.get('l', lb.get('c', 0))
+            upper_wick   = lb.get('h', 0) - max(lb.get('c', 0), lb.get('o', 0))
+            wick_ratio   = upper_wick / candle_range if candle_range > 0.01 else 0
+            if wick_ratio > 0.60 and vol_spike >= 1.5 and trend_pct > 3:
+                short_score += 3
+                reasons_short.append(f'Distribution: {round(wick_ratio*100)}% Oberschatten bei Run-Up +{round(trend_pct,1)}%')
+            elif wick_ratio > 0.55 and vol_spike >= 2.0:
+                short_score += 2
+                reasons_short.append(f'Rejection-Kerze: {round(wick_ratio*100)}% Wick')
+
         # Gelernte Gewichtungen + Regeln laden (Hermes Self-Learning 14-Tage)
         try:
             import json as _lj, os as _lo
@@ -2348,13 +2522,23 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
                 reasons_short.append(
                     f'EARNINGS {ea["date"]} | {ea["run5"]:+.0f}% Run-Up | '
                     f'DROP {ea["sell_prob"]:.0f}% wahrscheinlich')
-                # Long Score senken wenn Sell-the-News wahrscheinlich
                 long_score = max(0, long_score - 3)
             elif ea['verdict'] == 'BEAT-ERWARTUNG':
                 long_score += 4
                 reasons_long.append(
                     f'EARNINGS {ea["date"]} | Beat {ea["beat_prob"]:.0f}% wahrscheinlich | '
                     f'Call-Premium dominiert')
+            # Pre-Earnings Schwäche: Aktie fällt bereits VOR Earnings = Fear-Sell
+            if ea['days'] is not None and 0 <= ea['days'] <= 3:
+                if trend_pct < -5 and prev_chg < -2:
+                    short_score += 4
+                    reasons_short.append(
+                        f'Pre-Earnings Schwäche: {trend_pct:+.1f}% Trend, Markt flieht vor Earnings')
+                elif run5 >= 10 and prev_chg > 1:
+                    # Klassischer AVGO-Fall: +10% Run-Up → Sell-the-News
+                    short_score += 4
+                    reasons_short.append(
+                        f'Earnings Run-Up +{run5:.1f}% in 5T — Sell-the-News Setup (AVGO-Muster)')
 
         # ── TIER 1: Smart Money Signale (höchste Priorität) ──────────────────
 
