@@ -1445,8 +1445,9 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
             pass
 
         # 3) Alpaca Snapshot: ungewöhnliches Volumen + prev_chg
-        prev_chg  = None
-        trend_10d = None
+        prev_chg      = None
+        trend_10d     = None
+        prev_close_al = None
         if ticker in al_snap:
             snap = al_snap[ticker]
             dbar = snap.get('dailyBar', {})
@@ -1458,9 +1459,11 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
                 reasons.append(f'Alpaca Vol {vol/1e6:.1f}M vs Vortag {pvol/1e6:.1f}M ({vol/pvol:.1f}x)')
             dc = float(dbar.get('c') or 0)
             pc = float(prev.get('c') or 0)
+            if pc > 0:
+                prev_close_al = pc
             if dc and pc:
                 prev_chg = round((dc - pc) / pc * 100, 2)
-        # 3b) Polygon 10-Tage Trend
+        # 3b) Polygon 10-Tage Trend + prev_chg Fallback
         try:
             from_d = (datetime.now() - timedelta(days=14)).strftime('%Y-%m-%d')
             to_d   = datetime.now().strftime('%Y-%m-%d')
@@ -1468,8 +1471,29 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
             bars   = bars_d.get('results', [])
             if len(bars) >= 2:
                 trend_10d = round((bars[-1]['c'] - bars[0]['c']) / bars[0]['c'] * 100, 2)
+                if prev_chg is None:
+                    prev_c = float(bars[-2]['c'] or 0)
+                    curr_p = float(price_from_opt or bars[-1]['c'] or 0)
+                    if prev_c and curr_p:
+                        prev_chg = round((curr_p - prev_c) / prev_c * 100, 2)
+                # drop_high: Abstand vom 10-Tage Hoch
+                highs = [float(b.get('h', b['c'])) for b in bars[-10:]]
+                if highs:
+                    p_high = max(highs)
+                    curr_p2 = float(price_from_opt or bars[-1]['c'] or 0)
+                    if p_high and curr_p2:
+                        drop_high = round((curr_p2 - p_high) / p_high * 100, 2)
+                    else:
+                        drop_high = None
+                else:
+                    drop_high = None
+            else:
+                drop_high = None
         except Exception:
-            pass
+            drop_high = None
+        # prev_chg letzter Fallback: Options-Preis vs Alpaca prevDailyBar
+        if prev_chg is None and price_from_opt > 0 and prev_close_al:
+            prev_chg = round((price_from_opt - prev_close_al) / prev_close_al * 100, 2)
 
         # 4) Polygon News (letzte 4h)
         try:
@@ -1568,6 +1592,7 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
                 'prev_chg':      prev_chg,
                 'trend':         trend_10d,
                 'pc':            pc_ratio,
+                'drop_high':     drop_high,
             }
             if social_info:
                 out['social'] = {

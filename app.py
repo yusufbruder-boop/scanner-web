@@ -2371,7 +2371,7 @@ function renderResults(data, isNew) {
       prev_chg: a.prev_chg != null ? a.prev_chg : null,
       trend:    a.trend    != null ? a.trend    : null,
       pc:       a.pc       != null ? a.pc       : null,
-      drop_high: null,
+      drop_high: a.drop_high != null ? a.drop_high : null,
       reasons:  a.reasons || [],
       signal:   a.net_direction || 'LONG',
       label:    '🤖 Hermes Hunt',
