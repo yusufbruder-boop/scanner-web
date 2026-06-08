@@ -3,13 +3,90 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ctx = ssl.create_default_context()
-API           = os.environ.get('POLYGON_API_KEY', '')
-ALPACA_KEY    = os.environ.get('ALPACA_API_KEY',    '')
-ALPACA_SECRET = os.environ.get('ALPACA_SECRET_KEY', '')
-NOUS_KEY      = os.environ.get('NOUS_API_KEY',      '')
+API              = os.environ.get('POLYGON_API_KEY', '')
+ALPACA_KEY       = os.environ.get('ALPACA_API_KEY',    '')
+ALPACA_SECRET    = os.environ.get('ALPACA_SECRET_KEY', '')
+NOUS_KEY         = os.environ.get('NOUS_API_KEY',      '')
+IBKR_BRIDGE_URL  = os.environ.get('IBKR_BRIDGE_URL',  '')   # http://dein-pc:8765
+IBKR_BRIDGE_TOKEN= os.environ.get('IBKR_BRIDGE_TOKEN','hermes-ibkr-2026')
 
-_LEARNING_FILE = 'hermes_learning.json'
+_LEARNING_FILE  = 'hermes_learning.json'
 _patterns_cache = {'data': None, 'ts': 0}
+_ibkr_cache     = {'data': None, 'ts': 0}
+
+
+# ── IBKR Bridge — liest Top-Traded + Options-Flow vom lokalen Bridge-Script ──
+def get_ibkr_top_traded() -> dict:
+    """
+    Holt IBKR Most-Active + Options-Flow vom lokalen ibkr_bridge.py.
+    Gibt zurück: {most_active, hot_options, top_gainers, top_losers, ts, source}
+    Fällt lautlos zurück auf {} wenn Bridge nicht erreichbar.
+    """
+    global _ibkr_cache
+    if time.time() - _ibkr_cache['ts'] < 90 and _ibkr_cache['data']:
+        return _ibkr_cache['data']
+    if not IBKR_BRIDGE_URL:
+        return {}
+    try:
+        req = urllib.request.Request(
+            f'{IBKR_BRIDGE_URL}/ibkr/data',
+            headers={'Authorization': f'Bearer {IBKR_BRIDGE_TOKEN}',
+                     'User-Agent': 'HermesScanner/3.0'}
+        )
+        with urllib.request.urlopen(req, context=ctx, timeout=5) as r:
+            data = json.loads(r.read())
+        _ibkr_cache = {'data': data, 'ts': time.time()}
+        return data
+    except Exception:
+        return {}
+
+
+def enrich_with_ibkr(results: list) -> list:
+    """
+    Reichert Scanner-Ergebnisse mit IBKR-Daten an.
+    Setzt ibkr_rank, ibkr_source, ibkr_confirmed wenn IBKR den Ticker auch sieht.
+    """
+    ibkr = get_ibkr_top_traded()
+    if not ibkr:
+        return results
+
+    # Baue Lookup: sym → {rank, category}
+    ibkr_lookup = {}
+    for i, item in enumerate(ibkr.get('most_active', [])[:25]):
+        sym = item.get('sym', '')
+        if sym:
+            ibkr_lookup[sym] = {'rank': i + 1, 'category': 'MOST_ACTIVE',
+                                'ibkr_vol': item.get('volume', 0),
+                                'ibkr_chg': item.get('chg', 0)}
+    for i, item in enumerate(ibkr.get('hot_options', [])[:25]):
+        sym = item.get('sym', '')
+        if sym and sym not in ibkr_lookup:
+            ibkr_lookup[sym] = {'rank': i + 1, 'category': 'HOT_OPTIONS',
+                                'ibkr_vol': item.get('volume', 0),
+                                'ibkr_chg': item.get('chg', 0)}
+    for i, item in enumerate(ibkr.get('top_gainers', [])[:15]):
+        sym = item.get('sym', '')
+        if sym and sym not in ibkr_lookup:
+            ibkr_lookup[sym] = {'rank': i + 1, 'category': 'TOP_GAINER',
+                                'ibkr_vol': item.get('volume', 0),
+                                'ibkr_chg': item.get('chg', 0)}
+
+    for r in results:
+        sym = r.get('t', '')
+        if sym in ibkr_lookup:
+            info = ibkr_lookup[sym]
+            r['ibkr_rank']      = info['rank']
+            r['ibkr_category']  = info['category']
+            r['ibkr_confirmed'] = True
+            r['ibkr_chg']       = info['ibkr_chg']
+            # Conviction boost: wenn IBKR + Polygon beide das Signal sehen
+            if r.get('signal_basis') in ('POLYGON_CONFIRMED', 'POLYGON_ONLY'):
+                r['signal_basis']  = 'IBKR_POLYGON_CONFIRMED'
+                r['conviction']    = min(0.95, r.get('conviction', 0.65) + 0.15)
+                r['score']         = r.get('score', 0) + 2
+        else:
+            r['ibkr_confirmed'] = False
+    return results
 
 def _load_patterns():
     """Lädt Pattern-Datenbank aus hermes_learning.json (gecacht 5 Min)."""
@@ -2906,6 +2983,17 @@ def run_scan(progress_cb=None):
     for r in results:
         r['is_social'] = r['t'] in social_tickers
 
+    # IBKR Anreicherung: Conviction + Source-Label für Tickers die IBKR auch sieht
+    all_results = longs + shorts + movers + watch
+    all_results = enrich_with_ibkr(all_results)
+    # Ibkr-confirmed zuerst in Longs/Shorts (re-sort nach Score)
+    longs  = sorted([r for r in all_results if r['signal'] == 'LONG'],  key=lambda x: (-x.get('ibkr_confirmed',False), -x['score']))
+    shorts = sorted([r for r in all_results if r['signal'] == 'SHORT'], key=lambda x: (-x.get('ibkr_confirmed',False), -x['score']))
+    movers = [r for r in all_results if r['t'] in {m['t'] for m in movers}]
+
+    # IBKR Top Traded — eigene Kategorie im Output
+    ibkr_raw = get_ibkr_top_traded()
+
     return {
         'longs':         longs[:10],
         'shorts':        shorts[:10],
@@ -2917,4 +3005,6 @@ def run_scan(progress_cb=None):
         'total':         len(universe),
         'time':          datetime.now().strftime('%Y-%m-%d %H:%M'),
         'today':         today,
+        'ibkr':          ibkr_raw,       # raw IBKR Bridge Daten (most_active, hot_options, ts)
+        'ibkr_sources':  ['IBKR', 'Polygon', 'Alpaca'],
     }

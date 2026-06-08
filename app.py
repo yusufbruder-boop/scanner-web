@@ -125,6 +125,9 @@ ALPACA_KEY    = os.environ.get('ALPACA_KEY',    'PK5T6OU5ENWZQK5DVZ746MHHEF')
 ALPACA_SECRET = os.environ.get('ALPACA_SECRET', '3nngSp7NksYikEZvf5hLihWEBtFdnuG336KfeYvFb5D9')
 ALPACA_BASE   = 'https://paper-api.alpaca.markets'
 
+# IBKR Bridge — lokales Script sendet Daten hierher
+IBKR_BRIDGE_TOKEN = os.environ.get('IBKR_BRIDGE_TOKEN', 'hermes-ibkr-2026')
+
 # Auto-Trading: Hermes handelt bei Score >= AUTO_TRADE_MIN_SCORE
 AUTO_TRADE_ENABLED   = os.environ.get('AUTO_TRADE', 'false').lower() == 'true'
 AUTO_TRADE_AMOUNT    = float(os.environ.get('AUTO_TRADE_AMOUNT', '300'))   # $ pro Trade
@@ -168,6 +171,10 @@ state = {
     'social_data':    [],
     'hf_data':        [],
     'extra_ts':       None,
+    # IBKR Bridge Daten (empfangen vom lokalen ibkr_bridge.py)
+    'ibkr_data':      {},           # {most_active, hot_options, top_gainers, ts, connected}
+    'ibkr_ts':        None,         # letzter Empfang
+    'ibkr_scan':      [],           # IBKR-bestätigte Top-Mover mit Signal
 }
 _hermes_lock = threading.Lock()
 _scan_lock   = threading.Lock()   # verhindert gleichzeitige Scans
@@ -2360,6 +2367,60 @@ function renderResults(data, isNew) {
     html += '</div>';
   }
 
+  // ── IBKR Most Traded — Weltgrößter Broker als Datenquelle ──────────────
+  const ibkrData = data.ibkr_data || {};
+  const ibkrScan = data.ibkr_scan || [];
+  if (ibkrData.connected || ibkrScan.length > 0) {
+    const ibkrTs = data.ibkr_ts ? ' <span style="font-size:10px;color:#64748b">@ ' + data.ibkr_ts + '</span>' : '';
+    html += '<div class="section"><div class="section-title" style="color:#00e5ff;border-left:3px solid #00e5ff">🏦 IBKR MOST TRADED — Weltgrößter Broker Live-Daten' + ibkrTs + '</div>';
+    // Most Active
+    const mostActive = (ibkrData.most_active || []).slice(0,6);
+    if (mostActive.length > 0) {
+      html += '<div style="padding:6px 14px;font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:1px">📊 Meistgehandelt</div>';
+      mostActive.forEach(s => {
+        let chgCol = (s.chg||0) >= 0 ? '#4dff91' : '#ff4d6b';
+        let volStr = s.vol ? ' | Vol: ' + (s.vol/1e6).toFixed(1) + 'M' : '';
+        html += '<div style="padding:5px 14px;border-bottom:1px solid #0d1a26;display:flex;justify-content:space-between">'
+          + '<span style="color:#fff;font-weight:bold">' + s.sym + '</span>'
+          + '<span style="color:#94a3b8;font-size:11px">'
+          + (s.price ? '$' + s.price : '')
+          + ' <span style="color:' + chgCol + '">' + ((s.chg||0)>=0?'+':'') + (s.chg||0).toFixed(2) + '%</span>'
+          + volStr + '</span>'
+          + '</div>';
+      });
+    }
+    // Hot Options
+    const hotOpts = (ibkrData.hot_options || []).slice(0,4);
+    if (hotOpts.length > 0) {
+      html += '<div style="padding:6px 14px;font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:1px">🔥 Hot Options</div>';
+      hotOpts.forEach(s => {
+        html += '<div style="padding:5px 14px;border-bottom:1px solid #0d1a26;display:flex;justify-content:space-between">'
+          + '<span style="color:#ffa040;font-weight:bold">' + s.sym + '</span>'
+          + '<span style="color:#94a3b8;font-size:11px">' + (s.reason || '') + '</span>'
+          + '</div>';
+      });
+    }
+    // IBKR Confirmed Signals
+    if (ibkrScan.length > 0) {
+      html += '<div style="padding:6px 14px;font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:1px">✅ IBKR + Polygon Bestätigt</div>';
+      ibkrScan.slice(0,5).forEach(s => {
+        let dirCol = s.direction === 'LONG' ? '#4dff91' : '#ff4d6b';
+        let dirArrow = s.direction === 'LONG' ? '▲' : '▼';
+        let scCol = (s.score||0) >= 8 ? '#4dff91' : (s.score||0) >= 6 ? '#ffd700' : '#ffa040';
+        html += '<div style="padding:8px 14px;border-bottom:1px solid #0d1a26;display:flex;justify-content:space-between;align-items:center">'
+          + '<div>'
+          +   '<span style="font-weight:bold;color:#fff;font-size:14px">' + s.sym + '</span>'
+          +   ' <span style="color:' + dirCol + ';font-weight:bold">' + dirArrow + ' ' + s.direction + '</span>'
+          +   ' <span style="font-size:10px;background:#001a33;border:1px solid #00e5ff44;color:#00e5ff;padding:1px 5px;border-radius:4px">IBKR #' + (s.ibkr_rank||'?') + '</span>'
+          +   '<div style="font-size:10px;color:#94a3b8;margin-top:2px">' + (s.reason||'') + '</div>'
+          + '</div>'
+          + '<div style="font-weight:bold;font-size:20px;color:' + scCol + '">' + (s.score||0) + '</div>'
+          + '</div>';
+      });
+    }
+    html += '</div>';
+  }
+
   // ── Hauptziel: Mover + Long + Short ─────────────────────────────────────
   if (data.movers && data.movers.length > 0) {
     html += '<div class="section"><div class="section-title mover">🎯 NEXT MOVER — Pre-Move Setup: News + Smart Money + Entscheidung</div>';
@@ -3226,6 +3287,9 @@ def results():
             out['hermes_24h']          = state.get('hermes_24h', [])
             out['hermes_learning']     = load_learning()
             out['hermes_identity']     = load_identity()
+            out['ibkr_data']           = state.get('ibkr_data', {})
+            out['ibkr_scan']           = state.get('ibkr_scan', [])
+            out['ibkr_ts']             = state.get('ibkr_ts')
         return jsonify(_to_json_safe(out))
     except Exception as e:
         return jsonify({'error': f'Server Fehler: {str(e)[:120]}'})
@@ -3843,6 +3907,16 @@ def hermes_monitor():
                             pass
                     threading.Thread(target=_bg_24h, daemon=True).start()
 
+                    # 0b2) IBKR Most-Traded Abgleich — wenn Bridge verbunden
+                    def _bg_ibkr():
+                        try:
+                            ibkr = state.get('ibkr_data', {})
+                            if ibkr and ibkr.get('connected'):
+                                _run_ibkr_scan(ibkr)
+                        except Exception:
+                            pass
+                    threading.Thread(target=_bg_ibkr, daemon=True).start()
+
                     # 0c) SEKTOR ROTATION MONITOR — wo geht das Geld hin?
                     def _bg_sector_rotation():
                         try:
@@ -4223,6 +4297,132 @@ def alpaca_order_api():
 @app.route('/alpaca/portfolio')
 def alpaca_portfolio_api():
     return jsonify(get_alpaca_portfolio())
+
+# ── IBKR Bridge — empfängt Daten vom lokalen ibkr_bridge.py ─────────────────
+@app.route('/ibkr/push', methods=['POST'])
+def ibkr_push():
+    """
+    Lokales ibkr_bridge.py sendet alle 60s IBKR-Daten hierher.
+    Body: {most_active, hot_options, top_gainers, top_losers, ts, connected}
+    Auth: Bearer IBKR_BRIDGE_TOKEN
+    """
+    auth = request.headers.get('Authorization', '')
+    if auth != f'Bearer {IBKR_BRIDGE_TOKEN}':
+        return jsonify({'error': 'unauthorized'}), 401
+    data = request.get_json(force=True) or {}
+    data['received_at'] = datetime.now().strftime('%H:%M:%S')
+    state['ibkr_data'] = data
+    state['ibkr_ts']   = datetime.now().strftime('%H:%M')
+
+    # Sofort IBKR-Scan: welche Top-Traded Stocks haben Hermes-Signal?
+    try:
+        _run_ibkr_scan(data)
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'received': len(data.get('most_active', []))})
+
+
+@app.route('/ibkr/data')
+def ibkr_data_get():
+    """Gibt gespeicherte IBKR Bridge Daten zurück."""
+    return jsonify(state.get('ibkr_data') or {'connected': False, 'error': 'Bridge nicht verbunden'})
+
+
+@app.route('/ibkr/scan')
+def ibkr_scan_get():
+    """Gibt IBKR-bestätigte Top-Mover mit Hermes-Signal zurück."""
+    return jsonify(state.get('ibkr_scan') or [])
+
+
+def _run_ibkr_scan(ibkr_data: dict):
+    """
+    Vergleicht IBKR Most-Active mit letzten Scanner-Ergebnissen.
+    Erstellt IBKR-Confirmed Signal-Liste mit Richtung + Grund.
+    """
+    if not ibkr_data:
+        return
+    results = state.get('results') or {}
+    all_signals = (results.get('longs', []) + results.get('shorts', []) +
+                   results.get('movers', []) + results.get('watch', []))
+    signal_lookup = {r['t']: r for r in all_signals if r.get('t')}
+
+    ibkr_scan = []
+    all_ibkr = (
+        [(s, 'MOST_ACTIVE')  for s in ibkr_data.get('most_active', [])[:20]] +
+        [(s, 'HOT_OPTIONS')  for s in ibkr_data.get('hot_options',  [])[:20]] +
+        [(s, 'TOP_GAINER')   for s in ibkr_data.get('top_gainers',  [])[:10]] +
+        [(s, 'TOP_LOSER')    for s in ibkr_data.get('top_losers',   [])[:10]]
+    )
+    seen = set()
+    for item, category in all_ibkr:
+        sym  = item.get('sym', '')
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
+        chg  = item.get('chg', 0)
+        vol  = item.get('volume', 0)
+        price = item.get('price', 0)
+
+        # Richtung aus IBKR-Daten + Scanner-Signal
+        sig_r = signal_lookup.get(sym)
+        if sig_r:
+            direction  = sig_r.get('signal', 'WATCH')
+            score      = sig_r.get('score', 0)
+            kat        = sig_r.get('kat_text', '')[:80]
+            conviction = sig_r.get('conviction', 0)
+            basis      = 'IBKR_POLYGON_CONFIRMED'
+            score      = min(15, score + 2)
+        else:
+            # Kein Scanner-Signal → Richtung aus IBKR-Preisbewegung ableiten
+            if category in ('TOP_GAINER',) or chg >= 3:
+                direction, score, conviction = 'LONG', 4, 0.45
+            elif category in ('TOP_LOSER',) or chg <= -3:
+                direction, score, conviction = 'SHORT', 4, 0.45
+            elif category == 'HOT_OPTIONS':
+                direction, score, conviction = 'WATCH', 3, 0.35
+            else:
+                direction, score, conviction = 'WATCH', 2, 0.30
+            kat   = f'IBKR {category}: {chg:+.1f}% | Vol {int(vol):,}'
+            basis = 'IBKR_ONLY'
+
+        # Grund formulieren
+        reason_parts = [f'IBKR #{list(seen).index(sym)+1} {category}']
+        if chg:
+            reason_parts.append(f'{chg:+.1f}% heute')
+        if vol:
+            reason_parts.append(f'Vol {int(vol/1000):.0f}K')
+        if sig_r:
+            reason_parts.append(kat[:60])
+
+        ibkr_scan.append({
+            'sym':        sym,
+            'price':      price,
+            'chg':        round(chg, 2),
+            'volume':     int(vol),
+            'category':   category,
+            'direction':  direction,
+            'score':      score,
+            'conviction': round(conviction, 2),
+            'basis':      basis,
+            'reason':     ' | '.join(reason_parts),
+            'sources':    ['IBKR'] + (['Polygon'] if sig_r else []) + (['Alpaca'] if sig_r else []),
+            'has_signal': sig_r is not None,
+        })
+
+    # Sortierung: IBKR_POLYGON_CONFIRMED + Score zuerst
+    ibkr_scan.sort(key=lambda x: (0 if x['basis']=='IBKR_POLYGON_CONFIRMED' else 1, -x['score']))
+    state['ibkr_scan'] = ibkr_scan[:30]
+
+    # Telegram Alert für Top IBKR Confirmed Signale
+    top = [s for s in ibkr_scan if s['basis'] == 'IBKR_POLYGON_CONFIRMED' and s['score'] >= 7]
+    if top:
+        lines = [f'<b>🏦 IBKR + POLYGON BESTÄTIGT — {datetime.now().strftime("%H:%M")}</b>']
+        for s in top[:4]:
+            emoji = '🟢' if s['direction'] == 'LONG' else '🔴' if s['direction'] == 'SHORT' else '🟡'
+            lines.append(f'{emoji} <b>{s["sym"]}</b> ${s["price"]:.2f} {s["chg"]:+.1f}% Score:{s["score"]}')
+            lines.append(f'   {s["reason"][:80]}')
+        tg_send('\n'.join(lines))
+
 
 # ── MT5 Bot Monitor ──────────────────────────────────────────────────────────
 @app.route('/mt5/status', methods=['POST'])
