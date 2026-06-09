@@ -4667,6 +4667,83 @@ def hermes_alerts_api():
         })
 
 
+# ── SHORT SQUEEZE SCANNER — Route + Background Monitor ───────────────────────
+
+_squeeze_state = {'results': [], 'ts': '', 'last_alerted': set()}
+_squeeze_lock  = threading.Lock()
+
+@app.route('/squeeze')
+def squeeze_route():
+    with _squeeze_lock:
+        data = _squeeze_state.copy()
+    return jsonify({
+        'results': data['results'],
+        'count':   len(data['results']),
+        'ts':      data['ts'],
+    })
+
+def squeeze_monitor():
+    """
+    Laeuft alle 10 Minuten waehrend Marktzeiten.
+    Sendet Telegram-Alert wenn neuer Squeeze-Kandidat mit Score >= 4 gefunden.
+    """
+    import time as _time
+    from scanner import squeeze_scanner
+    _time.sleep(60)   # kurz warten bis App bereit ist
+
+    alerted_today = set()
+    last_day = ''
+
+    while True:
+        try:
+            now = datetime.now()
+            day_str = now.strftime('%Y-%m-%d')
+
+            # Reset taeglich
+            if day_str != last_day:
+                alerted_today.clear()
+                last_day = day_str
+
+            # Nur waehrend US-Marktzeiten (14:30 - 22:00 UTC = 8:30-16:00 ET)
+            hour_utc = now.utctimetuple().tm_hour
+            is_market = (12 <= hour_utc <= 22)   # erweitertes Fenster inkl. Pre/After
+
+            if is_market:
+                results = squeeze_scanner()
+
+                with _squeeze_lock:
+                    _squeeze_state['results'] = results
+                    _squeeze_state['ts']      = now.strftime('%H:%M:%S')
+
+                # Alerts fuer neue Kandidaten mit hohem Score
+                for r in results:
+                    sym   = r['sym']
+                    score = r['score']
+                    level = r['alert_level']
+                    key   = f"{sym}_{r['chg_pct']}"
+
+                    if key not in alerted_today and score >= 4:
+                        alerted_today.add(key)
+                        emoji = {'EXTREME': '🚨🚨', 'HIGH': '🚨', 'MEDIUM': '⚡', 'LOW': '📊'}.get(level, '📊')
+                        cats  = '\n'.join(f'  • {c}' for c in r['catalysts'][:3]) if r['catalysts'] else '  • kein Katalysator'
+                        sigs  = ' | '.join(r.get('signals', []))
+                        msg = (
+                            f'{emoji} <b>SQUEEZE ALERT: {sym}</b>  [{level}]  Score:{score}\n'
+                            f'Preis: ${r["price"]}  (vorher ${r["prev_close"]})\n'
+                            f'Heute: <b>+{r["chg_pct"]}%</b>  Vol:{r["vol_ratio"]}x normal\n'
+                            f'MarketCap: ${r["mktcap"]/1e6:.1f}M  Float:{r["shares_out"]/1e3:.0f}K Aktien\n'
+                            f'Signale: {sigs}\n'
+                            f'Katalysatoren:\n{cats}\n'
+                            f'Gruende: {" | ".join(r["reasons"][:3])}'
+                        )
+                        tg_send(msg)
+
+        except Exception as e:
+            pass   # lautlos — kein Crash des Monitors
+
+        _time.sleep(600)   # alle 10 Minuten
+
+
 # ── Startup ───────────────────────────────────────────────────────────────────
 
 saved = load_results()
@@ -4690,6 +4767,10 @@ sched.start()
 # Hermes Agent starten
 hermes_thread = threading.Thread(target=hermes_monitor, daemon=True)
 hermes_thread.start()
+
+# Squeeze Scanner Monitor starten
+squeeze_thread = threading.Thread(target=squeeze_monitor, daemon=True)
+squeeze_thread.start()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))

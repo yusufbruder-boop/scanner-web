@@ -3163,3 +3163,262 @@ def fibonacci_scan(max_workers=10):
                 'NEAR_KEY': 3, 'NEAR_382': 4, 'MONITORING': 5}
     results.sort(key=lambda x: (priority.get(x['signal'], 9), x['nearest_dist']))
     return results
+
+
+# ── SHORT SQUEEZE / LOW-FLOAT PUMP SCANNER ────────────────────────────────────
+# Findet Setups wie PAVS (+2300%) bevor oder genau wenn sie explodieren.
+# Signale: tiny float + hohe Short-Interest-Proxy + Volumen-Spike + Katalysator
+
+_squeeze_cache = {'data': [], 'ts': 0}
+
+def _squeeze_get_ticker_details(sym: str) -> dict:
+    """Polygon ticker details: market_cap, shares_outstanding, type."""
+    try:
+        url = f'https://api.polygon.io/v3/reference/tickers/{sym}?apiKey={API}'
+        d = poly_fetch(url)
+        r = d.get('results', {})
+        return {
+            'market_cap':   r.get('market_cap', 0) or 0,
+            'shares_out':   r.get('share_class_shares_outstanding', 0) or 0,
+            'type':         r.get('type', ''),
+            'locale':       r.get('locale', ''),
+            'sic_desc':     r.get('sic_description', ''),
+        }
+    except Exception:
+        return {}
+
+def _squeeze_get_news(sym: str) -> list:
+    """Alpaca + Polygon News für den Ticker (letzte 48h)."""
+    catalysts = []
+    cutoff = (datetime.now() - timedelta(hours=48)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    # Alpaca news
+    try:
+        url = (f'https://data.alpaca.markets/v1beta1/news?symbols={sym}'
+               f'&limit=5&start={cutoff}')
+        req = urllib.request.Request(url, headers={
+            'APCA-API-KEY-ID':     ALPACA_KEY,
+            'APCA-API-SECRET-KEY': ALPACA_SECRET,
+        })
+        with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+            items = json.loads(r.read()).get('news', [])
+        for n in items:
+            catalysts.append(n.get('headline', '')[:100])
+    except Exception:
+        pass
+    # Polygon news
+    try:
+        today    = datetime.now().strftime('%Y-%m-%d')
+        two_days = (datetime.now() - timedelta(days=2)).strftime('%Y-%m-%d')
+        url = (f'https://api.polygon.io/v2/reference/news?ticker={sym}'
+               f'&published_utc.gte={two_days}&limit=5&apiKey={API}')
+        d = poly_fetch(url)
+        for n in d.get('results', []):
+            t = n.get('title', '')[:100]
+            if t and t not in catalysts:
+                catalysts.append(t)
+    except Exception:
+        pass
+    # SEC EDGAR 8-K / 6-K (letzte 2 Tage)
+    try:
+        today    = datetime.now().strftime('%Y-%m-%d')
+        two_days = (datetime.now() - timedelta(days=2)).strftime('%Y-%m-%d')
+        url = (f'https://efts.sec.gov/LATEST/search-index?q=%22{sym}%22'
+               f'&dateRange=custom&startdt={two_days}&enddt={today}&forms=8-K,6-K,S-1')
+        req = urllib.request.Request(url,
+            headers={'User-Agent': 'hermes-scanner/3.0 yusufbruder@gmail.com'})
+        with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+            hits = json.loads(r.read()).get('hits', {}).get('hits', [])
+        for h in hits[:3]:
+            src = h.get('_source', {})
+            form = src.get('form_type', '')
+            entity = src.get('entity_name', sym)[:30]
+            catalysts.append(f'[SEC {form}] {entity}')
+    except Exception:
+        pass
+    return catalysts[:6]
+
+def _squeeze_score(sym: str, snap: dict) -> dict | None:
+    """
+    Berechnet Squeeze-Score fuer einen Ticker.
+    Gibt dict zurueck wenn score >= 3, sonst None.
+    """
+    try:
+        day   = snap.get('day', {})
+        prev  = snap.get('prevDay', {})
+        price = float(day.get('c') or 0)
+        pc    = float(prev.get('c') or price or 1)
+        vol   = int(day.get('v') or 0)
+        pvol  = int(prev.get('v') or 1)
+
+        if price <= 0 or pc <= 0:
+            return None
+
+        chg_pct    = round((price - pc) / pc * 100, 1)
+        vol_ratio  = round(vol / pvol, 1) if pvol > 0 else 0
+
+        # Nur Kandidaten die sich stark bewegen oder viel Volume haben
+        if chg_pct < 20 and vol_ratio < 5:
+            return None
+
+        details = _squeeze_get_ticker_details(sym)
+        mktcap  = details.get('market_cap', 0)
+        shares  = details.get('shares_out', 0)
+
+        # Maximal $100M Market Cap — groessere sind kein Squeeze-Ziel
+        if mktcap > 100_000_000 and mktcap != 0:
+            return None
+
+        score   = 0
+        reasons = []
+        signals = []
+
+        # 1) Preisveraenderung heute
+        if chg_pct >= 200:
+            score += 3; reasons.append(f'+{chg_pct}% heute (explodiert)')
+            signals.append('PUMP')
+        elif chg_pct >= 100:
+            score += 2; reasons.append(f'+{chg_pct}% heute (stark)')
+            signals.append('SURGE')
+        elif chg_pct >= 50:
+            score += 1; reasons.append(f'+{chg_pct}% heute')
+            signals.append('MOVER')
+        elif chg_pct >= 20:
+            score += 0; reasons.append(f'+{chg_pct}% heute (fruehes Signal)')
+            signals.append('EARLY')
+
+        # 2) Volumen-Spike
+        if vol_ratio >= 50:
+            score += 3; reasons.append(f'Vol {vol_ratio}x normal (EXTREM)')
+            signals.append('VOL_EXTREME')
+        elif vol_ratio >= 20:
+            score += 2; reasons.append(f'Vol {vol_ratio}x normal (sehr hoch)')
+            signals.append('VOL_HIGH')
+        elif vol_ratio >= 5:
+            score += 1; reasons.append(f'Vol {vol_ratio}x normal')
+            signals.append('VOL_SPIKE')
+
+        # 3) Tiny Float / Micro-Cap
+        if 0 < mktcap <= 5_000_000:
+            score += 3; reasons.append(f'Nano-Cap ${mktcap/1e6:.1f}M (Short-Squeeze Ziel!)')
+            signals.append('NANO_CAP')
+        elif 0 < mktcap <= 20_000_000:
+            score += 2; reasons.append(f'Micro-Cap ${mktcap/1e6:.1f}M')
+            signals.append('MICRO_CAP')
+        elif 0 < mktcap <= 100_000_000:
+            score += 1; reasons.append(f'Small-Cap ${mktcap/1e6:.0f}M')
+            signals.append('SMALL_CAP')
+
+        # 4) Sehr guenstige Shares Outstanding (tinier float = mehr Squeeze-Potenzial)
+        if 0 < shares <= 2_000_000:
+            score += 2; reasons.append(f'Float nur {shares/1e3:.0f}K Aktien (Squeeze-Risiko!)')
+            signals.append('TINY_FLOAT')
+        elif 0 < shares <= 10_000_000:
+            score += 1; reasons.append(f'Kleiner Float {shares/1e6:.1f}M Aktien')
+            signals.append('SMALL_FLOAT')
+
+        # 5) Guenstiger Preis (Pennystocks sind haefiger betroffen)
+        if price <= 1:
+            score += 1; reasons.append(f'Penny Stock ${price:.2f}')
+        elif price <= 5:
+            score += 1; reasons.append(f'Low Price ${price:.2f}')
+
+        # Minimum Score 2 um Katalysator zu pruefen
+        if score < 2:
+            return None
+
+        # 6) Katalysatoren (News, SEC Filing)
+        catalysts = _squeeze_get_news(sym)
+        if catalysts:
+            score += 2
+            reasons.append(f'Katalysator: {catalysts[0][:60]}')
+            signals.append('CATALYST')
+        else:
+            reasons.append('Kein Katalysator gefunden (reine Momentum)')
+
+        if score < 3:
+            return None
+
+        # Alert-Level bestimmen
+        if score >= 8:
+            alert_level = 'EXTREME'
+        elif score >= 6:
+            alert_level = 'HIGH'
+        elif score >= 4:
+            alert_level = 'MEDIUM'
+        else:
+            alert_level = 'LOW'
+
+        return {
+            'sym':         sym,
+            'price':       round(price, 4),
+            'prev_close':  round(pc, 4),
+            'chg_pct':     chg_pct,
+            'vol':         vol,
+            'vol_ratio':   vol_ratio,
+            'mktcap':      mktcap,
+            'shares_out':  shares,
+            'score':       score,
+            'alert_level': alert_level,
+            'signals':     signals,
+            'reasons':     reasons,
+            'catalysts':   catalysts,
+            'ts':          datetime.now().strftime('%H:%M:%S'),
+        }
+    except Exception:
+        return None
+
+
+def squeeze_scanner() -> list:
+    """
+    Short-Squeeze / Low-Float Pump Scanner.
+    Laedt Polygon Top-Gainers + alle Tickers mit hohem Volumen-Spike,
+    filtert auf Micro/Nano-Cap Kriterien, bewertet Squeeze-Potenzial.
+    Ergebnis wird gecacht (5 Minuten).
+    """
+    global _squeeze_cache
+    if time.time() - _squeeze_cache['ts'] < 300:
+        return _squeeze_cache['data']
+
+    candidates = {}
+
+    # Quelle 1: Polygon Top Gainers (heute)
+    try:
+        url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers?apiKey={API}'
+        d   = poly_fetch(url)
+        for t in d.get('tickers', [])[:50]:
+            sym = t.get('ticker', '')
+            if sym and 1 <= len(sym) <= 5:
+                candidates[sym] = t
+    except Exception:
+        pass
+
+    # Quelle 2: Alle Tickers im Universe mit Volume-Spike
+    try:
+        syms_str = ','.join(list(UNIVERSE)[:30])
+        url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?tickers={syms_str}&apiKey={API}'
+        d   = poly_fetch(url)
+        for t in d.get('tickers', []):
+            sym = t.get('ticker', '')
+            day  = t.get('day', {})
+            prev = t.get('prevDay', {})
+            vol  = int(day.get('v') or 0)
+            pvol = int(prev.get('v') or 1)
+            if sym and pvol > 0 and vol / pvol >= 5:
+                candidates[sym] = t
+    except Exception:
+        pass
+
+    results = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(_squeeze_score, sym, snap): sym
+                for sym, snap in list(candidates.items())[:60]}
+        for fut in as_completed(futs):
+            r = fut.result()
+            if r:
+                results.append(r)
+
+    # Sortierung: Score DESC, dann chg_pct DESC
+    results.sort(key=lambda x: (-x['score'], -x['chg_pct']))
+
+    _squeeze_cache = {'data': results, 'ts': time.time()}
+    return results
