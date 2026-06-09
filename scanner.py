@@ -3005,6 +3005,161 @@ def run_scan(progress_cb=None):
         'total':         len(universe),
         'time':          datetime.now().strftime('%Y-%m-%d %H:%M'),
         'today':         today,
-        'ibkr':          ibkr_raw,       # raw IBKR Bridge Daten (most_active, hot_options, ts)
+        'ibkr':          ibkr_raw,
         'ibkr_sources':  ['IBKR', 'Polygon', 'Alpaca'],
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIBONACCI SCANNER
+# ─────────────────────────────────────────────────────────────────────────────
+
+FIB_UNIVERSE = [
+    # ETFs / Indizes
+    'SPY','QQQ','IWM','DIA','GLD','SLV','GDX','GDXJ',
+    'XLF','XLK','XLE','XLC','XLI','XLP','ARKK','SMH',
+    # Mega-Caps
+    'NVDA','TSLA','AAPL','META','MSFT','AMZN','GOOGL','NFLX',
+    'AMD','AVGO','INTC','QCOM','MU','ORCL','CRM',
+    # High-Momentum / Trending
+    'ASTS','AXTI','NKE','PLTR','MSTR','COIN','HOOD',
+    'SOFI','RKLB','IONQ','QUBT','RGTI',
+    # Weitere Liquid Names
+    'BABA','NIO','XPEV','LI','FUTU','TIGR',
+    'JPM','BAC','GS','WMT','COST','MCD',
+]
+
+FIB_RATIOS = {
+    '23.6': 0.236,
+    '38.2': 0.382,
+    '50.0': 0.500,
+    '61.8': 0.618,
+    '78.6': 0.786,
+    '88.2': 0.882,
+}
+
+KEY_LEVELS = {'61.8', '78.6', '88.2'}
+
+
+def _fib_for_ticker(sym, lookback_days=60):
+    try:
+        from_d = (datetime.now() - timedelta(days=lookback_days + 10)).strftime('%Y-%m-%d')
+        to_d   = datetime.now().strftime('%Y-%m-%d')
+        data   = poly_fetch(
+            f'https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/day'
+            f'/{from_d}/{to_d}?adjusted=true&sort=asc&limit=80&apiKey={API}'
+        )
+        bars = data.get('results', [])
+        if len(bars) < 10:
+            return None
+
+        highs   = [b['h'] for b in bars]
+        lows    = [b['l'] for b in bars]
+        closes  = [b['c'] for b in bars]
+        vols    = [b.get('v', 0) for b in bars]
+
+        swing_high = max(highs)
+        swing_low  = min(lows)
+        current    = closes[-1]
+        prev_close = closes[-2] if len(closes) >= 2 else current
+        rng        = swing_high - swing_low
+        if rng <= 0 or current <= 0:
+            return None
+
+        # Volumen-Ratio (heute vs. 20-Tage-Schnitt)
+        avg_vol   = sum(vols[-20:]) / 20 if len(vols) >= 20 else sum(vols) / len(vols)
+        vol_ratio = round(vols[-1] / avg_vol, 2) if avg_vol > 0 else 1.0
+        chg_pct   = round((current - prev_close) / prev_close * 100, 2)
+
+        # Fibonacci-Levels berechnen: Retracement (von Hoch nach unten)
+        levels = {}
+        nearest_name  = None
+        nearest_dist  = 999.0
+        nearest_price = 0.0
+        nearest_dir   = ''
+
+        for name, ratio in FIB_RATIOS.items():
+            # Retracement: Preis faellt vom High zurueck
+            retrace_p = round(swing_high - rng * ratio, 4)
+            # Extension: Preis steigt vom Low aus
+            extend_p  = round(swing_low  + rng * ratio, 4)
+
+            dist_ret = abs(current - retrace_p) / current * 100
+            dist_ext = abs(current - extend_p)  / current * 100
+
+            if dist_ret <= dist_ext:
+                use_price = retrace_p
+                use_dist  = dist_ret
+                use_dir   = 'RETRACE'
+            else:
+                use_price = extend_p
+                use_dist  = dist_ext
+                use_dir   = 'EXTENSION'
+
+            levels[name] = {
+                'retrace':  retrace_p,
+                'extend':   extend_p,
+                'nearest':  use_price,
+                'dist_pct': round(use_dist, 3),
+                'dir':      use_dir,
+            }
+
+            if use_dist < nearest_dist:
+                nearest_dist  = use_dist
+                nearest_name  = name
+                nearest_price = use_price
+                nearest_dir   = use_dir
+
+        at_level  = nearest_dist < 0.5
+        near_key  = nearest_name in KEY_LEVELS and nearest_dist < 1.5
+        near_882  = nearest_name == '88.2' and nearest_dist < 2.0
+
+        # Bounce-Signal: Preis steigt an einem Unterstuetzungs-Level
+        bounce    = chg_pct > 0 and at_level
+        rejection = chg_pct < 0 and at_level
+
+        return {
+            'sym':           sym,
+            'price':         round(current, 4),
+            'chg_pct':       chg_pct,
+            'swing_high':    round(swing_high, 4),
+            'swing_low':     round(swing_low, 4),
+            'range':         round(rng, 4),
+            'nearest_fib':   nearest_name,
+            'nearest_price': round(nearest_price, 4),
+            'nearest_dist':  round(nearest_dist, 3),
+            'nearest_dir':   nearest_dir,
+            'vol_ratio':     vol_ratio,
+            'levels':        levels,
+            'at_level':      at_level,
+            'near_key':      near_key,
+            'near_882':      near_882,
+            'bounce':        bounce,
+            'rejection':     rejection,
+            'signal': (
+                'AT_882'      if nearest_name == '88.2' and at_level else
+                'AT_618'      if nearest_name == '61.8' and at_level else
+                'AT_786'      if nearest_name == '78.6' and at_level else
+                'NEAR_KEY'    if near_key else
+                'NEAR_382'    if nearest_name == '38.2' and nearest_dist < 1.5 else
+                'MONITORING'
+            ),
+        }
+    except Exception:
+        return None
+
+
+def fibonacci_scan(max_workers=10):
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_fib_for_ticker, sym): sym for sym in FIB_UNIVERSE}
+        for fut in as_completed(futures):
+            r = fut.result()
+            if r:
+                results.append(r)
+
+    # Sortierung: AT_LEVEL zuerst, dann KEY_LEVEL, dann Distanz
+    priority = {'AT_882': 0, 'AT_618': 1, 'AT_786': 2,
+                'NEAR_KEY': 3, 'NEAR_382': 4, 'MONITORING': 5}
+    results.sort(key=lambda x: (priority.get(x['signal'], 9), x['nearest_dist']))
+    return results

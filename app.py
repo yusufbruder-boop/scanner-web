@@ -1990,6 +1990,25 @@ body { background: #0a0e1a; color: #e0e6f0; font-family: -apple-system, BlinkMac
 .tab-btn { flex:1; padding:9px 0; font-size:12px; font-weight:700; letter-spacing:1px; border:none; background:transparent; cursor:pointer; color:#4a6a8a; border-bottom:2px solid transparent; transition:all 0.2s; }
 .tab-btn.active { color:#4db8ff; border-bottom-color:#4db8ff; background:rgba(77,184,255,0.06); }
 .tab-btn.intel.active { color:#b070ff; border-bottom-color:#b070ff; background:rgba(176,112,255,0.06); }
+.tab-btn.fib         { color:#4a6a8a; }
+.tab-btn.fib.active  { color:#4dffaa; border-bottom-color:#4dffaa; background:rgba(77,255,170,0.06); }
+.fib-card { background:#0d1f17; border:1px solid #1a3a25; border-radius:8px; padding:10px 12px; margin-bottom:8px; }
+.fib-card.at-level  { border-color:#4dff88; box-shadow:0 0 8px rgba(77,255,136,0.15); }
+.fib-card.near-key  { border-color:#ffd700; }
+.fib-card.near-882  { border-color:#ff6b35; box-shadow:0 0 8px rgba(255,107,53,0.2); }
+.fib-sym  { font-size:15px; font-weight:700; color:#e0e0e0; }
+.fib-price{ font-size:13px; color:#4db8ff; font-weight:600; }
+.fib-level-badge { display:inline-block; padding:2px 7px; border-radius:4px; font-size:11px; font-weight:700; margin-right:4px; }
+.badge-882 { background:#ff6b35; color:#fff; }
+.badge-618 { background:#ffd700; color:#000; }
+.badge-786 { background:#ff9500; color:#000; }
+.badge-500 { background:#4db8ff; color:#000; }
+.badge-382 { background:#2a5a8a; color:#fff; }
+.badge-236 { background:#1a3a5a; color:#fff; }
+.fib-bar  { height:6px; background:#0a1a12; border-radius:3px; margin:8px 0 4px; position:relative; overflow:visible; }
+.fib-bar-fill { height:100%; border-radius:3px; background:linear-gradient(90deg,#1a4a2a,#4dff88); }
+.fib-marker { position:absolute; top:-4px; width:2px; height:14px; background:#ffd700; }
+.fib-section-title { color:#4a6a8a; font-size:10px; letter-spacing:1px; text-transform:uppercase; padding:8px 8px 4px; }
 .tab-pane { display:none; }
 .tab-pane.active { display:block; }
 .scan-btn { display: block; width: calc(100% - 32px); margin: 14px 16px 0; padding: 13px; background: linear-gradient(135deg, #1a6b3c, #0d4a28); color: #4dff91; font-size: 15px; font-weight: bold; border: 1px solid #2d9e57; border-radius: 10px; cursor: pointer; text-align: center; letter-spacing: 1px; }
@@ -2067,6 +2086,7 @@ body { background: #0a0e1a; color: #e0e6f0; font-family: -apple-system, BlinkMac
   <div class="tabs">
     <button class="tab-btn active"      id="tab1Btn" onclick="showTab(1)">📊 SCANNER</button>
     <button class="tab-btn intel"       id="tab2Btn" onclick="showTab(2)">🔍 INTEL</button>
+    <button class="tab-btn fib"         id="tab3Btn" onclick="showTab(3)">📐 FIB</button>
   </div>
 </div>
 
@@ -2093,6 +2113,21 @@ body { background: #0a0e1a; color: #e0e6f0; font-family: -apple-system, BlinkMac
     <div class="empty" style="padding:20px 16px">
       Intel-Daten werden nach dem Scan geladen...<br>
       <span style="color:#4a6a8a;font-size:12px">Reddit/Stocktwits KI-Score, Hedge Fund 13F, Leopold Aschenbrenner</span>
+    </div>
+  </div>
+</div>
+
+<div id="tab3" style="display:none">
+  <div style="padding:12px 8px 6px">
+    <button onclick="loadFibScan()" style="background:linear-gradient(135deg,#1a3a2a,#0d2a1a);border:1px solid #2a6a3a;color:#4dff88;padding:9px 22px;border-radius:6px;font-size:12px;font-weight:700;letter-spacing:1px;cursor:pointer;width:100%">
+      FIBONACCI SCAN STARTEN
+    </button>
+  </div>
+  <div id="fib-status" style="text-align:center;color:#4a6a8a;font-size:11px;padding:4px 8px"></div>
+  <div id="fib-content">
+    <div class="empty" style="padding:20px 16px">
+      Fibonacci Scanner — 88.2% / 61.8% / 78.6% Level-Erkennung<br>
+      <span style="color:#4a6a8a;font-size:12px">SPY, QQQ, Gold, Silver, Stocks — alle Instrumente auf einen Blick</span>
     </div>
   </div>
 </div>
@@ -3021,11 +3056,128 @@ let _lastData = null;
 function showTab(n) {
   document.getElementById('tab1').style.display = n === 1 ? 'block' : 'none';
   document.getElementById('tab2').style.display = n === 2 ? 'block' : 'none';
+  document.getElementById('tab3').style.display = n === 3 ? 'block' : 'none';
   document.getElementById('tab1Btn').classList.toggle('active', n === 1);
   document.getElementById('tab2Btn').classList.toggle('active', n === 2);
+  document.getElementById('tab3Btn').classList.toggle('active', n === 3);
   if (n === 2 && _lastData) {
     document.getElementById('intel-content').innerHTML = renderTab2(_lastData) || '<div class="empty">Wird nach Scan geladen...</div>';
   }
+}
+
+// ── FIBONACCI SCANNER ────────────────────────────────────────────────────────
+function loadFibScan() {
+  document.getElementById('fib-status').innerHTML = 'Scanne alle Instrumente... (15-30s)';
+  document.getElementById('fib-content').innerHTML = '<div class="empty" style="padding:30px">Berechne Fibonacci-Levels...</div>';
+  fetch('/fib-scan')
+    .then(r => r.json())
+    .then(d => {
+      document.getElementById('fib-status').innerHTML =
+        d.count + ' Instrumente gescannt &nbsp;|&nbsp; ' + (d.time||'');
+      document.getElementById('fib-content').innerHTML = renderFibResults(d.results || []);
+    })
+    .catch(e => {
+      document.getElementById('fib-status').innerHTML = 'Fehler: ' + e;
+    });
+}
+
+const FIB_COLORS = {'88.2':'badge-882','78.6':'badge-786','61.8':'badge-618',
+                    '50.0':'badge-500','38.2':'badge-382','23.6':'badge-236'};
+const FIB_NAMES  = {'88.2':'88.2%','78.6':'78.6%','61.8':'61.8% (Golden)',
+                    '50.0':'50.0%','38.2':'38.2%','23.6':'23.6%'};
+const SIG_LABELS = {
+  'AT_882':   ['AT 88.2%',   '#ff6b35'],
+  'AT_618':   ['AT 61.8%',   '#ffd700'],
+  'AT_786':   ['AT 78.6%',   '#ff9500'],
+  'NEAR_KEY': ['KEY LEVEL',  '#4dffaa'],
+  'NEAR_382': ['NEAR 38.2%', '#4db8ff'],
+  'MONITORING':['MONITORING','#4a6a8a'],
+};
+
+function renderFibResults(results) {
+  if (!results.length) return '<div class="empty">Keine Ergebnisse</div>';
+
+  // Gruppen
+  const at882   = results.filter(r => r.signal === 'AT_882');
+  const at618   = results.filter(r => r.signal === 'AT_618');
+  const at786   = results.filter(r => r.signal === 'AT_786');
+  const nearKey = results.filter(r => r.signal === 'NEAR_KEY');
+  const others  = results.filter(r => !['AT_882','AT_618','AT_786','NEAR_KEY'].includes(r.signal));
+
+  let html = '';
+
+  function cardGroup(title, items, color) {
+    if (!items.length) return '';
+    let h = '<div class="fib-section-title" style="color:' + color + '">' + title + ' (' + items.length + ')</div>';
+    items.forEach(r => { h += fibCard(r); });
+    return h;
+  }
+
+  html += cardGroup('AT 88.2% — DEEP RETRACE (KEY ENTRY)', at882, '#ff6b35');
+  html += cardGroup('AT 61.8% — GOLDEN RATIO', at618, '#ffd700');
+  html += cardGroup('AT 78.6% — STRONG RETRACE', at786, '#ff9500');
+  html += cardGroup('NEAR KEY LEVEL (61.8 / 78.6 / 88.2)', nearKey, '#4dffaa');
+  html += cardGroup('ALLE ANDEREN', others, '#4a6a8a');
+
+  return html;
+}
+
+function fibCard(r) {
+  const sig      = r.signal || 'MONITORING';
+  const sigInfo  = SIG_LABELS[sig] || ['?','#4a6a8a'];
+  const chgCls   = r.chg_pct >= 0 ? 'pct-pos' : 'pct-neg';
+  const chgStr   = (r.chg_pct >= 0 ? '+' : '') + (r.chg_pct||0).toFixed(2) + '%';
+  const cardCls  = r.at_level ? 'at-level' : (r.near_882 ? 'near-882' : (r.near_key ? 'near-key' : ''));
+  const nearFib  = r.nearest_fib || '—';
+  const nearBadge = FIB_COLORS[nearFib] || 'badge-236';
+  const nearName  = FIB_NAMES[nearFib]  || nearFib;
+  const dist      = r.nearest_dist != null ? r.nearest_dist.toFixed(2) : '?';
+  const distCol   = r.nearest_dist < 0.5 ? '#4dff88' : (r.nearest_dist < 1.5 ? '#ffd700' : '#4a6a8a');
+  const volStr    = r.vol_ratio != null ? (r.vol_ratio > 1.5 ? ' VOL x' + r.vol_ratio : '') : '';
+  const bounce    = r.bounce    ? ' BOUNCE' : '';
+  const reject    = r.rejection ? ' REJECTION' : '';
+
+  // Level-Bar: zeige Preis relativ zu Swing-High/Low
+  const rng     = (r.swing_high - r.swing_low) || 1;
+  const fillPct = Math.max(0, Math.min(100, (r.price - r.swing_low) / rng * 100));
+
+  // Marker-Positionen fuer die Fib-Levels
+  let markers = '';
+  if (r.levels) {
+    Object.entries(r.levels).forEach(([name, lv]) => {
+      const mp = Math.max(0, Math.min(100, (lv.nearest - r.swing_low) / rng * 100));
+      const mc = FIB_COLORS[name] ? (name === '88.2' ? '#ff6b35' : name === '61.8' ? '#ffd700' : '#aaa') : '#555';
+      markers += '<div class="fib-marker" style="left:' + mp + '%;background:' + mc + '" title="' + name + '%: ' + lv.nearest + '"></div>';
+    });
+  }
+
+  return '<div class="fib-card ' + cardCls + '">' +
+    '<div style="display:flex;justify-content:space-between;align-items:center">' +
+      '<span class="fib-sym">' + r.sym + '</span>' +
+      '<span style="font-size:11px;background:' + sigInfo[1] + ';color:' + (sig==='AT_618'||sig==='AT_786'?'#000':'#fff') + ';padding:2px 7px;border-radius:4px;font-weight:700">' + sigInfo[0] + '</span>' +
+    '</div>' +
+    '<div style="display:flex;align-items:center;gap:10px;margin:4px 0">' +
+      '<span class="fib-price">$' + (r.price||0).toFixed(2) + '</span>' +
+      '<span class="' + chgCls + '" style="font-size:12px">' + chgStr + '</span>' +
+      (volStr ? '<span style="color:#ff9500;font-size:11px">' + volStr + '</span>' : '') +
+      (bounce  ? '<span style="color:#4dff88;font-size:11px">BOUNCE</span>'   : '') +
+      (reject  ? '<span style="color:#ff4444;font-size:11px">REJECTION</span>' : '') +
+    '</div>' +
+    '<div style="margin:4px 0">' +
+      '<span class="fib-level-badge ' + nearBadge + '">' + nearName + '</span>' +
+      '<span style="color:' + distCol + ';font-size:11px">Abstand: ' + dist + '%</span>' +
+      '<span style="color:#4a6a8a;font-size:10px;margin-left:8px">' + (r.nearest_dir||'') + '</span>' +
+    '</div>' +
+    '<div class="fib-bar">' +
+      '<div class="fib-bar-fill" style="width:' + fillPct.toFixed(1) + '%"></div>' +
+      markers +
+    '</div>' +
+    '<div style="display:flex;justify-content:space-between;font-size:10px;color:#2a4a3a">' +
+      '<span>LOW ' + (r.swing_low||0).toFixed(2) + '</span>' +
+      '<span style="color:#4a6a8a">Range: ' + (r.range||0).toFixed(2) + '</span>' +
+      '<span>HIGH ' + (r.swing_high||0).toFixed(2) + '</span>' +
+    '</div>' +
+  '</div>';
 }
 
 let _autoTradeOn = false;
@@ -4488,6 +4640,17 @@ def hermes_trigger():
         return jsonify({'ok': False, 'msg': 'Keine Scan-Ergebnisse vorhanden'})
     state['hermes_force'] = True
     return jsonify({'ok': True, 'msg': 'Hermes wird beim nächsten Tick gestartet (<30s)'})
+
+
+@app.route('/fib-scan')
+def fib_scan():
+    from scanner import fibonacci_scan
+    try:
+        results = fibonacci_scan()
+        return jsonify({'results': results, 'count': len(results),
+                        'time': datetime.now().strftime('%Y-%m-%d %H:%M')})
+    except Exception as e:
+        return jsonify({'error': str(e), 'results': []}), 500
 
 
 @app.route('/hermes/alerts')
