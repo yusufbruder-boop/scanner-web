@@ -338,7 +338,7 @@ def analyze_social_smart_money(trending_list: list) -> list:
 
         # 1) Options Snapshot
         try:
-            opt = poly_fetch(f'https://api.polygon.io/v3/snapshot/options/{sym}?limit=200&apiKey={API}')
+            opt = {'results': []}  # Options-API deaktiviert (kein Polygon-Abo)
             res = opt.get('results', [])
             if res:
                 sm_data['price'] = res[0].get('underlying_asset', {}).get('price', 0)
@@ -851,7 +851,7 @@ def get_market_context() -> dict:
 
     # Makro-Event aus Polygon News (Jobs, CPI, Fed, Yields)
     try:
-        news = poly_fetch(f'https://api.polygon.io/v2/reference/news?limit=10&apiKey={API}')
+        news = {'results': get_alpaca_market_news(limit=10)}
         MACRO_KEYS = {
             'nonfarm': ('NFP / Jobs-Daten', 5), 'jobs report': ('Jobs-Bericht', 5),
             'employment': ('Jobsdaten', 4), 'cpi': ('CPI Inflation', 5),
@@ -935,8 +935,7 @@ def get_earnings_calendar_polygon(tickers: list) -> dict:
     cutoff = (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
     for t in tickers[:20]:
         try:
-            url = f'https://api.polygon.io/vX/reference/financials?ticker={t}&limit=1&apiKey={API}'
-            d = poly_fetch(url)
+            d = {'results': []}  # Polygon Financials deaktiviert
             for r in d.get('results', []):
                 ed = r.get('end_date', '')
                 if today <= ed <= cutoff:
@@ -958,8 +957,7 @@ def get_market_sentiment() -> dict:
     per_sym = {}
 
     def _fetch_vol(sym, ctype):
-        url = f'https://api.polygon.io/v3/snapshot/options/{sym}?limit=250&contract_type={ctype}&apiKey={API}'
-        d = poly_fetch(url)
+        d = {'results': []}  # Options-API deaktiviert
         return sum(r['day'].get('volume', 0) for r in d.get('results', []))
 
     try:
@@ -1022,10 +1020,7 @@ def get_darkpool_signal(ticker: str, today: str) -> dict:
     Dark pool conditions: 37=Large Block, 41=OTC/Dark Pool, 20, 29, 80, 81.
     """
     try:
-        start = f'{today}T13:30:00Z'
-        url   = (f'https://api.polygon.io/v3/trades/{ticker}'
-                 f'?timestamp.gte={start}&order=asc&limit=500&apiKey={API}')
-        data   = poly_fetch(url)
+        data = {'results': []}  # Dark Pool API deaktiviert
         trades = data.get('results', [])
         if not trades:
             return {}
@@ -1110,7 +1105,7 @@ def get_mag7_market_signal() -> dict:
 
     def _check_one(sym):
         try:
-            opt = poly_fetch(f'https://api.polygon.io/v3/snapshot/options/{sym}?limit=200&apiKey={API}')
+            opt = {'results': []}  # Options-API deaktiviert (kein Polygon-Abo)
             res = opt.get('results', [])
             if not res:
                 return None
@@ -1328,25 +1323,38 @@ def get_alpaca_news(tickers: list, limit: int = 5) -> list:
 
 # ── Polygon Top Movers (Gainers/Losers — 24/7) ───────────────────────────────
 def get_market_movers() -> list:
-    """Polygon Gainers + Losers — direkt aus Polygon-Abo, läuft 24/7."""
+    """Yahoo Finance Gainers — ersetzt Polygon Gainers/Losers."""
     movers = []
-    for direction, label in [('gainers', 'Gainer'), ('losers', 'Loser')]:
-        try:
-            url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/{direction}?apiKey={API}'
-            data = poly_fetch(url)
-            for t in data.get('tickers', [])[:15]:
-                sym  = t.get('ticker', '')
-                day  = t.get('day', {})
-                prev = t.get('prevDay', {})
-                price = float(day.get('c') or 0)
-                pc    = float(prev.get('c') or price)
-                chg   = round((price - pc) / pc * 100, 1) if pc else 0
-                vol   = int(day.get('v') or 0)
-                if sym and 2 <= len(sym) <= 5 and abs(chg) >= 2:
-                    movers.append({'sym': sym, 'chg': chg, 'price': round(price, 2),
-                                   'vol': vol, 'label': label})
-        except Exception:
-            pass
+    try:
+        for t in al_top_gainers(limit=15):
+            sym   = t.get('ticker', '')
+            price = float(t['day'].get('c') or 0)
+            prev  = float(t['prevDay'].get('c') or price or 1)
+            chg   = round((price - prev) / prev * 100, 1) if prev else 0
+            vol   = int(t['day'].get('v') or 0)
+            if sym and 2 <= len(sym) <= 5 and abs(chg) >= 2:
+                movers.append({'sym': sym, 'chg': chg, 'price': round(price, 2),
+                               'vol': vol, 'label': 'Gainer'})
+    except Exception:
+        pass
+    # Losers: Alpaca snapshot auf UNIVERSE sortiert nach change
+    try:
+        snaps = get_alpaca_snapshot(list(UNIVERSE)[:40])
+        losers = []
+        for sym, snap in snaps.items():
+            dbar  = snap.get('dailyBar', {})
+            pbar  = snap.get('prevDailyBar', {})
+            price = float(dbar.get('c') or 0)
+            prev  = float(pbar.get('c') or price or 1)
+            chg   = round((price - prev) / prev * 100, 1) if prev else 0
+            vol   = int(dbar.get('v') or 0)
+            if price > 0 and chg <= -3:
+                losers.append({'sym': sym, 'chg': chg, 'price': round(price, 2),
+                               'vol': vol, 'label': 'Loser'})
+        losers.sort(key=lambda x: x['chg'])
+        movers.extend(losers[:15])
+    except Exception:
+        pass
     return movers
 
 
@@ -1364,30 +1372,43 @@ def hermes_24h_scan() -> list:
     from_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     signals   = []
 
-    # 1) Polygon Gainers + Losers (Top-Mover 24h)
+    # 1) Yahoo Finance Gainers + Alpaca Snapshot fuer Losers (ersetzt Polygon)
     candidates = {}
-    for direction in ['gainers', 'losers']:
-        try:
-            url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/{direction}?apiKey={API}'
-            d   = poly_fetch(url)
-            for t in d.get('tickers', [])[:50]:
-                sym   = t.get('ticker', '')
-                day   = t.get('day', {})
-                prev  = t.get('prevDay', {})
-                price = float(day.get('c') or 0)
-                pc    = float(prev.get('c') or price or 1)
-                chg   = round((price - pc) / pc * 100, 1) if pc else 0
-                vol   = int(day.get('v') or 0)
-                pvol  = int(prev.get('v') or 1)
-                vol_ratio = round(vol / pvol, 1) if pvol else 0
-                if sym and 2 <= len(sym) <= 6 and price >= 5:
-                    candidates[sym] = {
-                        'sym': sym, 'price': price, 'chg': chg,
-                        'vol': vol, 'vol_ratio': vol_ratio,
-                        'direction': direction, 'score': 0, 'reasons': []
-                    }
-        except Exception:
-            pass
+    try:
+        for t in al_top_gainers(limit=50):
+            sym   = t.get('ticker', '')
+            price = float(t['day'].get('c') or 0)
+            pc    = float(t['prevDay'].get('c') or price or 1)
+            chg   = round((price - pc) / pc * 100, 1) if pc else 0
+            vol   = int(t['day'].get('v') or 0)
+            if sym and 2 <= len(sym) <= 6 and price >= 5:
+                candidates[sym] = {
+                    'sym': sym, 'price': price, 'chg': chg,
+                    'vol': vol, 'vol_ratio': 0,
+                    'direction': 'gainers', 'score': 0, 'reasons': []
+                }
+    except Exception:
+        pass
+    try:
+        snaps = get_alpaca_snapshot(list(UNIVERSE)[:40])
+        for sym, snap in snaps.items():
+            dbar  = snap.get('dailyBar', {})
+            pbar  = snap.get('prevDailyBar', {})
+            price = float(dbar.get('c') or 0)
+            pc    = float(pbar.get('c') or price or 1)
+            chg   = round((price - pc) / pc * 100, 1) if pc else 0
+            vol   = int(dbar.get('v') or 0)
+            pvol  = int(pbar.get('v') or 1)
+            vol_ratio = round(vol / pvol, 1) if pvol else 0
+            if price >= 5 and (abs(chg) >= 3 or vol_ratio >= 3) and sym not in candidates:
+                candidates[sym] = {
+                    'sym': sym, 'price': price, 'chg': chg,
+                    'vol': vol, 'vol_ratio': vol_ratio,
+                    'direction': 'losers' if chg < 0 else 'gainers',
+                    'score': 0, 'reasons': []
+                }
+    except Exception:
+        pass
 
     # 2) Für jeden Kandidaten: Options Vol/OI + Dark Pool + News checken
     def _check_24h(sym, info):
@@ -1421,7 +1442,7 @@ def hermes_24h_scan() -> list:
 
         # Options Vol/OI Anomalie
         try:
-            opt = poly_fetch(f'https://api.polygon.io/v3/snapshot/options/{sym}?limit=100&apiKey={API}')
+            opt = {'results': []}  # Options-API deaktiviert
             res = opt.get('results', [])
             if res:
                 calls = [r for r in res if r['details']['contract_type'] == 'call']
@@ -1463,7 +1484,7 @@ def hermes_24h_scan() -> list:
 
         # Polygon News letzte 24h
         try:
-            nd = poly_fetch(f'https://api.polygon.io/v2/reference/news?ticker={sym}&limit=3&apiKey={API}')
+            nd = {'results': al_news_for_sym(sym, limit=3)}
             cutoff = (datetime.now() - timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ')
             for n in nd.get('results', []):
                 if n.get('published_utc', '') >= cutoff:
@@ -1628,7 +1649,7 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
         put_sweeps_n  = 0
         pc_ratio      = None
         try:
-            opt = poly_fetch(f'https://api.polygon.io/v3/snapshot/options/{ticker}?limit=100&apiKey={API}')
+            opt = {'results': []}  # Options-API deaktiviert
             res = opt.get('results', [])
             if res:
                 price_from_opt = res[0].get('underlying_asset', {}).get('price', 0)
@@ -1682,7 +1703,7 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
         try:
             from_d = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
             to_d   = datetime.now().strftime('%Y-%m-%d')
-            bars_d = poly_fetch(f'https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{from_d}/{to_d}?adjusted=true&limit=25&apiKey={API}')
+            bars_d = al_bars(ticker, from_d, to_d, limit=25)
             bars   = bars_d.get('results', [])
             curr_p = float(price_from_opt or live_price_al or 0)
             if len(bars) >= 2:
@@ -1706,7 +1727,7 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
 
         # 4) Polygon News (letzte 4h)
         try:
-            nd  = poly_fetch(f'https://api.polygon.io/v2/reference/news?ticker={ticker}&limit=5&apiKey={API}')
+            nd  = {'results': al_news_for_sym(ticker, limit=5)}
             cut = (datetime.now() - timedelta(hours=4)).strftime('%Y-%m-%dT%H:%M:%SZ')
             for n in nd.get('results', []):
                 if n.get('published_utc', '') < cut:
@@ -1841,13 +1862,93 @@ def poly_fetch(url, retries=2):
             if '429' in str(e) or 'Too Many' in str(e):
                 time.sleep(5)
             if attempt >= retries:
-                raise
+                return {'results': [], 'tickers': []}   # statt raise — lautlos bei Polygon-Fehler
+
+
+# ── Alpaca Data Helpers (ersetzen Polygon wenn Abo abgelaufen) ─────────────────
+
+def _al_hdrs():
+    return {'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET,
+            'User-Agent': 'HermesScanner/3.0'}
+
+def al_bars(sym: str, from_d: str, to_d: str, limit: int = 80) -> dict:
+    """Alpaca Daily Bars — ersetzt Polygon aggs/ticker/{sym}/range/1/day.
+    Gibt {'results': [...]} mit Keys o,h,l,c,v zurueck."""
+    if not (ALPACA_KEY and ALPACA_SECRET):
+        return {'results': []}
+    try:
+        url = (f'https://data.alpaca.markets/v2/stocks/{sym}/bars'
+               f'?timeframe=1Day&start={from_d}&end={to_d}&limit={limit}'
+               f'&adjustment=all&feed=iex')
+        req = urllib.request.Request(url, headers=_al_hdrs())
+        with urllib.request.urlopen(req, context=ctx, timeout=12) as r:
+            bars = json.loads(r.read()).get('bars', [])
+        return {'results': [{'t': b['t'], 'o': b['o'], 'h': b['h'],
+                              'l': b['l'], 'c': b['c'], 'v': b.get('v', 0)} for b in bars]}
+    except Exception:
+        return {'results': []}
+
+def al_ticker_details(sym: str) -> dict:
+    """Yahoo Finance Market Cap + Shares — ersetzt Polygon reference/tickers/{sym}."""
+    try:
+        url = (f'https://query1.finance.yahoo.com/v10/finance/quoteSummary/{sym}'
+               f'?modules=summaryDetail,defaultKeyStatistics')
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+            d = json.loads(r.read())
+        res = d.get('quoteSummary', {}).get('result', [{}])[0]
+        sd  = res.get('summaryDetail', {})
+        ks  = res.get('defaultKeyStatistics', {})
+        return {
+            'market_cap': (sd.get('marketCap') or {}).get('raw', 0) or 0,
+            'shares_out': (ks.get('sharesOutstanding') or {}).get('raw', 0) or 0,
+            'type': 'CS', 'locale': 'us', 'sic_desc': '',
+        }
+    except Exception:
+        return {'market_cap': 0, 'shares_out': 0, 'type': 'CS', 'locale': 'us', 'sic_desc': ''}
+
+def al_news_for_sym(sym: str, limit: int = 5) -> list:
+    """Alpaca News fuer Ticker — ersetzt Polygon reference/news?ticker={sym}."""
+    if not (ALPACA_KEY and ALPACA_SECRET):
+        return []
+    try:
+        cutoff = (datetime.now() - timedelta(hours=48)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        url = (f'https://data.alpaca.markets/v1beta1/news'
+               f'?symbols={sym}&limit={limit}&start={cutoff}&sort=desc')
+        req = urllib.request.Request(url, headers=_al_hdrs())
+        with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+            return json.loads(r.read()).get('news', [])
+    except Exception:
+        return []
+
+def al_top_gainers(limit: int = 50) -> list:
+    """Yahoo Finance Top Gainers — ersetzt Polygon gainers endpoint.
+    Gibt Polygon-kompatible Liste {'ticker':..,'day':{'c':..,'v':..},'prevDay':{'c':..}} zurueck."""
+    results = []
+    try:
+        url = (f'https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved'
+               f'?formatted=false&scrIds=day_gainers&count={limit}')
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+            quotes = json.loads(r.read()).get('finance', {}).get('result', [{}])[0].get('quotes', [])
+        for q in quotes:
+            sym  = q.get('symbol', '').split('.')[0].split('-')[0]
+            price = float(q.get('regularMarketPrice', 0) or 0)
+            prev  = float(q.get('regularMarketPreviousClose', price) or price)
+            vol   = int(q.get('regularMarketVolume', 0) or 0)
+            if sym and price > 0 and 1 <= len(sym) <= 5:
+                results.append({'ticker': sym,
+                                 'day':    {'c': price, 'v': vol},
+                                 'prevDay': {'c': prev}})
+    except Exception:
+        pass
+    return results
+
 
 def get_earnings_soon(ticker):
     """Prüft ob Earnings in den nächsten 10 Tagen. Gibt (datum, tage) zurück oder None."""
     try:
-        url = f'https://api.polygon.io/vX/reference/financials?ticker={ticker}&limit=1&apiKey={API}'
-        d = poly_fetch(url)
+        d = {'results': []}  # Polygon Financials deaktiviert
         for r in d.get('results', []):
             fd = r.get('fiscal_period_description', '')
             # Polygon hat kein direktes earnings date — nutze SEC filing date als Näherung
@@ -2021,7 +2122,7 @@ def hermes_afterhours_scan(extra_tickers: list = None) -> dict:
 
         # 1) Options Flow (kompletter Tages-Flow)
         try:
-            opt = poly_fetch(f'https://api.polygon.io/v3/snapshot/options/{ticker}?limit=200&apiKey={API}')
+            opt = {'results': []}  # Options-API deaktiviert
             res = opt.get('results', [])
             if not res:
                 return None
@@ -2115,7 +2216,7 @@ def hermes_afterhours_scan(extra_tickers: list = None) -> dict:
 
         # 3) News (letzte 24h)
         try:
-            nd = poly_fetch(f'https://api.polygon.io/v2/reference/news?ticker={ticker}&limit=5&apiKey={API}')
+            nd = {'results': al_news_for_sym(ticker, limit=5)}
             for n in nd.get('results', []):
                 if n.get('published_utc', '') < news_cut:
                     continue
@@ -2202,7 +2303,7 @@ def hermes_afterhours_scan(extra_tickers: list = None) -> dict:
 
 def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
     try:
-        opt = poly_fetch(f'https://api.polygon.io/v3/snapshot/options/{ticker}?limit=250&apiKey={API}')
+        opt = {'results': []}  # Options-API deaktiviert
         res = opt.get('results', [])
         if not res:
             return None
@@ -2226,13 +2327,9 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         # Smart Money Positionierung — Vol/OI Anomalien + Expected Move
         sm = get_smart_money_signals(res, price, today)
 
-        # Polygon Aggregates — immer aktuelle Tages-OHLCV Daten (kein yfinance)
         from_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
         to_date   = datetime.now().strftime('%Y-%m-%d')
-        agg = poly_fetch(
-            f'https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day'
-            f'/{from_date}/{to_date}?adjusted=true&sort=asc&limit=25&apiKey={API}'
-        )
+        agg  = al_bars(ticker, from_date, to_date, limit=25)
         bars = agg.get('results', [])
         if not bars or len(bars) < 3:
             return None
@@ -2330,7 +2427,7 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         dp_thread.start()
 
         # Polygon News — mit HIGH/EXTREME Impact Erkennung
-        news_data = poly_fetch(f'https://api.polygon.io/v2/reference/news?ticker={ticker}&limit=10&apiKey={API}')
+        news_data = {'results': al_news_for_sym(ticker, limit=10)}
         katalysator = 'KEIN'
         katalysator_strength = 'NORMAL'  # NORMAL / HIGH / EXTREME
         kat_text = kat_url = ''
@@ -3045,10 +3142,7 @@ def _fib_for_ticker(sym, lookback_days=60):
     try:
         from_d = (datetime.now() - timedelta(days=lookback_days + 10)).strftime('%Y-%m-%d')
         to_d   = datetime.now().strftime('%Y-%m-%d')
-        data   = poly_fetch(
-            f'https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/day'
-            f'/{from_d}/{to_d}?adjusted=true&sort=asc&limit=80&apiKey={API}'
-        )
+        data = al_bars(sym, from_d, to_d, limit=80)
         bars = data.get('results', [])
         if len(bars) < 10:
             return None
@@ -3174,20 +3268,8 @@ def fibonacci_scan(max_workers=4):
 _squeeze_cache = {'data': [], 'ts': 0}
 
 def _squeeze_get_ticker_details(sym: str) -> dict:
-    """Polygon ticker details: market_cap, shares_outstanding, type."""
-    try:
-        url = f'https://api.polygon.io/v3/reference/tickers/{sym}?apiKey={API}'
-        d = poly_fetch(url)
-        r = d.get('results', {})
-        return {
-            'market_cap':   r.get('market_cap', 0) or 0,
-            'shares_out':   r.get('share_class_shares_outstanding', 0) or 0,
-            'type':         r.get('type', ''),
-            'locale':       r.get('locale', ''),
-            'sic_desc':     r.get('sic_description', ''),
-        }
-    except Exception:
-        return {}
+    """Yahoo Finance market_cap + shares — ersetzt Polygon reference/tickers."""
+    return al_ticker_details(sym)
 
 def _squeeze_get_news(sym: str) -> list:
     """Alpaca + Polygon News für den Ticker (letzte 48h)."""
@@ -3211,9 +3293,7 @@ def _squeeze_get_news(sym: str) -> list:
     try:
         today    = datetime.now().strftime('%Y-%m-%d')
         two_days = (datetime.now() - timedelta(days=2)).strftime('%Y-%m-%d')
-        url = (f'https://api.polygon.io/v2/reference/news?ticker={sym}'
-               f'&published_utc.gte={two_days}&limit=5&apiKey={API}')
-        d = poly_fetch(url)
+        d = {'results': al_news_for_sym(sym, limit=5)}
         for n in d.get('results', []):
             t = n.get('title', '')[:100]
             if t and t not in catalysts:
@@ -3383,30 +3463,26 @@ def squeeze_scanner() -> list:
 
     candidates = {}
 
-    # Quelle 1: Polygon Top Gainers (heute)
-    try:
-        url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers?apiKey={API}'
-        d   = poly_fetch(url)
-        for t in d.get('tickers', [])[:50]:
-            sym = t.get('ticker', '')
-            if sym and 1 <= len(sym) <= 5:
-                candidates[sym] = t
-    except Exception:
-        pass
+    # Quelle 1: Yahoo Finance Top Gainers (ersetzt Polygon)
+    for t in al_top_gainers(limit=50):
+        sym = t.get('ticker', '')
+        if sym and 1 <= len(sym) <= 5:
+            candidates[sym] = t
 
-    # Quelle 2: Alle Tickers im Universe mit Volume-Spike
+    # Quelle 2: Alpaca Snapshot fuer UNIVERSE — Volume-Spike Kandidaten
     try:
-        syms_str = ','.join(list(UNIVERSE)[:30])
-        url = f'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?tickers={syms_str}&apiKey={API}'
-        d   = poly_fetch(url)
-        for t in d.get('tickers', []):
-            sym = t.get('ticker', '')
-            day  = t.get('day', {})
-            prev = t.get('prevDay', {})
-            vol  = int(day.get('v') or 0)
-            pvol = int(prev.get('v') or 1)
-            if sym and pvol > 0 and vol / pvol >= 5:
-                candidates[sym] = t
+        snaps = get_alpaca_snapshot(list(UNIVERSE)[:40])
+        for sym, snap in snaps.items():
+            dbar  = snap.get('dailyBar', {})
+            pbar  = snap.get('prevDailyBar', {})
+            vol   = int(dbar.get('v') or 0)
+            pvol  = int(pbar.get('v') or 1)
+            price = float(dbar.get('c') or 0)
+            prev  = float(pbar.get('c') or price or 1)
+            if sym and pvol > 0 and vol / pvol >= 5 and sym not in candidates:
+                candidates[sym] = {'ticker': sym,
+                                   'day':    {'c': price, 'v': vol},
+                                   'prevDay': {'c': prev}}
     except Exception:
         pass
 
