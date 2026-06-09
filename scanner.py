@@ -3140,6 +3140,7 @@ def _fib_for_ticker(sym, lookback_days=60):
                 'AT_882'      if nearest_name == '88.2' and at_level else
                 'AT_618'      if nearest_name == '61.8' and at_level else
                 'AT_786'      if nearest_name == '78.6' and at_level else
+                'NEAR_882'    if near_882 else
                 'NEAR_KEY'    if near_key else
                 'NEAR_382'    if nearest_name == '38.2' and nearest_dist < 1.5 else
                 'MONITORING'
@@ -3160,7 +3161,7 @@ def fibonacci_scan(max_workers=10):
 
     # Sortierung: AT_LEVEL zuerst, dann KEY_LEVEL, dann Distanz
     priority = {'AT_882': 0, 'AT_618': 1, 'AT_786': 2,
-                'NEAR_KEY': 3, 'NEAR_382': 4, 'MONITORING': 5}
+                'NEAR_882': 3, 'NEAR_KEY': 4, 'NEAR_382': 5, 'MONITORING': 6}
     results.sort(key=lambda x: (priority.get(x['signal'], 9), x['nearest_dist']))
     return results
 
