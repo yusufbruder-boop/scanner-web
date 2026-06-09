@@ -3150,8 +3150,9 @@ def _fib_for_ticker(sym, lookback_days=60):
         return None
 
 
-def fibonacci_scan(max_workers=10):
+def fibonacci_scan(max_workers=4):
     results = []
+    # max_workers=4 statt 10: verhindert Polygon Rate-Limit (429) bei parallelen Requests
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {ex.submit(_fib_for_ticker, sym): sym for sym in FIB_UNIVERSE}
         for fut in as_completed(futures):

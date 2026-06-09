@@ -4684,29 +4684,33 @@ def squeeze_route():
 
 def squeeze_monitor():
     """
-    Laeuft alle 10 Minuten waehrend Marktzeiten.
-    Sendet Telegram-Alert wenn neuer Squeeze-Kandidat mit Score >= 4 gefunden.
+    Raketen-Scanner: 3min in der ersten Handelsstunde (9:30-10:30 ET),
+    5min danach. INHD/PAVS-Moves werden so fruehzeitig erkannt.
+    Sendet Telegram-Alert wenn Score >= 4.
     """
     import time as _time
     from scanner import squeeze_scanner
-    _time.sleep(60)   # kurz warten bis App bereit ist
+    _time.sleep(60)
 
     alerted_today = set()
     last_day = ''
 
     while True:
         try:
-            now = datetime.now()
+            now     = datetime.now()
             day_str = now.strftime('%Y-%m-%d')
 
-            # Reset taeglich
             if day_str != last_day:
                 alerted_today.clear()
                 last_day = day_str
 
-            # Nur waehrend US-Marktzeiten (14:30 - 22:00 UTC = 8:30-16:00 ET)
+            # US-Marktzeiten (UTC): Pre-Market ab 12:00, Close 22:00
             hour_utc = now.utctimetuple().tm_hour
-            is_market = (12 <= hour_utc <= 22)   # erweitertes Fenster inkl. Pre/After
+            min_utc  = now.utctimetuple().tm_min
+            is_market = (12 <= hour_utc <= 22)
+
+            # Erste Stunde nach Open (13:30-14:30 UTC = 9:30-10:30 ET) = schnellster Scan
+            is_power_hour = (hour_utc == 13 and min_utc >= 30) or (hour_utc == 14 and min_utc < 30)
 
             if is_market:
                 results = squeeze_scanner()
@@ -4715,7 +4719,6 @@ def squeeze_monitor():
                     _squeeze_state['results'] = results
                     _squeeze_state['ts']      = now.strftime('%H:%M:%S')
 
-                # Alerts fuer neue Kandidaten mit hohem Score
                 for r in results:
                     sym   = r['sym']
                     score = r['score']
@@ -4738,10 +4741,12 @@ def squeeze_monitor():
                         )
                         tg_send(msg)
 
-        except Exception as e:
-            pass   # lautlos — kein Crash des Monitors
+        except Exception:
+            pass
 
-        _time.sleep(600)   # alle 10 Minuten
+        # Power Hour (9:30-10:30 ET): alle 3min — Raketen passieren meist hier
+        # Restliche Marktzeit: alle 5min
+        _time.sleep(180 if is_power_hour else 300)
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────
