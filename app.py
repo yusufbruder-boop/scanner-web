@@ -4453,20 +4453,17 @@ def alpaca_portfolio_api():
 # ── IBKR Bridge — empfängt Daten vom lokalen ibkr_bridge.py ─────────────────
 @app.route('/ibkr/push', methods=['POST'])
 def ibkr_push():
-    """
-    Lokales ibkr_bridge.py sendet alle 60s IBKR-Daten hierher.
-    Body: {most_active, hot_options, top_gainers, top_losers, ts, connected}
-    Auth: Bearer IBKR_BRIDGE_TOKEN
-    """
+    """ibkr_bridge.py sendet alle 60s Scanner + Account-Daten."""
     auth = request.headers.get('Authorization', '')
     if auth != f'Bearer {IBKR_BRIDGE_TOKEN}':
         return jsonify({'error': 'unauthorized'}), 401
     data = request.get_json(force=True) or {}
     data['received_at'] = datetime.now().strftime('%H:%M:%S')
-    state['ibkr_data'] = data
-    state['ibkr_ts']   = datetime.now().strftime('%H:%M')
-
-    # Sofort IBKR-Scan: welche Top-Traded Stocks haben Hermes-Signal?
+    state['ibkr_data']      = data
+    state['ibkr_ts']        = datetime.now().strftime('%H:%M')
+    state['ibkr_account']   = data.get('account', {})
+    state['ibkr_positions'] = data.get('positions', [])
+    state['ibkr_watchlist'] = data.get('watchlist', {})
     try:
         _run_ibkr_scan(data)
     except Exception:
@@ -4476,13 +4473,24 @@ def ibkr_push():
 
 @app.route('/ibkr/data')
 def ibkr_data_get():
-    """Gibt gespeicherte IBKR Bridge Daten zurück."""
     return jsonify(state.get('ibkr_data') or {'connected': False, 'error': 'Bridge nicht verbunden'})
+
+
+@app.route('/ibkr/account')
+def ibkr_account_get():
+    """Account-Übersicht: Balance + Positionen + Watchlist."""
+    connected = bool(state.get('ibkr_data', {}).get('connected'))
+    return jsonify({
+        'connected':  connected,
+        'ts':         state.get('ibkr_ts', '—'),
+        'account':    state.get('ibkr_account', {}),
+        'positions':  state.get('ibkr_positions', []),
+        'watchlist':  state.get('ibkr_watchlist', {}),
+    })
 
 
 @app.route('/ibkr/scan')
 def ibkr_scan_get():
-    """Gibt IBKR-bestätigte Top-Mover mit Hermes-Signal zurück."""
     return jsonify(state.get('ibkr_scan') or [])
 
 

@@ -1,217 +1,179 @@
 """
 IBKR Bridge — läuft LOKAL auf deinem PC
-Pollt IBKR Client Portal API (localhost:5001) alle 60s
-Sendet Daten an Hermes Scanner auf Railway
+Zeigt was der Markt kauft/verkauft: Most Active, Top Gainers, Hot Options
+Sendet alle 60s an Hermes auf Railway → sichtbar auf Handy
 
 Starten: python ibkr_bridge.py
-Voraussetzung: IBKR Client Portal Gateway muss laufen (localhost:5001)
+Voraussetzung: IBKR Client Portal Gateway laufen (localhost:5001)
+Download: https://www.interactivebrokers.com/en/trading/ibkr-apis.php
 """
 
-import requests
-import time
-import json
-import urllib3
+import requests, time, urllib3
 from datetime import datetime
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ── Konfiguration ─────────────────────────────────────────────────────────────
-IBKR_BASE   = 'https://localhost:5001/v1/api'
-RAILWAY_URL = 'https://scanner-web-production-7a52.up.railway.app'
+IBKR_BASE    = 'https://localhost:5001/v1/api'
+RAILWAY_URL  = 'https://scanner-web-production-7a52.up.railway.app'
 BRIDGE_TOKEN = 'hermes-ibkr-2026'
-INTERVAL    = 60  # Sekunden zwischen Updates
+INTERVAL     = 60
 
-HEADERS_IBKR = {'Content-Type': 'application/json'}
-HEADERS_RLW  = {
-    'Content-Type': 'application/json',
-    'Authorization': f'Bearer {BRIDGE_TOKEN}',
-}
+HDR_IBKR = {'Content-Type': 'application/json'}
+HDR_RLW  = {'Content-Type': 'application/json',
+             'Authorization': f'Bearer {BRIDGE_TOKEN}'}
 
-# ── IBKR Scanner-Typen ────────────────────────────────────────────────────────
-SCANNER_CONFIGS = [
-    {
-        'key': 'most_active',
-        'label': 'Most Active',
-        'body': {
-            'instrument': 'STK',
-            'location': 'STK.US.MAJOR',
-            'type': 'MOST_ACTIVE',
-            'filter': [{'code': 'volumeRate', 'value': 1000000}],
-        },
-    },
-    {
-        'key': 'hot_options',
-        'label': 'Hot By Options Volume',
-        'body': {
-            'instrument': 'STK',
-            'location': 'STK.US.MAJOR',
-            'type': 'HOT_BY_OPT_VOLUME',
-            'filter': [],
-        },
-    },
-    {
-        'key': 'top_gainers',
-        'label': 'Top Gainers',
-        'body': {
-            'instrument': 'STK',
-            'location': 'STK.US.MAJOR',
-            'type': 'TOP_PERC_GAIN',
-            'filter': [{'code': 'priceAbove', 'value': 5}],
-        },
-    },
-    {
-        'key': 'top_losers',
-        'label': 'Top Losers',
-        'body': {
-            'instrument': 'STK',
-            'location': 'STK.US.MAJOR',
-            'type': 'TOP_PERC_LOSE',
-            'filter': [{'code': 'priceAbove', 'value': 5}],
-        },
-    },
+# Was kauft/verkauft der Markt — 4 Scanner
+SCANNERS = [
+    {'key': 'most_active',  'label': 'Most Active',
+     'body': {'instrument': 'STK', 'location': 'STK.US.MAJOR',
+              'type': 'MOST_ACTIVE',
+              'filter': [{'code': 'volumeRate', 'value': 1000000}]}},
+    {'key': 'hot_options',  'label': 'Hot Options Volume',
+     'body': {'instrument': 'STK', 'location': 'STK.US.MAJOR',
+              'type': 'HOT_BY_OPT_VOLUME', 'filter': []}},
+    {'key': 'top_gainers',  'label': 'Top Gainers',
+     'body': {'instrument': 'STK', 'location': 'STK.US.MAJOR',
+              'type': 'TOP_PERC_GAIN',
+              'filter': [{'code': 'priceAbove', 'value': 2}]}},
+    {'key': 'top_losers',   'label': 'Top Losers',
+     'body': {'instrument': 'STK', 'location': 'STK.US.MAJOR',
+              'type': 'TOP_PERC_LOSE',
+              'filter': [{'code': 'priceAbove', 'value': 2}]}},
 ]
 
 
-def ibkr_get(path):
+def get(path):
     try:
-        r = requests.get(f'{IBKR_BASE}{path}', headers=HEADERS_IBKR,
-                         verify=False, timeout=10)
-        if r.status_code == 200:
-            return r.json()
+        r = requests.get(f'{IBKR_BASE}{path}', headers=HDR_IBKR, verify=False, timeout=10)
+        return r.json() if r.status_code == 200 else None
     except Exception as e:
-        print(f'  IBKR GET {path} Fehler: {e}')
-    return None
+        print(f'  GET {path}: {e}')
+        return None
 
 
-def ibkr_scanner(body):
+def post(path, body=None):
     try:
-        r = requests.post(f'{IBKR_BASE}/iserver/scanner/run',
-                          headers=HEADERS_IBKR, json=body,
-                          verify=False, timeout=15)
-        if r.status_code == 200:
-            return r.json()
+        r = requests.post(f'{IBKR_BASE}{path}', headers=HDR_IBKR,
+                          json=body or {}, verify=False, timeout=15)
+        return r.json() if r.status_code == 200 else None
     except Exception as e:
-        print(f'  Scanner Fehler: {e}')
-    return None
+        print(f'  POST {path}: {e}')
+        return None
 
 
-def get_price_snapshot(conid):
-    data = ibkr_get(f'/iserver/marketdata/snapshot?conids={conid}&fields=31,83,84,85,86,7295,7296')
-    if data and isinstance(data, list) and len(data) > 0:
-        d = data[0]
-        return {
-            'price': float(str(d.get('31', 0)).replace(',', '') or 0),
-            'chg':   float(str(d.get('83', '0%')).replace('%','').replace(',','') or 0),
-            'vol':   int(str(d.get('7295', 0)).replace(',','') or 0),
-            'bid':   float(str(d.get('84', 0)).replace(',','') or 0),
-            'ask':   float(str(d.get('85', 0)).replace(',','') or 0),
-        }
-    return {}
+def price_snapshot(conids):
+    """Preis + Change% für Liste von ConIDs."""
+    if not conids:
+        return {}
+    cids = ','.join(str(c) for c in conids[:20])
+    data = get(f'/iserver/marketdata/snapshot?conids={cids}&fields=31,83,7295,55')
+    result = {}
+    if data and isinstance(data, list):
+        for d in data:
+            cid = str(d.get('conid', ''))
+            price = float(str(d.get('31', 0)).replace(',', '') or 0)
+            chg   = float(str(d.get('83', '0%')).replace('%', '').replace(',', '') or 0)
+            vol   = int(str(d.get('7295', 0)).replace(',', '') or 0)
+            sym   = str(d.get('55', cid))
+            result[cid] = {'sym': sym, 'price': price, 'chg': chg, 'vol': vol}
+    return result
 
 
-def parse_scanner_result(raw, key):
-    results = []
+def run_scanner(body):
+    raw = post('/iserver/scanner/run', body)
+    if not raw:
+        return []
     contracts = raw.get('contracts', raw.get('Contract', []))
     if isinstance(contracts, dict):
         contracts = [contracts]
-    for c in contracts[:15]:
-        sym = c.get('symbol') or c.get('Symbol', '')
-        conid = c.get('con_id') or c.get('conId', '')
-        if not sym:
-            continue
-        entry = {
-            'sym':      sym,
-            'conid':    conid,
-            'category': key,
-            'rank':     c.get('rank', len(results) + 1),
-            'reason':   c.get('secType', 'STK'),
-        }
-        # Preis-Snapshot (optional, nicht critical)
-        if conid:
-            snap = get_price_snapshot(conid)
-            entry.update(snap)
-        results.append(entry)
+    results = []
+    for c in contracts[:20]:
+        sym   = c.get('symbol') or c.get('Symbol', '')
+        conid = c.get('con_id') or c.get('conId', 0)
+        if sym:
+            results.append({'sym': sym, 'conid': conid,
+                            'rank': c.get('rank', len(results)+1)})
     return results
 
 
-def fetch_all_scanners():
+def ensure_auth():
+    auth = get('/iserver/auth/status')
+    if not auth or not auth.get('authenticated'):
+        post('/tickle')
+        time.sleep(2)
+        auth = get('/iserver/auth/status')
+    return bool(auth and auth.get('authenticated'))
+
+
+def fetch_market_data():
     payload = {
-        'most_active':  [],
-        'hot_options':  [],
-        'top_gainers':  [],
-        'top_losers':   [],
-        'connected':    False,
-        'ts':           datetime.now().isoformat(),
+        'most_active': [], 'hot_options': [],
+        'top_gainers': [], 'top_losers':  [],
+        'prices':      {},
+        'connected':   True,
+        'ts':          datetime.now().isoformat(),
     }
 
-    # Auth-Check
-    auth = ibkr_get('/iserver/auth/status')
-    if not auth or not auth.get('authenticated'):
-        # Session tickle
-        requests.post(f'{IBKR_BASE}/tickle', headers=HEADERS_IBKR, verify=False, timeout=5)
-        time.sleep(2)
-        auth = ibkr_get('/iserver/auth/status')
+    for cfg in SCANNERS:
+        print(f'  [{cfg["label"]}]...')
+        items = run_scanner(cfg['body'])
+        payload[cfg['key']] = items
+        print(f'    {len(items)} Treffer: {", ".join(i["sym"] for i in items[:5])}')
+        time.sleep(0.8)
 
-    if not auth or not auth.get('authenticated'):
-        print(f'  [IBKR] Nicht authentifiziert — Gateway läuft?')
-        return None
+    # Preise für alle gefundenen Stocks
+    all_conids = []
+    for key in ['most_active', 'hot_options', 'top_gainers', 'top_losers']:
+        for item in payload[key]:
+            if item.get('conid') and item['conid'] not in all_conids:
+                all_conids.append(item['conid'])
 
-    payload['connected'] = True
-    print(f'  [IBKR] Verbunden ✓  ({datetime.now().strftime("%H:%M:%S")})')
-
-    for cfg in SCANNER_CONFIGS:
-        print(f'  Scanne: {cfg["label"]}...')
-        raw = ibkr_scanner(cfg['body'])
-        if raw:
-            items = parse_scanner_result(raw, cfg['key'])
-            payload[cfg['key']] = items
-            print(f'    → {len(items)} Treffer')
-        else:
-            print(f'    → keine Daten')
-        time.sleep(1)
+    if all_conids:
+        print(f'  Lade {len(all_conids)} Preise...')
+        payload['prices'] = price_snapshot(all_conids[:20])
+        # Preise in die Items einmergen
+        for key in ['most_active', 'hot_options', 'top_gainers', 'top_losers']:
+            for item in payload[key]:
+                snap = payload['prices'].get(str(item.get('conid', '')), {})
+                item['price'] = snap.get('price', 0)
+                item['chg']   = snap.get('chg', 0)
+                item['vol']   = snap.get('vol', 0)
 
     return payload
 
 
 def push_to_railway(payload):
     try:
-        r = requests.post(
-            f'{RAILWAY_URL}/ibkr/push',
-            headers=HEADERS_RLW,
-            json=payload,
-            timeout=15,
-        )
+        r = requests.post(f'{RAILWAY_URL}/ibkr/push',
+                          headers=HDR_RLW, json=payload, timeout=15)
         if r.status_code == 200:
-            resp = r.json()
-            print(f'  [Railway] OK — {resp.get("signals", 0)} Signale, {resp.get("confirmed", 0)} IBKR+Polygon bestätigt')
+            print(f'  [Railway] OK')
         else:
-            print(f'  [Railway] Fehler {r.status_code}: {r.text[:120]}')
+            print(f'  [Railway] Fehler {r.status_code}: {r.text[:100]}')
     except Exception as e:
-        print(f'  [Railway] Verbindungsfehler: {e}')
+        print(f'  [Railway] {e}')
 
 
 def main():
-    print('=' * 60)
-    print('IBKR Bridge — Hermes Scanner Datenquelle')
-    print(f'IBKR Gateway: {IBKR_BASE}')
-    print(f'Railway:      {RAILWAY_URL}')
-    print(f'Intervall:    {INTERVAL}s')
-    print('=' * 60)
-    print()
+    print('=' * 55)
+    print('IBKR Bridge — Marktdaten fuer Hermes')
+    print(f'Gateway: {IBKR_BASE}')
+    print(f'Railway: {RAILWAY_URL}')
+    print('=' * 55)
 
     while True:
-        ts = datetime.now().strftime('%H:%M:%S')
-        print(f'[{ts}] Starte IBKR Scan...')
+        print(f'\n[{datetime.now().strftime("%H:%M:%S")}] Starte...')
 
-        payload = fetch_all_scanners()
-        if payload:
-            syms = [s['sym'] for s in payload.get('most_active', [])[:5]]
-            print(f'  Most Active Top-5: {", ".join(syms) if syms else "—"}')
-            push_to_railway(payload)
-        else:
-            print(f'  [IBKR] Kein Gateway erreichbar — nächster Versuch in {INTERVAL}s')
+        if not ensure_auth():
+            print('  NICHT verbunden. Gateway laeuft? Browser-Login gemacht?')
+            print(f'  Oeffne: https://localhost:5001')
+            time.sleep(INTERVAL)
+            continue
 
-        print()
+        print('  Verbunden mit IBKR Gateway')
+        payload = fetch_market_data()
+        push_to_railway(payload)
+        print(f'  Naechster Abruf in {INTERVAL}s')
         time.sleep(INTERVAL)
 
 
