@@ -175,6 +175,11 @@ state = {
     'ibkr_data':      {},           # {most_active, hot_options, top_gainers, ts, connected}
     'ibkr_ts':        None,         # letzter Empfang
     'ibkr_scan':      [],           # IBKR-bestätigte Top-Mover mit Signal
+    # Hermes Brain — autonomer KI-Agent
+    'brain_worldview': {'focus': 'BALANCED', 'market': 'NEUTRAL', 'reason': '', 'updated': ''},
+    'brain_trades':    [],          # Trades ausgelöst vom Brain (mit P&L tracking)
+    'brain_news':      [],          # zuletzt klassifizierte wichtige News
+    'brain_active':    False,       # läuft Brain gerade?
 }
 _hermes_lock = threading.Lock()
 _scan_lock   = threading.Lock()   # verhindert gleichzeitige Scans
@@ -2786,6 +2791,69 @@ function renderResults(data, isNew) {
 function renderTab2(data) {
   let html = '';
 
+  // ── Hermes Brain — autonomer KI-Agent Status ──────────────────────────────
+  const bwv = data.brain_worldview || {};
+  const bNews = data.brain_news || [];
+  const bTrades = data.brain_trades || [];
+  const focusColors = {
+    'LONG_HUNT':'#4dff91','LONG_LEAN':'#86efac','BALANCED':'#94a3b8',
+    'SHORT_LEAN':'#fca5a5','SHORT_HUNT':'#ff4d6b'
+  };
+  const focusIcons = {
+    'LONG_HUNT':'🟢🟢','LONG_LEAN':'🟢','BALANCED':'⚪','SHORT_LEAN':'🔴','SHORT_HUNT':'🔴🔴'
+  };
+  if (bwv.focus) {
+    let fc = focusColors[bwv.focus] || '#94a3b8';
+    let fi = focusIcons[bwv.focus] || '⚪';
+    let totalBrainPL = bTrades.reduce((s,t) => s + (t.pnl_pct || 0), 0);
+    let brainWins    = bTrades.filter(t => t.won === true).length;
+    let brainLoss    = bTrades.filter(t => t.won === false).length;
+    html += '<div style="margin:8px;background:linear-gradient(135deg,#0a0a1a,#0d0d28);border:1px solid #6366f144;border-radius:10px;padding:12px 14px">'
+      + '<div style="font-size:10px;font-weight:bold;color:#a78bfa;letter-spacing:2px;margin-bottom:8px">🧠 HERMES BRAIN — AUTONOMER KI-AGENT</div>'
+      + '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px">'
+      +   '<div><div style="font-size:10px;color:#6b8cad">Strategie</div>'
+      +     '<div style="font-size:15px;font-weight:bold;color:' + fc + '">' + fi + ' ' + (bwv.focus||'?') + '</div></div>'
+      +   '<div><div style="font-size:10px;color:#6b8cad">Markt</div>'
+      +     '<div style="font-size:14px;font-weight:bold;color:#cbd5e1">' + (bwv.market||'?') + ' QQQ ' + (bwv.qqq >= 0 ? '+' : '') + (bwv.qqq||0).toFixed(1) + '%</div></div>'
+      +   '<div><div style="font-size:10px;color:#6b8cad">Brain Trades</div>'
+      +     '<div style="font-size:14px;font-weight:bold;color:#fff">✅' + brainWins + ' ❌' + brainLoss + '</div></div>'
+      +   '<div><div style="font-size:10px;color:#6b8cad">Letzte News</div>'
+      +     '<div style="font-size:12px;color:#94a3b8">' + (bwv.updated||'—') + '</div></div>'
+      + '</div>';
+
+    // Letzte Brain-News Klassifizierungen
+    if (bNews.length > 0) {
+      html += '<div style="font-size:10px;color:#6b8cad;margin-bottom:5px;text-transform:uppercase;letter-spacing:1px">Zuletzt klassifizierte News:</div>';
+      bNews.slice(0,5).forEach(n => {
+        let ac = n.action === 'LONG' ? '#4dff91' : '#ff4d6b';
+        let ai_badge = n.ai ? ' <span style="font-size:9px;background:#1a0a2e;color:#a78bfa;padding:1px 4px;border-radius:3px">KI</span>' : '';
+        html += '<div style="padding:4px 0;border-top:1px solid #1a1a2e;display:flex;gap:8px;align-items:flex-start">'
+          + '<span style="font-size:11px;font-weight:bold;color:' + ac + ';min-width:45px">' + n.action + '</span>'
+          + '<div><div style="font-size:11px;color:#fff">' + (n.headline||'').slice(0,70) + ai_badge + '</div>'
+          +   '<div style="font-size:10px;color:#64748b">' + (n.tickers||[]).join(', ') + ' | ' + n.reason + ' | ' + n.time + '</div></div>'
+          + '</div>';
+      });
+    }
+
+    // Brain Auto-Trades P&L
+    if (bTrades.length > 0) {
+      html += '<div style="font-size:10px;color:#6b8cad;margin-top:8px;margin-bottom:5px;text-transform:uppercase;letter-spacing:1px">Brain Auto-Trades:</div>';
+      bTrades.slice(0,8).forEach(t => {
+        let wonIcon = t.won === true ? '✅' : t.won === false ? '❌' : '⏳';
+        let sc = t.signal === 'LONG' ? '#4dff91' : '#ff4d6b';
+        let pnlStr = t.pnl_pct ? (t.pnl_pct >= 0 ? '+' : '') + t.pnl_pct.toFixed(1) + '%' : 'offen';
+        let pnlCol = (t.pnl_pct || 0) >= 0 ? '#4dff91' : '#ff4d6b';
+        html += '<div style="padding:4px 0;border-top:1px solid #1a1a2e;display:flex;justify-content:space-between">'
+          + '<div><span style="color:' + sc + ';font-weight:bold">' + wonIcon + ' ' + t.signal + ' ' + t.sym + '</span>'
+          + ' <span style="font-size:10px;color:#64748b">Score:' + t.score + ' Conviction:' + Math.round((t.conviction||0)*100) + '%</span>'
+          + '<div style="font-size:10px;color:#64748b">' + t.reason.slice(0,55) + ' | ' + t.time + '</div></div>'
+          + '<div style="text-align:right"><span style="color:' + pnlCol + ';font-size:12px;font-weight:bold">' + pnlStr + '</span></div>'
+          + '</div>';
+      });
+    }
+    html += '</div>';
+  }
+
   // ── Alpaca Portfolio ─────────────────────────────────────────────────────────
   const ap = data.alpaca_portfolio || {};
   if (ap.equity) {
@@ -3473,6 +3541,9 @@ def results():
             out['ibkr_ts']                 = state.get('ibkr_ts')
             out['market_fall_candidates']  = state.get('market_fall_candidates', [])
             out['market_fall_qqq']         = state.get('market_fall_qqq', 0)
+            out['brain_worldview']         = state.get('brain_worldview', {})
+            out['brain_trades']            = state.get('brain_trades', [])
+            out['brain_news']              = state.get('brain_news', [])
         return jsonify(_to_json_safe(out))
     except Exception as e:
         return jsonify({'error': f'Server Fehler: {str(e)[:120]}'})
@@ -3821,6 +3892,248 @@ Max 220 Wörter. Bei fallendem Markt: SHORT-Setups bevorzugen, LONG nur bei star
         )
     except Exception:
         return ''
+
+
+# ── Hermes Brain — autonomer KI-Agent ────────────────────────────────────────
+_brain_seen_ids = set()   # dedup für News
+_brain_prio_q   = []      # Priority-Scan-Queue
+
+def hermes_classify_news(headline: str, tickers: list) -> dict:
+    """
+    KI klassifiziert eine einzelne News: LONG / SHORT / IGNORE.
+    Erst Keyword-Check (instant), dann AI nur für unklare Fälle.
+    """
+    from scanner import HARD_NEG_KEYS, HIGH_IMPACT_GOV, HIGH_IMPACT_ENDORSE, HIGH_IMPACT_INSIDER, HIGH_IMPACT_NEG
+    hl = headline.lower()
+
+    # Sofort SHORT: Verwässerung, Secondary Offering, DOJ, SEC, Bankruptcy
+    for k in list(HARD_NEG_KEYS) + list(HIGH_IMPACT_NEG):
+        if k in hl:
+            return {'action': 'SHORT', 'strength': 'STARK', 'reason': f'Katalysator: {k}', 'ai': False}
+    # Sofort LONG: Gov-Vertrag, CEO-Endorsement, Insider-Kauf
+    for k in list(HIGH_IMPACT_GOV) + list(HIGH_IMPACT_ENDORSE) + list(HIGH_IMPACT_INSIDER):
+        if k in hl:
+            return {'action': 'LONG', 'strength': 'STARK', 'reason': f'Katalysator: {k}', 'ai': False}
+    # Earnings Beat → LONG
+    if any(k in hl for k in ['beat', 'raised guidance', 'record revenue', 'surprise earnings']):
+        return {'action': 'LONG', 'strength': 'NORMAL', 'reason': 'Earnings Beat', 'ai': False}
+    # Earnings Miss → SHORT
+    if any(k in hl for k in ['miss', 'below estimate', 'cut guidance', 'lowered guidance', 'warned']):
+        return {'action': 'SHORT', 'strength': 'NORMAL', 'reason': 'Earnings Miss / Warning', 'ai': False}
+    # Downgrade → SHORT
+    if any(k in hl for k in ['downgrade', 'sell rating', 'underperform', 'price target cut']):
+        return {'action': 'SHORT', 'strength': 'NORMAL', 'reason': 'Downgrade', 'ai': False}
+    # Upgrade → LONG
+    if any(k in hl for k in ['upgrade', 'buy rating', 'outperform', 'price target raised']):
+        return {'action': 'LONG', 'strength': 'NORMAL', 'reason': 'Upgrade', 'ai': False}
+
+    # Unklar → AI fragen (nur 50 Token, sehr schnell)
+    if not NOUS_KEY:
+        return {}
+    try:
+        prompt = (f'Aktien-News: "{headline[:120]}"\n'
+                  f'Ticker: {",".join(tickers[:3])}\n'
+                  f'Antworte NUR: LONG, SHORT oder IGNORE\n'
+                  f'Dann Pipe dann 10-Wort-Grund: LONG|Grund')
+        raw = _nous_call(prompt, system='Trading AI. Nur: ACTION|GRUND', max_tokens=40)
+        if raw and '|' in raw:
+            parts = raw.strip().split('|', 1)
+            action = parts[0].strip().upper()
+            if action in ('LONG', 'SHORT', 'IGNORE'):
+                return {'action': action, 'strength': 'NORMAL', 'reason': parts[1].strip()[:60], 'ai': True}
+    except Exception:
+        pass
+    return {}
+
+
+def hermes_brain_loop():
+    """
+    Hermes Gehirn — läuft 24/7 unabhängig vom 5-Min-Scanner.
+
+    Was Hermes selbst macht:
+    1. Alle 90s: News-Feed lesen → KI klassifiziert LONG/SHORT/IGNORE
+    2. Bei wichtiger News → sofort Ticker scannen (Priority Queue)
+    3. Bei Score >= 12 + Conviction >= 0.80 → direkt auf Alpaca traden
+    4. Marktlage laufend updaten → Strategie anpassen (LONG_HUNT / SHORT_HUNT)
+    5. Alle Entscheidungen + P&L transparent loggen
+    """
+    global _brain_seen_ids, _brain_prio_q
+    time.sleep(90)  # Warten bis Hauptsystem hochgefahren ist
+
+    while True:
+        try:
+            state['brain_active'] = True
+            now_utc = datetime.now(timezone.utc)
+            # Aktiv während Extended Market Hours (06:00-22:00 UTC = 2 AM - 6 PM ET)
+            is_active = (now_utc.hour >= 11 and now_utc.hour < 22)
+
+            # ── 1) Marktlage prüfen → Worldview updaten ──────────────────────
+            try:
+                from scanner import get_market_context
+                mkt      = get_market_context()
+                qqq_chg  = mkt.get('qqq_chg', 0)
+                mkt_bias = mkt.get('bias', 'NEUTRAL')
+                wv = state['brain_worldview']
+                old_focus = wv.get('focus', 'BALANCED')
+
+                if mkt_bias in ('STRONG_BEAR',) or qqq_chg <= -2.0:
+                    new_focus = 'SHORT_HUNT'
+                elif mkt_bias == 'BEAR' or qqq_chg <= -1.2:
+                    new_focus = 'SHORT_LEAN'
+                elif mkt_bias in ('STRONG_BULL',) or qqq_chg >= 2.0:
+                    new_focus = 'LONG_HUNT'
+                elif mkt_bias == 'BULL' or qqq_chg >= 1.2:
+                    new_focus = 'LONG_LEAN'
+                else:
+                    new_focus = 'BALANCED'
+
+                state['brain_worldview'] = {
+                    'focus':   new_focus, 'market': mkt_bias,
+                    'qqq':     round(qqq_chg, 2),
+                    'reason':  f'QQQ {qqq_chg:+.1f}% | {mkt_bias}',
+                    'updated': datetime.now().strftime('%H:%M'),
+                }
+
+                # Strategie-Wechsel → Telegram
+                if new_focus != old_focus and is_active:
+                    icons = {'SHORT_HUNT':'🔴🔴','SHORT_LEAN':'🔴','BALANCED':'⚪','LONG_LEAN':'🟢','LONG_HUNT':'🟢🟢'}
+                    tg_send(
+                        f'{icons.get(new_focus,"⚪")} <b>HERMES STRATEGIE: {new_focus}</b>\n'
+                        f'{old_focus} → {new_focus}\n'
+                        f'QQQ {qqq_chg:+.1f}% | Markt: {mkt_bias}',
+                        key=f'wv_{new_focus}'
+                    )
+            except Exception:
+                mkt = {}
+
+            # ── 2) News-Feed lesen + KI klassifizieren ────────────────────────
+            if is_active:
+                try:
+                    news_items = get_alpaca_market_news(limit=20)
+                except Exception:
+                    news_items = []
+
+                for n in news_items:
+                    nid = str(n.get('id', n.get('headline', '')[:40]))
+                    if nid in _brain_seen_ids:
+                        continue
+                    _brain_seen_ids.add(nid)
+
+                    headline = n.get('headline', '')
+                    symbols  = [s.get('symbol', '') for s in n.get('symbols', [])
+                                if s.get('symbol', '') and len(s.get('symbol','')) <= 5][:3]
+
+                    # Schnell-Filter: nur marktbewegende News
+                    hl = headline.lower()
+                    keywords_check = (
+                        'dilut','offering','earnings','beat','miss','guidance','fda',
+                        'acquisition','merger','buyback','sec','doj','bankruptcy',
+                        'downgrade','upgrade','contract','insider','chapter 11'
+                    )
+                    if not any(k in hl for k in keywords_check) or not symbols:
+                        continue
+
+                    decision = hermes_classify_news(headline, symbols)
+                    action   = decision.get('action', 'IGNORE')
+                    if action not in ('LONG', 'SHORT'):
+                        continue
+
+                    strength = decision.get('strength', 'NORMAL')
+                    reason   = decision.get('reason', '')
+                    icon     = '🟢' if action == 'LONG' else '🔴'
+
+                    # News in State loggen (für UI)
+                    brain_entry = {
+                        'time':     datetime.now().strftime('%H:%M'),
+                        'action':   action, 'strength': strength,
+                        'headline': headline[:80], 'tickers': symbols,
+                        'reason':   reason, 'ai': decision.get('ai', False),
+                    }
+                    state['brain_news'] = ([brain_entry] + state.get('brain_news', []))[:20]
+
+                    # Sofort-Alert
+                    tg_send(
+                        f'{icon} <b>HERMES BRAIN — {action} {strength}</b>\n'
+                        f'"{headline[:80]}"\n'
+                        f'Ticker: {", ".join(symbols)}\n'
+                        f'Grund: {reason}\n'
+                        f'<i>Scanne sofort...</i>',
+                        key=f'brain_{nid[:25]}'
+                    )
+
+                    # Priority Queue — diese Ticker sofort scannen
+                    _brain_prio_q.extend(symbols)
+
+            # ── 3) Priority Queue verarbeiten → Sofort-Scan + Auto-Trade ─────
+            if _brain_prio_q and is_active:
+                pq = list(dict.fromkeys(_brain_prio_q[:6]))  # dedup, max 6
+                _brain_prio_q.clear()
+
+                def _do_priority_scan(tickers, _mkt=mkt):
+                    from datetime import datetime as _dt, timedelta as _td
+                    from scanner import scan_ticker as _st
+                    today     = _dt.now().strftime('%Y-%m-%d')
+                    exp_cut   = (_dt.now() + _td(days=35)).strftime('%Y-%m-%d')
+                    news_cut  = (_dt.now() - _td(days=7)).strftime('%Y-%m-%d')
+                    for sym in tickers:
+                        try:
+                            r = _st(sym, today, exp_cut, news_cut)
+                            if not r or r.get('signal') not in ('LONG', 'SHORT'):
+                                continue
+                            score     = r.get('score', 0)
+                            conviction= r.get('conviction', 0)
+                            if score < 6:
+                                continue
+
+                            # Picks updaten (immer bei Score >= 6)
+                            picks = state.get('hermes_picks', [])
+                            if not any(p['t'] == sym for p in picks):
+                                picks.insert(0, r)
+                                state['hermes_picks'] = picks[:10]
+
+                            # Telegram Signal
+                            b    = r.get('best') or {}
+                            sico = '🟢' if r['signal'] == 'LONG' else '🔴'
+                            conv_str = f'{conviction:.0%}' if conviction else '?'
+                            tg_send(
+                                f'{sico} <b>BRAIN SCAN: {r["signal"]} {sym}</b>\n'
+                                f'Score:{score} | Conviction:{conv_str}\n'
+                                f'${r["price"]} | {r.get("kat_text","")[:60]}\n'
+                                + (f'{r.get("otype","?")} ${b.get("strike")} @ ${b.get("pr")} '
+                                   f'Exp:{b.get("exp")}' if b else ''),
+                                key=f'bscan_{sym}_{_dt.now().strftime("%H%M")}'
+                            )
+
+                            # Auto-Trade bei hoher Conviction (Schwelle höher als normaler Auto-Trade)
+                            if state.get('auto_trade_enabled') and score >= 12 and conviction >= 0.80:
+                                hermes_auto_trade(r)
+                                # Als Brain-Trade markieren
+                                entry = {
+                                    'sym': sym, 'signal': r['signal'], 'score': score,
+                                    'conviction': round(conviction, 2),
+                                    'price_entry': r['price'], 'price_current': r['price'],
+                                    'pnl_pct': 0.0, 'won': None,
+                                    'time': _dt.now().strftime('%H:%M'),
+                                    'date': _dt.now().strftime('%Y-%m-%d'),
+                                    'reason': r.get('kat_text', '')[:60],
+                                }
+                                state['brain_trades'] = ([entry] + state.get('brain_trades', []))[:30]
+
+                        except Exception:
+                            pass
+
+                threading.Thread(target=_do_priority_scan, args=(pq,), daemon=True).start()
+
+            # Seen-Set begrenzen
+            if len(_brain_seen_ids) > 2000:
+                _brain_seen_ids = set(list(_brain_seen_ids)[-800:])
+
+        except Exception:
+            pass
+        finally:
+            state['brain_active'] = False
+
+        time.sleep(90)
 
 
 def hermes_monitor():
@@ -4836,6 +5149,10 @@ sched.start()
 # Hermes Agent starten
 hermes_thread = threading.Thread(target=hermes_monitor, daemon=True)
 hermes_thread.start()
+
+# Hermes Brain — autonomer KI-Agent (läuft unabhängig, denkt selbst)
+brain_thread = threading.Thread(target=hermes_brain_loop, daemon=True)
+brain_thread.start()
 
 # Squeeze Scanner Monitor starten
 squeeze_thread = threading.Thread(target=squeeze_monitor, daemon=True)
