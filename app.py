@@ -180,6 +180,10 @@ state = {
     'brain_trades':    [],          # Trades ausgelöst vom Brain (mit P&L tracking)
     'brain_news':      [],          # zuletzt klassifizierte wichtige News
     'brain_active':    False,       # läuft Brain gerade?
+    # Claude ↔ Hermes direkte Kommunikation
+    'claude_session':  {},          # aktive Claude-Trading-Session mit IBKR-Daten
+    'claude_trades':   [],          # Claude-Trades (manuell MT5)
+    'claude_ibkr':     {},          # IBKR-Daten von Claude gepusht
 }
 _hermes_lock = threading.Lock()
 _scan_lock   = threading.Lock()   # verhindert gleichzeitige Scans
@@ -4810,49 +4814,92 @@ Marktschluss-Zusammenfassung (Deutsch, max 150 Wörter):
 @app.route('/hermes/intel')
 def hermes_intel_api():
     """
-    Schnelles Intel-Endpoint für externe Bots + Claude.
-    Gibt aktuellen Marktbias, Top-Signale, Breaking News und Brain-Status zurück.
-    Bitget Bot + MT5 + Claude fragen hier an bevor sie traden/entscheiden.
+    Haupt-Intel-Endpoint für Claude + Bots.
+    Claude holt das vor jedem Trade: Marktbias, IBKR NAS/Gold, News, Brain-Status.
     """
-    data    = state.get('results') or {}
-    bwv     = state.get('brain_worldview', {})
-    mkt_ctx = state.get('market_context_cache', {})
-
+    data   = state.get('results') or {}
+    bwv    = state.get('brain_worldview', {})
     longs  = data.get('longs',  [])[:5]
     shorts = data.get('shorts', [])[:5]
 
     qqq_chg = bwv.get('qqq', 0)
     focus   = bwv.get('focus', 'BALANCED')
-
-    # ok_long / ok_short — einfache Boolean-Flags für Bots
     ok_long  = focus not in ('SHORT_HUNT',) and qqq_chg > -2.0
     ok_short = focus not in ('LONG_HUNT',)  and qqq_chg < 2.0
 
-    # Breaking News (letzter Brain-Fund)
-    brain_news  = state.get('brain_news', [])
+    # Breaking News (Brain-Klassifizierungen)
+    brain_news = state.get('brain_news', [])
     latest_news = brain_news[0].get('headline', '') if brain_news else ''
+    recent_news = [{'headline': n['headline'][:80], 'action': n['action'],
+                    'tickers': n['tickers'], 'time': n['time']}
+                   for n in brain_news[:5]]
 
-    # Bot-Positionen (gemeldet via /hermes/bot-status)
-    bot_positions = state.get('bot_positions', {})
+    # ── IBKR Daten gefiltert für NAS100 + Gold ────────────────────────────────
+    ibkr = state.get('ibkr_data', {})
+    nas_tickers  = {'QQQ', 'TQQQ', 'SQQQ', 'NVDA', 'TSLA', 'META', 'AAPL', 'MSFT', 'AMZN', 'GOOGL', 'AMD', 'SPY', 'IWM'}
+    gold_tickers = {'GLD', 'GDX', 'GDXJ', 'SLV', 'GC', 'XAUUSD', 'IAU', 'NEM', 'GOLD'}
 
-    # Hermes Picks (Score >= 8)
-    top_longs  = [r['t'] for r in longs  if r.get('score', 0) >= 7][:5]
-    top_shorts = [r['t'] for r in shorts if r.get('score', 0) >= 7][:5]
+    def _filter_ibkr(items, watch_set):
+        return [i for i in (items or []) if i.get('sym','').upper() in watch_set][:5]
+
+    ibkr_nas  = _filter_ibkr(ibkr.get('most_active', []) + ibkr.get('hot_options', []), nas_tickers)
+    ibkr_gold = _filter_ibkr(ibkr.get('most_active', []) + ibkr.get('hot_options', []), gold_tickers)
+
+    # IBKR Richtungs-Bias für NAS + Gold
+    def _ibkr_bias(items):
+        if not items: return 'NEUTRAL'
+        bull = sum(1 for i in items if (i.get('chg') or 0) > 0)
+        bear = len(items) - bull
+        return 'BULLISH' if bull > bear else ('BEARISH' if bear > bull else 'NEUTRAL')
+
+    ibkr_nas_bias  = _ibkr_bias(ibkr_nas)
+    ibkr_gold_bias = _ibkr_bias(ibkr_gold)
+
+    # ── Claude aktive Trading Session ────────────────────────────────────────
+    claude_session = state.get('claude_session', {})
+    claude_trades  = state.get('claude_trades', [])
+
+    # ── Hermes Picks für NAS/Gold Kontext ─────────────────────────────────────
+    nas_signals  = [r for r in longs + shorts if r.get('t') in nas_tickers][:3]
+    gold_signals = [r for r in longs + shorts if r.get('t') in gold_tickers][:2]
+
+    nas_summary  = ', '.join(f'{r["t"]}:{r["signal"]}({r["score"]})' for r in nas_signals) or 'kein Signal'
+    gold_summary = ', '.join(f'{r["t"]}:{r["signal"]}({r["score"]})' for r in gold_signals) or 'kein Signal'
 
     # Market Fall Kandidaten
     fall_cands = [fc['sym'] for fc in state.get('market_fall_candidates', [])[:5]]
 
     return jsonify({
+        # Markt-Übersicht
         'bias':          bwv.get('market', 'NEUTRAL'),
         'brain_focus':   focus,
         'qqq_chg':       round(qqq_chg, 2),
         'ok_long':       ok_long,
         'ok_short':      ok_short,
-        'top_longs':     top_longs,
-        'top_shorts':    top_shorts,
-        'fall_candidates': fall_cands,
+        # NAS100 spezifisch
+        'nas': {
+            'hermes_signals': nas_summary,
+            'ibkr_bias':      ibkr_nas_bias,
+            'ibkr_items':     ibkr_nas,
+            'ok_long':        ok_long,
+            'ok_short':       ok_short,
+        },
+        # Gold spezifisch
+        'gold': {
+            'hermes_signals': gold_summary,
+            'ibkr_bias':      ibkr_gold_bias,
+            'ibkr_items':     ibkr_gold,
+        },
+        # News
         'breaking_news': latest_news[:120],
-        'bot_positions': bot_positions,
+        'recent_news':   recent_news,
+        # Top Signale
+        'top_longs':     [r['t'] for r in longs  if r.get('score', 0) >= 7][:5],
+        'top_shorts':    [r['t'] for r in shorts if r.get('score', 0) >= 7][:5],
+        'fall_candidates': fall_cands,
+        # Claude Session
+        'claude_session': claude_session,
+        'claude_trades':  claude_trades[-5:],
         'hermes_ts':     state.get('hermes_ts', ''),
         'timestamp':     datetime.now().strftime('%H:%M'),
     })
@@ -4928,6 +4975,177 @@ def hermes_share():
 def hermes_shared_intel():
     """Zeigt was Bots + Claude an Hermes gesendet haben."""
     return jsonify(state.get('shared_intel', []))
+
+
+# ── Claude ↔ Hermes direkte Kommunikation ────────────────────────────────────
+
+@app.route('/hermes/claude-push', methods=['POST'])
+def hermes_claude_push():
+    """
+    Claude pusht IBKR-Daten + Trades an Hermes während einer Trading-Session.
+    Claude hat IBKR-Zugang, Hermes nicht — so bekommt Hermes 2 Broker-Quellen.
+
+    Body: {
+      'ibkr': {                         # IBKR Live-Daten von Claude
+        'nas_price': 21450,             # aktueller NAS100 Preis
+        'nas_chg': -0.5,                # % Veränderung
+        'gold_price': 2340,
+        'gold_chg': 0.3,
+        'positions': [...],             # offene IBKR Positionen
+        'account_value': 2050,          # Kontostand
+        'orders': [...],                # ausstehende Orders
+        'market_context': '...',        # freie Beschreibung
+      },
+      'trade': {                        # optional: neuer Trade gemeldet
+        'symbol': 'NAS100',
+        'direction': 'LONG',
+        'entry': 21450,
+        'lots': 1.0,
+        'reason': 'BOS + Fib 0.618',
+        'stop': 21380,
+        'target': 21600,
+      },
+      'session_note': 'Morning session, watching NAS support',
+    }
+    """
+    body  = request.get_json(force=True) or {}
+    ibkr  = body.get('ibkr', {})
+    trade = body.get('trade', {})
+    note  = body.get('session_note', '')
+    ts    = datetime.now().strftime('%H:%M')
+
+    # IBKR-Daten speichern (Hermes liest diese beim nächsten Intel-Request)
+    if ibkr:
+        state['claude_ibkr'] = {**ibkr, 'updated': ts}
+
+        # In Session-Status einbauen
+        session = state.get('claude_session', {})
+        session.update({
+            'active':         True,
+            'last_push':      ts,
+            'note':           note or session.get('note', ''),
+            'nas_price':      ibkr.get('nas_price'),
+            'nas_chg':        ibkr.get('nas_chg'),
+            'gold_price':     ibkr.get('gold_price'),
+            'gold_chg':       ibkr.get('gold_chg'),
+            'account_value':  ibkr.get('account_value'),
+            'market_context': ibkr.get('market_context', ''),
+        })
+        state['claude_session'] = session
+
+    # Neuer Trade von Claude → speichern + Brain informieren
+    if trade and trade.get('symbol') and trade.get('direction'):
+        sym = trade['symbol'].upper()
+        entry = {
+            'symbol':    sym,
+            'direction': trade['direction'],
+            'entry':     trade.get('entry'),
+            'lots':      trade.get('lots'),
+            'reason':    trade.get('reason', '')[:80],
+            'stop':      trade.get('stop'),
+            'target':    trade.get('target'),
+            'ts':        ts,
+            'status':    'OPEN',
+            'pnl':       0,
+        }
+        state['claude_trades'] = ([entry] + state.get('claude_trades', []))[:20]
+
+        # Brain Priority Queue → Hermes überwacht den Ticker sofort
+        watch_sym = sym.replace('NAS100', 'QQQ').replace('XAUUSD', 'GLD')
+        _brain_prio_q.append(watch_sym)
+
+        tg_send(
+            f'📊 <b>CLAUDE TRADE → HERMES</b>\n'
+            f'{sym}: {trade["direction"]} @ {trade.get("entry","?")}\n'
+            f'Lots: {trade.get("lots","?")} | Stop: {trade.get("stop","?")} | TP: {trade.get("target","?")}\n'
+            f'Grund: {trade.get("reason","")}\n'
+            f'Hermes überwacht ab sofort.',
+            key=f'claude_trade_{sym}'
+        )
+
+    return jsonify({
+        'ok':           True,
+        'ibkr_stored':  bool(ibkr),
+        'trade_stored': bool(trade),
+        'ts':           ts,
+    })
+
+
+@app.route('/hermes/claude-session')
+def hermes_claude_session():
+    """
+    Claude holt am Morgen vor dem Trading den vollständigen Hermes-Kontext.
+    Gibt alles zurück was Claude braucht: Marktbias, NAS/Gold IBKR-Daten,
+    Brain-News, aktive Trades, Hermes-Einschätzung für heute.
+    """
+    data    = state.get('results') or {}
+    bwv     = state.get('brain_worldview', {})
+    longs   = data.get('longs',  [])[:10]
+    shorts  = data.get('shorts', [])[:10]
+    brain_n = state.get('brain_news', [])
+
+    qqq_chg = bwv.get('qqq', 0)
+    focus   = bwv.get('focus', 'BALANCED')
+
+    # NAS100-relevante Signale
+    nas_set  = {'QQQ', 'TQQQ', 'SQQQ', 'NVDA', 'TSLA', 'META', 'AAPL', 'MSFT', 'AMZN', 'GOOGL', 'AMD', 'SPY'}
+    gold_set = {'GLD', 'GDX', 'GDXJ', 'SLV', 'IAU', 'NEM', 'GOLD'}
+
+    nas_longs  = [r for r in longs  if r.get('t') in nas_set][:4]
+    nas_shorts = [r for r in shorts if r.get('t') in nas_set][:4]
+    gold_sigs  = [r for r in longs + shorts if r.get('t') in gold_set][:3]
+
+    # Brain-News nach NAS/Gold filtern
+    def _news_for(ticker_set):
+        return [n for n in brain_n if any(t in ticker_set for t in n.get('tickers', []))][:5]
+
+    nas_news  = _news_for(nas_set | {'NAS100', 'NASDAQ', 'QQQ', 'NDX'})
+    gold_news = _news_for(gold_set | {'GOLD', 'XAUUSD', 'XAU'})
+
+    # IBKR-Daten von Claude (falls schon gepusht)
+    claude_ibkr = state.get('claude_ibkr', {})
+
+    # Hermes Handlungsempfehlung für Claude
+    rec_nas = 'LONG' if focus in ('LONG_HUNT', 'LONG_LEAN') and qqq_chg > -1 else \
+              'SHORT' if focus in ('SHORT_HUNT', 'SHORT_LEAN') or qqq_chg < -1 else 'WARTEN'
+    rec_gold = 'LONG' if any(r.get('signal') == 'LONG' for r in gold_sigs) else \
+               'SHORT' if any(r.get('signal') == 'SHORT' for r in gold_sigs) else 'NEUTRAL'
+
+    # Alle Brain-News letzten 2h
+    recent_all = brain_n[:10]
+
+    return jsonify({
+        'hermes_briefing': {
+            'market_focus':   focus,
+            'market_bias':    bwv.get('market', 'NEUTRAL'),
+            'qqq_chg':        round(qqq_chg, 2),
+            'market_reason':  bwv.get('reason', ''),
+            'recommendation': {
+                'nas100':  rec_nas,
+                'gold':    rec_gold,
+            },
+        },
+        'nas100': {
+            'hermes_longs':  [{'t': r['t'], 'score': r.get('score'), 'reasons': r.get('reasons',[])} for r in nas_longs],
+            'hermes_shorts': [{'t': r['t'], 'score': r.get('score'), 'reasons': r.get('reasons',[])} for r in nas_shorts],
+            'news':          nas_news,
+            'ibkr_price':    claude_ibkr.get('nas_price'),
+            'ibkr_chg':      claude_ibkr.get('nas_chg'),
+        },
+        'gold': {
+            'hermes_signals': [{'t': r['t'], 'signal': r.get('signal'), 'score': r.get('score')} for r in gold_sigs],
+            'news':           gold_news,
+            'ibkr_price':     claude_ibkr.get('gold_price'),
+            'ibkr_chg':       claude_ibkr.get('gold_chg'),
+        },
+        'brain_news_recent': [{'headline': n['headline'][:100], 'action': n['action'],
+                                'tickers': n['tickers'], 'time': n['time']} for n in recent_all],
+        'claude_trades_open': [t for t in state.get('claude_trades', []) if t.get('status') == 'OPEN'],
+        'claude_ibkr':        claude_ibkr,
+        'fall_candidates':    [fc['sym'] for fc in state.get('market_fall_candidates', [])[:5]],
+        'hermes_ts':          state.get('hermes_ts', ''),
+        'timestamp':          datetime.now().strftime('%H:%M'),
+    })
 
 
 @app.route('/alpaca/order', methods=['POST'])
