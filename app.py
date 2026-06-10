@@ -2402,6 +2402,35 @@ function renderResults(data, isNew) {
     html += '</div>';
   }
 
+  // ── Market Fall Screener — wenn Markt fällt: zeige sensitivste Aktien ───────
+  const fallCands = data.market_fall_candidates || [];
+  const fallQqq   = data.market_fall_qqq || 0;
+  if (fallCands.length > 0 && fallQqq <= -1.0) {
+    let fallColor = fallQqq <= -3 ? '#ff2244' : fallQqq <= -2 ? '#ff4d6b' : '#ff8800';
+    html += '<div class="section"><div class="section-title" style="color:' + fallColor + ';border-left:3px solid ' + fallColor + '">📉 MARKT FÄLLT ' + fallQqq.toFixed(1) + '% — SENSITIVSTE AKTIEN (SHORT Kandidaten)</div>';
+    html += '<div style="padding:6px 14px;font-size:11px;color:#94a3b8">Diese Aktien fallen überproportional wenn der Markt fällt — ideal für PUT/SHORT Setups</div>';
+    fallCands.slice(0,10).forEach(s => {
+      let sc   = s.score || 0;
+      let scCol = sc >= 8 ? '#ff2244' : sc >= 6 ? '#ff4d6b' : '#ff8800';
+      let r0   = (s.reasons||[])[0] || '';
+      let r1   = (s.reasons||[])[1] || '';
+      let chgStr = (s.chg >= 0 ? '+' : '') + s.chg + '%';
+      let chgCol = s.chg < 0 ? '#ff4d6b' : '#94a3b8';
+      let volBadge = s.vol_ratio >= 2 ? '<span style="font-size:10px;background:#2a0a0a;border:1px solid #ff4d6b66;color:#ff4d6b;padding:1px 5px;border-radius:6px;margin-left:5px">Vol ' + s.vol_ratio + 'x</span>' : '';
+      html += '<div style="padding:8px 14px;border-bottom:1px solid #1a0a0a;display:flex;justify-content:space-between;align-items:center">'
+        + '<div>'
+        +   '<span style="font-size:15px;font-weight:bold;color:#fff">' + s.sym + '</span>'
+        +   ' <span style="font-size:12px;color:#94a3b8">$' + (s.price||0).toFixed(2) + '</span>'
+        +   ' <span style="font-size:13px;color:' + chgCol + ';font-weight:bold">' + chgStr + '</span>'
+        +   volBadge
+        +   '<div style="font-size:10px;color:#94a3b8;margin-top:2px">' + r0 + (r1 ? ' | ' + r1 : '') + '</div>'
+        + '</div>'
+        + '<div style="font-size:20px;font-weight:bold;color:' + scCol + ';min-width:32px;text-align:right">' + sc + '</div>'
+        + '</div>';
+    });
+    html += '</div>';
+  }
+
   // ── IBKR Most Traded — Weltgrößter Broker als Datenquelle ──────────────
   const ibkrData = data.ibkr_data || {};
   const ibkrScan = data.ibkr_scan || [];
@@ -3436,12 +3465,14 @@ def results():
             out['social_deep']         = state.get('social_deep', [])
             out['alpaca_portfolio']    = state.get('alpaca_portfolio', {})
             out['hermes_memory']       = state.get('hermes_memory', {})
-            out['hermes_24h']          = state.get('hermes_24h', [])
-            out['hermes_learning']     = load_learning()
-            out['hermes_identity']     = load_identity()
-            out['ibkr_data']           = state.get('ibkr_data', {})
-            out['ibkr_scan']           = state.get('ibkr_scan', [])
-            out['ibkr_ts']             = state.get('ibkr_ts')
+            out['hermes_24h']              = state.get('hermes_24h', [])
+            out['hermes_learning']         = load_learning()
+            out['hermes_identity']         = load_identity()
+            out['ibkr_data']               = state.get('ibkr_data', {})
+            out['ibkr_scan']               = state.get('ibkr_scan', [])
+            out['ibkr_ts']                 = state.get('ibkr_ts')
+            out['market_fall_candidates']  = state.get('market_fall_candidates', [])
+            out['market_fall_qqq']         = state.get('market_fall_qqq', 0)
         return jsonify(_to_json_safe(out))
     except Exception as e:
         return jsonify({'error': f'Server Fehler: {str(e)[:120]}'})
@@ -3726,6 +3757,15 @@ def hermes_ai_analysis(scan_data: dict, hunt_alerts: list) -> str:
         asch_long_str  = ', '.join(f"{r['t']} {r.get('prev_chg',0):+.1f}% Score:{r['score']}" for r in asch_l[:5]) or 'nicht im Scan'
         asch_short_str = ', '.join(f"{r['t']} {r.get('prev_chg',0):+.1f}% Score:{r['score']}" for r in asch_s[:5]) or 'nicht im Scan'
 
+        # Market Fall Kandidaten (wenn QQQ < -1%)
+        fall_cands = state.get('market_fall_candidates', [])
+        fall_qqq   = state.get('market_fall_qqq', 0)
+        if fall_cands and fall_qqq <= -1.0:
+            fall_lines = '\n'.join(f"  {fc['sym']} {fc['chg']:+.1f}% Score:{fc['score']} — {fc['reasons'][0] if fc['reasons'] else ''}" for fc in fall_cands[:5])
+            fall_section = f"\n=== ⚠️ MARKT FÄLLT {fall_qqq:.1f}% — SENSITIVSTE SHORT-KANDIDATEN ===\n{fall_lines}\n→ Diese fallen überproportional. News-Katalysator? Verwässerung? PUT Setup?"
+        else:
+            fall_section = ''
+
         prompt = f"""Du bist Hermes, ein professioneller AI Trading-Agent mit Selbstlern-Fähigkeit.
 
 === DEINE EIGENEN REGELN (selbst gelernt) ===
@@ -3750,7 +3790,7 @@ LONG KI: NBIS(38%=$2.6B), KEEL, CLSK, RIOT, BTDR, IREN
 SHORT Semis (PUT): SMH($2B), NVDA($1.57B), ORCL($1.07B), AVGO($1B), AMD($969M)
 → Longs heute: {asch_long_str}
 → Shorts heute: {asch_short_str}
-
+{fall_section}
 === POLYGON SCANNER — LONGS ({len(longs)}) ===
 {chr(10).join(long_lines) or '  keine'}
 
@@ -3761,13 +3801,13 @@ SHORT Semis (PUT): SMH($2B), NVDA($1.57B), ORCL($1.07B), AVGO($1B), AMD($969M)
 {chr(10).join(hunt_lines) or '  keine'}
 
 Trading-Briefing auf Deutsch:
-1. MAKRO CHECK: Wie beeinflusst VIX/Yield/Regime die heutigen Setups?
-2. SEC/NEWS: Gibt es 8-K oder Insider-Trades die ein Signal bestätigen/verneinen?
-3. TOP TRADE: Bestes Setup heute (Polygon + Smart Money + Makro zusammen)
-4. WARNUNG: Was meide ich heute basierend auf meinen eigenen Regeln?
+1. MAKRO CHECK: VIX/Yield/Regime — was bedeutet das für heute?
+2. NEWS/SEC: Gibt es Verwässerung, Downgrade oder 8-K die ein Signal erklären/verneinen?
+3. TOP TRADE: Bestes Setup (Long ODER Short — je nach Markt-Regime!)
+4. MARKT-FALL: Falls QQQ fällt — welche Aktie fällt am meisten und warum?
 5. FAZIT: 1 klarer Satz.
 
-Max 220 Wörter. Kombiniere Polygon-Flow mit Makro-Kontext."""
+Max 220 Wörter. Bei fallendem Markt: SHORT-Setups bevorzugen, LONG nur bei starkem Einzelsignal."""
 
         return _nous_call(
             prompt,
@@ -4151,6 +4191,22 @@ def hermes_monitor():
                         data.get('longs',  []),
                         data.get('shorts', [])
                     )
+
+                    # 3b) Market Fall Screener — wenn Markt fällt: zeige sensitivste Aktien
+                    try:
+                        from scanner import get_market_fall_candidates, get_market_context
+                        _mkt = get_market_context()
+                        _fall_cands = get_market_fall_candidates(_mkt)
+                        state['market_fall_candidates'] = _fall_cands
+                        state['market_fall_qqq']        = _mkt.get('qqq_chg', 0)
+                        if _fall_cands and _mkt.get('qqq_chg', 0) <= -2.0:
+                            top3 = _fall_cands[:3]
+                            lines_fc = [f'<b>📉 MARKT FÄLLT {_mkt["qqq_chg"]:+.1f}% — SENSITIVSTE AKTIEN:</b>']
+                            for fc in top3:
+                                lines_fc.append(f'<b>{fc["sym"]}</b> {fc["chg"]:+.1f}% — {fc["reasons"][0] if fc["reasons"] else ""}')
+                            tg_send('\n'.join(lines_fc), key=f'fall_{datetime.now().strftime("%H")}')
+                    except Exception:
+                        pass
 
                     # 4) Neue starke Signale in Memory speichern
                     for sig_r in data.get('longs', [])[:5] + data.get('shorts', [])[:3]:

@@ -1555,6 +1555,131 @@ def get_alpaca_snapshot(tickers: list) -> dict:
         return {}
 
 
+# ── Market Fall Screener: Aktien die MEHR fallen wenn der Markt fällt ─────────
+def get_market_fall_candidates(mkt: dict = None) -> list:
+    """
+    Wenn QQQ < -1.5%: Suche Aktien die SENSIBLER sind als der Markt.
+    Kriterien: High-Beta Tech, Dilution/Offering News, 7T-Downtrend, hoher Put-Druck.
+    Beispiel SMCI: -$10 wegen Aktienangebot → fällt viel stärker als der Index.
+    """
+    if mkt is None:
+        mkt = get_market_context()
+    qqq_chg = mkt.get('qqq_chg', 0)
+    if qqq_chg > -1.0:
+        return []  # Markt fällt nicht → kein Screener nötig
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    # High-Beta Tech & Momentum Aktien — fallen überproportional bei Marktfall
+    fall_universe = [
+        'SMCI','NVDA','AMD','TSLA','MSTR','COIN','HOOD','PLTR','IONQ','RGTI','QUBT',
+        'ASTS','RKLB','SOFI','RIOT','CLSK','MARA','IREN','APLD','CRWV','BE','KEEL',
+        'NBIS','AMBA','WOLF','OPEN','UPST','AFRM','LMND','CLOV','SPCE','WKHS',
+        'BBAI','SOUN','AIXI','ARQT','BLNK','CHPT','WULF','BTDR','BITI',
+    ]
+    # Auch Kandidaten aus dem Haupt-Universe hinzufügen
+    try:
+        from scanner import UNIVERSE as _U
+        fall_universe = list(set(fall_universe + list(_U)[:30]))
+    except Exception:
+        pass
+
+    candidates = []
+
+    # Alpaca Snapshot für alle Kandidaten
+    try:
+        snap_data = {}
+        for i in range(0, len(fall_universe), 30):
+            chunk = fall_universe[i:i+30]
+            s = get_alpaca_snapshot(chunk)
+            snap_data.update(s)
+    except Exception:
+        snap_data = {}
+
+    news_cutoff = (datetime.now() - timedelta(hours=48)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    def _check_fall(sym):
+        snap = snap_data.get(sym, {})
+        dbar = snap.get('dailyBar', {})
+        pbar = snap.get('prevDailyBar', {})
+        price = float(dbar.get('c') or 0)
+        prev  = float(pbar.get('c') or price or 1)
+        if price < 3:
+            return None
+        chg   = round((price - prev) / prev * 100, 1) if prev else 0
+        vol   = int(dbar.get('v') or 0)
+        pvol  = int(pbar.get('v') or 1)
+        vol_r = round(vol / pvol, 1) if pvol else 0
+
+        score   = 0
+        reasons = []
+
+        # 1) Heute stark gefallen → beweist Sensitivität
+        if chg <= -10:
+            score += 6; reasons.append(f'Heute {chg:+.1f}% — Mega-Absturz')
+        elif chg <= -6:
+            score += 4; reasons.append(f'Heute {chg:+.1f}% — Starker Fall')
+        elif chg <= -3:
+            score += 2; reasons.append(f'Heute {chg:+.1f}%')
+        elif chg > 0:
+            score -= 2  # Steigt gegen fallenden Markt → weniger sensitiv
+
+        # 2) Hohes Volumen bei Fall = echter Abverkauf, kein Rauschen
+        if chg <= -3 and vol_r >= 3:
+            score += 3; reasons.append(f'Volumen {vol_r:.0f}x bei Abverkauf — Smart Money raus')
+        elif chg <= -2 and vol_r >= 2:
+            score += 1; reasons.append(f'Volumen {vol_r:.0f}x')
+
+        # 3) News-Check: Dilution/Offering = Katalysator für weiteren Fall
+        try:
+            news = al_news_for_sym(sym, limit=5)
+            for n in news:
+                if n.get('published_utc', '') < news_cutoff:
+                    continue
+                tl = n.get('title', '').lower()
+                if any(k in tl for k in HARD_NEG_KEYS):
+                    score += 5; reasons.append(f'VERWÄSSERUNG: {n["title"][:55]}')
+                    break
+                elif any(k in tl for k in ['downgrade', 'cut', 'sell', 'miss', 'below']):
+                    score += 2; reasons.append(f'Neg.News: {n["title"][:50]}')
+                    break
+        except Exception:
+            pass
+
+        # 4) Put/Call Ratio (hoher Wert = Markt wettet auf weiteren Fall)
+        try:
+            pc_data = get_options_pc_ratio()
+            sym_pc = pc_data.get('per_sym', {}).get(sym, {}).get('pc', 0)
+            if sym_pc >= 1.5:
+                score += 3; reasons.append(f'P/C {sym_pc:.2f} — starker Put-Druck')
+            elif sym_pc >= 1.0:
+                score += 1; reasons.append(f'P/C {sym_pc:.2f}')
+        except Exception:
+            pass
+
+        # Mindest-Score: muss mindestens fallen oder negative News haben
+        if score < 3:
+            return None
+
+        return {
+            'sym': sym, 'price': round(price, 2), 'chg': chg,
+            'vol_ratio': vol_r, 'score': score, 'reasons': reasons[:3],
+            'qqq_chg': qqq_chg,
+        }
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs = {ex.submit(_check_fall, sym): sym for sym in fall_universe}
+        for fut in as_completed(futs, timeout=30):
+            try:
+                r = fut.result()
+                if r:
+                    candidates.append(r)
+            except Exception:
+                pass
+
+    candidates.sort(key=lambda x: -x['score'])
+    return candidates[:12]
+
+
 # ── Hermes Hunt: übersehene 10%+ Mover suchen ────────────────────────────────
 def hermes_hunt(current_longs: list, current_shorts: list) -> list:
     """
@@ -2558,9 +2683,11 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         mkt_bias = mkt.get('bias', 'NEUTRAL')
         if mkt_bias == 'STRONG_BEAR':
             short_score += 3
+            long_score = max(0, long_score - 3)  # LONG-Signale bei Marktabsturz unterdrücken
             reasons_short.append(f'Markt STARK BEARISH — QQQ {mkt["qqq_chg"]:+.1f}% VXX +{mkt["vxx_chg"]:.1f}%')
         elif mkt_bias == 'BEAR':
             short_score += 2
+            long_score = max(0, long_score - 1)  # Leichte LONG-Dämpfung bei bearishem Markt
             reasons_short.append(f'Markt BEARISH — QQQ {mkt["qqq_chg"]:+.1f}%')
         elif mkt_bias == 'STRONG_BULL':
             long_score += 3
@@ -2874,6 +3001,13 @@ def scan_ticker(ticker, today, exp_cutoff, news_cutoff):
         # Verhindert SHORT auf Stocks die heute schon +10%+ gestiegen sind (falsche Richtung)
         elif signal == 'SHORT' and prev_chg >= 10:
             signal, score, best, otype = 'WATCH', 0, bc or bp, None
+        # SMCI-Fix: HARD NEG (Dilution/Secondary Offering) → KEIN LONG wenn Kurs bereits -5%
+        # Beispiel: Aktienangebot = Verwässerung = Kurs fällt weiter, LONG wäre falsch
+        elif signal == 'LONG' and katalysator == 'NEGATIV' and katalysator_strength == 'HIGH' and prev_chg <= -5:
+            if bp:
+                signal, score, best, otype = 'SHORT', short_score, bp, 'PUT'
+            else:
+                signal, score, best, otype = 'WATCH', 0, bc or bp, None
 
         # Call-Sweep Widerspruch: viele Call-Sweeps = bullisches Signal
         # SHORT bei >= 5 Call-Sweeps nur erlaubt wenn NEGATIV-Katalysator oder Crash
