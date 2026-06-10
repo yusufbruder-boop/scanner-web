@@ -4803,6 +4803,133 @@ Marktschluss-Zusammenfassung (Deutsch, max 150 Wörter):
             time.sleep(60)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MULTI-AGENT KOMMUNIKATION — Hermes ↔ Bots ↔ Claude
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route('/hermes/intel')
+def hermes_intel_api():
+    """
+    Schnelles Intel-Endpoint für externe Bots + Claude.
+    Gibt aktuellen Marktbias, Top-Signale, Breaking News und Brain-Status zurück.
+    Bitget Bot + MT5 + Claude fragen hier an bevor sie traden/entscheiden.
+    """
+    data    = state.get('results') or {}
+    bwv     = state.get('brain_worldview', {})
+    mkt_ctx = state.get('market_context_cache', {})
+
+    longs  = data.get('longs',  [])[:5]
+    shorts = data.get('shorts', [])[:5]
+
+    qqq_chg = bwv.get('qqq', 0)
+    focus   = bwv.get('focus', 'BALANCED')
+
+    # ok_long / ok_short — einfache Boolean-Flags für Bots
+    ok_long  = focus not in ('SHORT_HUNT',) and qqq_chg > -2.0
+    ok_short = focus not in ('LONG_HUNT',)  and qqq_chg < 2.0
+
+    # Breaking News (letzter Brain-Fund)
+    brain_news  = state.get('brain_news', [])
+    latest_news = brain_news[0].get('headline', '') if brain_news else ''
+
+    # Bot-Positionen (gemeldet via /hermes/bot-status)
+    bot_positions = state.get('bot_positions', {})
+
+    # Hermes Picks (Score >= 8)
+    top_longs  = [r['t'] for r in longs  if r.get('score', 0) >= 7][:5]
+    top_shorts = [r['t'] for r in shorts if r.get('score', 0) >= 7][:5]
+
+    # Market Fall Kandidaten
+    fall_cands = [fc['sym'] for fc in state.get('market_fall_candidates', [])[:5]]
+
+    return jsonify({
+        'bias':          bwv.get('market', 'NEUTRAL'),
+        'brain_focus':   focus,
+        'qqq_chg':       round(qqq_chg, 2),
+        'ok_long':       ok_long,
+        'ok_short':      ok_short,
+        'top_longs':     top_longs,
+        'top_shorts':    top_shorts,
+        'fall_candidates': fall_cands,
+        'breaking_news': latest_news[:120],
+        'bot_positions': bot_positions,
+        'hermes_ts':     state.get('hermes_ts', ''),
+        'timestamp':     datetime.now().strftime('%H:%M'),
+    })
+
+
+@app.route('/hermes/bot-status', methods=['POST'])
+def hermes_bot_status():
+    """
+    Bots melden ihre offenen Positionen + letzten Trade an Hermes.
+    Hermes kann dann gezielt News für diese Positionen überwachen.
+    Body: {bot: 'bitget'|'mt5', positions: [...], last_trade: {...}}
+    """
+    body = request.get_json(force=True) or {}
+    bot  = body.get('bot', 'unknown')
+    pos  = body.get('positions', [])
+    lt   = body.get('last_trade', {})
+
+    if not state.get('bot_positions'):
+        state['bot_positions'] = {}
+    state['bot_positions'][bot] = {
+        'positions':   pos,
+        'last_trade':  lt,
+        'updated':     datetime.now().strftime('%H:%M'),
+    }
+
+    # Hermes überwacht nun gezielt diese Ticker für News
+    watch_tickers = list({p.get('sym', p.get('symbol', ''))
+                          for p in pos if p.get('sym') or p.get('symbol')})
+    if watch_tickers:
+        existing = list(state.get('bot_watch_tickers', set()))
+        state['bot_watch_tickers'] = set(existing + watch_tickers)
+
+    return jsonify({'ok': True, 'watching': watch_tickers})
+
+
+@app.route('/hermes/share', methods=['POST'])
+def hermes_share():
+    """
+    Claude oder andere Agenten teilen Daten mit Hermes.
+    Kann Chart-Daten, externe Signale, MT5 Kontext etc. enthalten.
+    Body: {source: 'claude'|'mt5', type: 'chart'|'signal'|'context', data: {...}}
+    """
+    body   = request.get_json(force=True) or {}
+    source = body.get('source', 'unknown')
+    dtype  = body.get('type', 'info')
+    data   = body.get('data', {})
+
+    if not state.get('shared_intel'):
+        state['shared_intel'] = []
+    state['shared_intel'] = ([{
+        'source': source, 'type': dtype, 'data': data,
+        'ts': datetime.now().strftime('%H:%M'),
+    }] + state.get('shared_intel', []))[:20]
+
+    # Wenn Chart-Daten für NAS100/Gold → in Brain-Kontext einbauen
+    symbol = data.get('symbol', '')
+    if dtype == 'chart' and symbol:
+        direction = data.get('direction', '')
+        reason    = data.get('reason', '')[:80]
+        if direction in ('LONG', 'SHORT'):
+            _brain_prio_q.append(symbol.replace('NAS100', 'QQQ').replace('XAUUSD', 'GLD'))
+            tg_send(
+                f'🔗 <b>HERMES ← {source.upper()}</b>\n'
+                f'{symbol}: {direction} | {reason}\n'
+                f'Hermes scannt zur Bestätigung...',
+                key=f'share_{source}_{symbol}'
+            )
+
+    return jsonify({'ok': True, 'received': {'source': source, 'type': dtype}})
+
+
+@app.route('/hermes/shared-intel')
+def hermes_shared_intel():
+    """Zeigt was Bots + Claude an Hermes gesendet haben."""
+    return jsonify(state.get('shared_intel', []))
+
+
 @app.route('/alpaca/order', methods=['POST'])
 def alpaca_order_api():
     """Hermes platziert Order auf Alpaca Paper. Body: {sym, qty, side}"""
