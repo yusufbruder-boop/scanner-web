@@ -3479,6 +3479,254 @@ def fibonacci_scan(max_workers=4):
     return results
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# STRATEGY MONITOR PRO — alle 5 Strategien aus TradingView (LSOB+GUSS+Dolphin+F882+OMS)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _ema_series(vals, period):
+    if len(vals) < period:
+        return [None] * len(vals)
+    k   = 2.0 / (period + 1)
+    out = [None] * (period - 1)
+    out.append(sum(vals[:period]) / period)
+    for v in vals[period:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
+
+
+def _atr_series(highs, lows, closes, period=14):
+    n   = len(closes)
+    trs = [max(highs[i] - lows[i],
+               abs(highs[i] - closes[i-1]),
+               abs(lows[i]  - closes[i-1])) for i in range(1, n)]
+    if len(trs) < period:
+        return [None] * n
+    out = [None] * period
+    out.append(sum(trs[:period]) / period)
+    for t in trs[period:]:
+        out.append((out[-1] * (period - 1) + t) / period)
+    return out
+
+
+def _strategy_monitor_ticker(sym, fib_tol=0.5, min_score=2, sw_len=5):
+    """
+    Repliziert TradingView Strategy Monitor Pro für ein Symbol:
+    LSOB + GUSS + Dolphin + FIB 0.882 + Old Money Stacks (OMS)
+    Gibt None zurück wenn Score < min_score; sonst vollständiges Signal-Dict.
+    """
+    try:
+        from_d = (datetime.now() - timedelta(days=110)).strftime('%Y-%m-%d')
+        to_d   = datetime.now().strftime('%Y-%m-%d')
+        data   = al_bars(sym, from_d, to_d, limit=100)
+        bars   = data.get('results', [])
+        if len(bars) < 52:
+            return None
+
+        opens  = [b['o'] for b in bars]
+        highs  = [b['h'] for b in bars]
+        lows   = [b['l'] for b in bars]
+        closes = [b['c'] for b in bars]
+        vols   = [b.get('v', 0) for b in bars]
+        n      = len(closes)
+
+        e21_arr = _ema_series(closes, 21)
+        e50_arr = _ema_series(closes, 50)
+        atr_arr = _atr_series(highs, lows, closes, 14)
+
+        i = n - 1
+        if e21_arr[i] is None or e50_arr[i] is None or atr_arr[i] is None:
+            return None
+
+        e21, e50, atr = e21_arr[i], e50_arr[i], atr_arr[i]
+        c, o, h, l    = closes[i], opens[i], highs[i], lows[i]
+        body          = abs(c - o)
+        upper_wick    = h - max(c, o)
+        lower_wick    = min(c, o) - l
+        is_bull_c     = c > o
+        is_bear_c     = c < o
+
+        # ── Fibonacci Pivots (mit Index für Richtungsbestimmung) ────────────
+        sh_idx, sl_idx = None, None
+        for j in range(n - sw_len - 1, sw_len - 1, -1):
+            if sh_idx is None:
+                if (all(highs[j] >= highs[j - k2] for k2 in range(1, sw_len + 1)) and
+                        all(highs[j] >= highs[j + k2] for k2 in range(1, min(sw_len + 1, n - j)))):
+                    sh_idx = j
+            if sl_idx is None:
+                if (all(lows[j] <= lows[j - k2] for k2 in range(1, sw_len + 1)) and
+                        all(lows[j] <= lows[j + k2] for k2 in range(1, min(sw_len + 1, n - j)))):
+                    sl_idx = j
+            if sh_idx and sl_idx:
+                break
+
+        recent = min(30, n)
+        sh  = highs[sh_idx] if sh_idx is not None else max(highs[-recent:])
+        sl  = lows[sl_idx]  if sl_idx  is not None else min(lows[-recent:])
+        rng = sh - sl
+        if rng <= 0:
+            return None
+
+        # Swing-Tief vor Swing-Hoch = bullischer Swing (Retracement von oben)
+        is_bull_sw = (sl_idx or 0) < (sh_idx or 0)
+
+        def fib_lvl(ratio):
+            return (sh - rng * ratio) if is_bull_sw else (sl + rng * ratio)
+
+        def near_fib(price, ratio):
+            lvl = fib_lvl(ratio)
+            return lvl > 0 and abs(price - lvl) / lvl * 100 <= fib_tol
+
+        def at_key_fib(price):
+            return any(near_fib(price, r) for r in (0.5, 0.618, 0.65, 0.786, 0.882))
+
+        def at_key_fib_low(price):
+            return any(near_fib(price, r) for r in (0.5, 0.618, 0.786, 0.882))
+
+        # EMA-Cross (nur auf aktuellem Bar)
+        ema_cross = (i > 0 and e21_arr[i-1] is not None and e50_arr[i-1] is not None and
+                     ((e21_arr[i-1] < e50_arr[i-1] and e21 >= e50) or
+                      (e21_arr[i-1] > e50_arr[i-1] and e21 <= e50)))
+
+        # ── STRATEGIE 1: LSOB (Liquidity Sweep + Orderblock) ───────────────
+        def bull_sweep_at(idx):
+            if idx < 20: return False
+            swl = min(lows[idx - 20:idx])
+            return lows[idx] < swl and closes[idx] > swl and closes[idx] > opens[idx]
+
+        def bear_sweep_at(idx):
+            if idx < 20: return False
+            swh = max(highs[idx - 20:idx])
+            return highs[idx] > swh and closes[idx] < swh and closes[idx] < opens[idx]
+
+        ob_bull_valid = (i >= 3 and bull_sweep_at(i - 2) and
+                         closes[i-1] > opens[i-1] and is_bull_c)
+        ob_bear_valid = (i >= 3 and bear_sweep_at(i - 2) and
+                         closes[i-1] < opens[i-1] and is_bear_c)
+
+        lsob_bull_sig = ob_bull_valid
+        lsob_bear_sig = ob_bear_valid
+        lsob_bull_fib = ob_bull_valid and at_key_fib_low(lows[i - 2])
+        lsob_bear_fib = ob_bear_valid and at_key_fib(highs[i - 2])
+
+        # ── STRATEGIE 2: GUSS (EMA50 Sniper — saubere Korrektur zu EMA50) ───
+        guss_sig = guss_fib = False
+        if i >= 16:
+            hh_idx = None
+            for j in range(i - 2, max(i - 25, 14), -1):
+                if (e21_arr[j] and highs[j] == max(highs[max(0, j-14):j+1]) and
+                        highs[j] > e21_arr[j] * 1.002 and closes[j] > e21_arr[j]):
+                    hh_idx = j
+                    break
+            if hh_idx is not None and (i - hh_idx) <= 25:
+                bull_in_corr = sum(1 for k2 in range(hh_idx + 1, i)
+                                   if closes[k2] > opens[k2] * 1.001)
+                if (lows[i] <= e50 * 1.001 and closes[i] >= e50 * 0.998 and
+                        bull_in_corr == 0 and is_bull_c):
+                    guss_sig = True
+                    guss_fib = any(near_fib(e50, r) for r in (0.5, 0.618, 0.667))
+
+        # ── STRATEGIE 3: DOLPHIN (EMA21-Docht-Touch) ───────────────────────
+        dolphin_long_sig  = (c > e21 and l <= e21 and c > e21 * 0.999 and
+                             lower_wick > body * 0.1 and e21 > e50 and
+                             not ema_cross and is_bull_c)
+        dolphin_short_sig = (c < e21 and h >= e21 and c < e21 * 1.001 and
+                             upper_wick > body * 0.1 and e21 < e50 and
+                             not ema_cross and is_bear_c)
+        dolphin_long_fib  = dolphin_long_sig  and at_key_fib_low(l)
+        dolphin_short_fib = dolphin_short_sig and at_key_fib(h)
+
+        # ── STRATEGIE 4: FIB 0.882 SNIPER ──────────────────────────────────
+        f882_long_sig  = near_fib(l, 0.882) and is_bull_c and c > l * 1.001
+        f882_short_sig = near_fib(h, 0.882) and is_bear_c and c < h * 0.999
+
+        # ── STRATEGIE 5: OLD MONEY STACKS (S/R Breakout) ───────────────────
+        body_over_res  = c > sh and o > sh * 0.998
+        wick_ok_long   = upper_wick <= body * 0.3
+        oms_long_sig   = body_over_res and wick_ok_long and is_bull_c and body > atr * 0.3
+
+        body_under_sup = c < sl and o < sl * 1.002
+        wick_ok_short  = lower_wick <= body * 0.3
+        oms_short_sig  = body_under_sup and wick_ok_short and is_bear_c and body > atr * 0.3
+
+        oms_long_fib   = oms_long_sig  and at_key_fib(c)
+        oms_short_fib  = oms_short_sig and at_key_fib_low(c)
+
+        # ── CONFLUENCE SCORING ──────────────────────────────────────────────
+        bull_score     = sum([lsob_bull_sig, guss_sig, dolphin_long_sig, f882_long_sig, oms_long_sig])
+        bear_score     = sum([lsob_bear_sig, dolphin_short_sig, f882_short_sig, oms_short_sig])
+        bull_fib_bonus = sum([lsob_bull_fib, guss_fib, dolphin_long_fib, oms_long_fib])
+        bear_fib_bonus = sum([lsob_bear_fib, dolphin_short_fib, oms_short_fib])
+
+        bull_total = bull_score + bull_fib_bonus
+        bear_total = bear_score + bear_fib_bonus
+
+        strong_long  = bull_total >= min_score
+        strong_short = bear_total >= min_score
+
+        if not (strong_long or strong_short):
+            return None
+
+        # Aktive Strategien als Label sammeln
+        strats_long, strats_short = [], []
+        if lsob_bull_sig:     strats_long.append('LSOB'  + ('+FIB' if lsob_bull_fib   else ''))
+        if guss_sig:          strats_long.append('GUSS'  + ('+FIB' if guss_fib         else ''))
+        if dolphin_long_sig:  strats_long.append('DOLPH' + ('+FIB' if dolphin_long_fib else ''))
+        if f882_long_sig:     strats_long.append('FIB882')
+        if oms_long_sig:      strats_long.append('OMS'   + ('+FIB' if oms_long_fib     else ''))
+
+        if lsob_bear_sig:     strats_short.append('LSOB'  + ('+FIB' if lsob_bear_fib    else ''))
+        if dolphin_short_sig: strats_short.append('DOLPH' + ('+FIB' if dolphin_short_fib else ''))
+        if f882_short_sig:    strats_short.append('FIB882')
+        if oms_short_sig:     strats_short.append('OMS'   + ('+FIB' if oms_short_fib     else ''))
+
+        direction = 'LONG' if bull_total >= bear_total else 'SHORT'
+        score     = max(bull_total, bear_total)
+        avg_vol   = sum(vols[-20:]) / max(1, min(20, len(vols)))
+        vol_ratio = round(vols[-1] / avg_vol, 2) if avg_vol > 0 else 1.0
+        candle    = _candle_pattern(opens, highs, lows, closes, idx=-1)
+        chg_pct   = round((c - closes[-2]) / closes[-2] * 100, 2) if n >= 2 else 0.0
+
+        return {
+            'sym':          sym,
+            'direction':    direction,
+            'score':        score,
+            'bull_total':   bull_total,
+            'bear_total':   bear_total,
+            'strong_long':  strong_long,
+            'strong_short': strong_short,
+            'price':        round(c, 4),
+            'chg_pct':      chg_pct,
+            'vol_ratio':    vol_ratio,
+            'candle':       candle,
+            'strats_long':  strats_long,
+            'strats_short': strats_short,
+            'ema21':        round(e21, 4),
+            'ema50':        round(e50, 4),
+            'atr':          round(atr, 4),
+            'swing_high':   round(sh, 4),
+            'swing_low':    round(sl, 4),
+            'fib_882':      round(fib_lvl(0.882), 4),
+            'fib_786':      round(fib_lvl(0.786), 4),
+            'fib_618':      round(fib_lvl(0.618), 4),
+            'fib_500':      round(fib_lvl(0.5),   4),
+        }
+    except Exception:
+        return None
+
+
+def strategy_monitor_scan(max_workers=4):
+    """Scant alle FIB_UNIVERSE Symbole mit Strategy Monitor Pro (5 Strategien)."""
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_strategy_monitor_ticker, sym): sym for sym in FIB_UNIVERSE}
+        for fut in as_completed(futures):
+            r = fut.result()
+            if r:
+                results.append(r)
+    results.sort(key=lambda x: (x['score'], x['vol_ratio']), reverse=True)
+    return results
+
+
 # ── SHORT SQUEEZE / LOW-FLOAT PUMP SCANNER ────────────────────────────────────
 # Findet Setups wie PAVS (+2300%) bevor oder genau wenn sie explodieren.
 # Signale: tiny float + hohe Short-Interest-Proxy + Volumen-Spike + Katalysator

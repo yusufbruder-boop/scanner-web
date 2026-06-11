@@ -190,6 +190,9 @@ state = {
     'fib_last_scan':   None,        # Zeitstempel letzter Fib-Scan
     # Trump/Makro Katalysator — marktweiter Move
     'trump_catalyst':  None,        # {direction, headline, strength, ts, age_min}
+    # Strategy Monitor Pro — 5 Strategien aus TradingView
+    'strategy_monitor': [],         # [{sym, direction, score, strats_long/short, ...}]
+    'strategy_monitor_ts': None,    # Zeitstempel letzter Scan
 }
 _hermes_lock = threading.Lock()
 _scan_lock   = threading.Lock()   # verhindert gleichzeitige Scans
@@ -5275,6 +5278,22 @@ Marktschluss-Zusammenfassung (Deutsch, max 150 Wörter):
             time.sleep(60)
 
 
+def _build_strategy_signals():
+    """Gibt die Top-5 LONG und SHORT Signale aus dem Strategy Monitor zurück."""
+    sm     = state.get('strategy_monitor', [])
+    ts     = state.get('strategy_monitor_ts', '')
+    longs  = sorted([r for r in sm if r.get('strong_long')],
+                    key=lambda x: (x['bull_total'], x['vol_ratio']), reverse=True)[:5]
+    shorts = sorted([r for r in sm if r.get('strong_short')],
+                    key=lambda x: (x['bear_total'], x['vol_ratio']), reverse=True)[:5]
+    return {
+        'longs':  longs,
+        'shorts': shorts,
+        'count':  len(sm),
+        'ts':     ts,
+    }
+
+
 def _build_trump_catalyst():
     """Gibt Trump-Katalysator zurück wenn er < 20 Minuten alt ist, sonst None."""
     tc = state.get('trump_catalyst')
@@ -5387,6 +5406,8 @@ def hermes_intel_api():
         'recent_news':   recent_news,
         # Trump/Makro Katalysator (Bot handelt ALLE Symbole wenn aktiv)
         'trump_catalyst': _build_trump_catalyst(),
+        # Strategy Monitor Pro — 5 Strategien (LSOB+GUSS+Dolphin+FIB882+OMS)
+        'strategy_signals': _build_strategy_signals(),
         # Top Signale
         'top_longs':     [r['t'] for r in longs  if r.get('score', 0) >= 7][:5],
         'top_shorts':    [r['t'] for r in shorts if r.get('score', 0) >= 7][:5],
@@ -6030,6 +6051,45 @@ except Exception:
     pass
 
 # Auto-Scheduler im Hintergrund starten
+def strategy_monitor_loop():
+    """
+    Strategy Monitor Pro — läuft alle 10 Minuten.
+    Scannt alle FIB_UNIVERSE Symbole nach: LSOB + GUSS + Dolphin + FIB 0.882 + OMS.
+    Schreibt Ergebnisse in state['strategy_monitor'] für /hermes/intel + Bitget Bot.
+    """
+    import time as _time
+    _time.sleep(30)   # kurzer Startup-Delay
+
+    while True:
+        try:
+            from scanner import strategy_monitor_scan
+            results = strategy_monitor_scan(max_workers=4)
+            state['strategy_monitor']    = results
+            state['strategy_monitor_ts'] = datetime.now().strftime('%H:%M')
+
+            longs  = [r for r in results if r.get('strong_long')]
+            shorts = [r for r in results if r.get('strong_short')]
+
+            if longs or shorts:
+                msg_parts = []
+                if longs:
+                    top = longs[:3]
+                    msg_parts.append('📈 LONG: ' + ', '.join(
+                        f"{r['sym']} {r['bull_total']}x ({'+'.join(r['strats_long'])})" for r in top
+                    ))
+                if shorts:
+                    top = shorts[:3]
+                    msg_parts.append('📉 SHORT: ' + ', '.join(
+                        f"{r['sym']} {r['bear_total']}x ({'+'.join(r['strats_short'])})" for r in top
+                    ))
+                logging.info('[StratMon] ' + ' | '.join(msg_parts))
+
+        except Exception as e:
+            logging.error(f'[StratMon] Fehler: {e}')
+
+        _time.sleep(600)   # 10 Minuten
+
+
 def hermes_fib_loop():
     """
     Fibonacci 88.2% Auto-Trade Loop — läuft alle 20 Minuten.
@@ -6199,6 +6259,10 @@ squeeze_thread.start()
 # Fibonacci 88.2% Auto-Trade Loop
 fib_thread = threading.Thread(target=hermes_fib_loop, daemon=True)
 fib_thread.start()
+
+# Strategy Monitor Pro — alle 5 Strategien aus TradingView (LSOB+GUSS+Dolphin+FIB882+OMS)
+strat_thread = threading.Thread(target=strategy_monitor_loop, daemon=True)
+strat_thread.start()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
