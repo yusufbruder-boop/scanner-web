@@ -4062,6 +4062,33 @@ def hermes_brain_loop():
                 wv = state['brain_worldview']
                 old_focus = wv.get('focus', 'BALANCED')
 
+                # IBKR Override: frische Claude-Daten haben Vorrang vor Alpaca (< 30 Min)
+                _ibkr_override = None
+                def _get_ibkr_chg():
+                    now_min = datetime.now().hour * 60 + datetime.now().minute
+                    for _src in [state.get('claude_ibkr', {}), state.get('claude_movers', {})]:
+                        upd = _src.get('updated', '')
+                        if not upd:
+                            continue
+                        try:
+                            _h, _m = map(int, upd.split(':'))
+                            if 0 <= now_min - (_h * 60 + _m) <= 30:
+                                if _src.get('nas_chg') is not None:
+                                    return float(_src['nas_chg'])
+                                for _s in _src.get('most_traded_usd', []):
+                                    if _s.get('symbol') == 'QQQ':
+                                        return float(_s.get('chg_pct', 0))
+                        except Exception:
+                            pass
+                    return None
+                _ibkr_override = _get_ibkr_chg()
+                if _ibkr_override is not None:
+                    qqq_chg  = _ibkr_override
+                    mkt_bias = ('STRONG_BULL' if qqq_chg >= 2.0 else
+                                'BULL'        if qqq_chg >= 0.5 else
+                                'STRONG_BEAR' if qqq_chg <= -2.0 else
+                                'BEAR'        if qqq_chg <= -0.5 else 'NEUTRAL')
+
                 if mkt_bias in ('STRONG_BEAR',) or qqq_chg <= -2.0:
                     new_focus = 'SHORT_HUNT'
                 elif mkt_bias == 'BEAR' or qqq_chg <= -1.2:
@@ -4073,10 +4100,11 @@ def hermes_brain_loop():
                 else:
                     new_focus = 'BALANCED'
 
+                _src_label = 'IBKR' if _ibkr_override is not None else 'QQQ'
                 state['brain_worldview'] = {
                     'focus':   new_focus, 'market': mkt_bias,
                     'qqq':     round(qqq_chg, 2),
-                    'reason':  f'QQQ {qqq_chg:+.1f}% | {mkt_bias}',
+                    'reason':  f'{_src_label} {qqq_chg:+.1f}% | {mkt_bias}',
                     'updated': datetime.now().strftime('%H:%M'),
                 }
 
@@ -4086,7 +4114,7 @@ def hermes_brain_loop():
                     tg_send(
                         f'{icons.get(new_focus,"⚪")} <b>HERMES STRATEGIE: {new_focus}</b>\n'
                         f'{old_focus} → {new_focus}\n'
-                        f'QQQ {qqq_chg:+.1f}% | Markt: {mkt_bias}',
+                        f'{_src_label} {qqq_chg:+.1f}% | Markt: {mkt_bias}',
                         key=f'wv_{new_focus}'
                     )
             except Exception:
