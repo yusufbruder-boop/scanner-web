@@ -2440,6 +2440,55 @@ function renderResults(data, isNew) {
     html += '</div>';
   }
 
+  // ── Claude IBKR Mover Analyse — gepusht von Claude ──────────────────────
+  const cm = data.claude_movers || {};
+  const cmList = (cm.most_traded_usd || []);
+  const cs = data.claude_session || {};
+  if (cmList.length > 0 || cs.active) {
+    const cmTs = cm.updated ? ' <span style="font-size:10px;color:#64748b">@ ' + cm.updated + '</span>' : '';
+    const instSig = cm.inst_summary || '';
+    html += '<div class="section"><div class="section-title" style="color:#00e5ff;border-left:3px solid #00e5ff">🏦 IBKR CLAUDE MOVER-ANALYSE' + cmTs + '</div>';
+    if (cs.active) {
+      let nasCol = (cs.nas_chg||0) >= 0 ? '#4dff91' : '#ff4d6b';
+      let goldCol = (cs.gold_chg||0) >= 0 ? '#4dff91' : '#ff4d6b';
+      html += '<div style="padding:8px 14px;display:flex;gap:16px;flex-wrap:wrap;border-bottom:1px solid #0d1a26">'
+        + '<span style="font-size:11px;color:#94a3b8">NAS/QQQ: <b style="color:' + nasCol + '">' + ((cs.nas_chg||0)>=0?'+':'') + (cs.nas_chg||0).toFixed(2) + '%</b> $' + (cs.nas_price||0) + '</span>'
+        + '<span style="font-size:11px;color:#94a3b8">Gold: <b style="color:' + goldCol + '">' + ((cs.gold_chg||0)>=0?'+':'') + (cs.gold_chg||0).toFixed(2) + '%</b> $' + (cs.gold_price||0) + '</span>'
+        + '<span style="font-size:10px;color:#4a6a8a">Push: ' + (cs.last_push||'–') + '</span>'
+        + '</div>';
+    }
+    if (instSig) {
+      html += '<div style="padding:5px 14px;font-size:11px;color:#ffa040;border-bottom:1px solid #0d1a26">⚡ ' + instSig + '</div>';
+    }
+    // Tabelle: meist gehandelt mit inst_signal Farben
+    if (cmList.length > 0) {
+      html += '<div style="padding:5px 14px 2px;font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:1px">MEIST GEHANDELT ($ Vol) — INSTITUTIONELLES SIGNAL</div>';
+      cmList.forEach(s => {
+        let sig = s.inst_signal || '';
+        let isLong  = sig === 'BULLISH' || sig === 'BULLISH_SILVER';
+        let isShort = sig.includes('BEARISH') || sig.includes('SHORT') || sig.includes('MAJOR_SHIFT');
+        let sigCol  = isLong ? '#4dff91' : (isShort ? '#ff4d6b' : '#ffd700');
+        let sigBg   = isLong ? '#0d3a1f' : (isShort ? '#3a0d1a' : '#2a1a00');
+        let sigBorder = isLong ? '#2d9e57' : (isShort ? '#9e2d40' : '#9e8000');
+        let sigArrow = isLong ? '▲ LONG' : (isShort ? '▼ SHORT' : '— NEUTRAL');
+        let chgCol  = (s.chg_pct||0) >= 0 ? '#4dff91' : '#ff4d6b';
+        let cpBadge = s.opt_cp_ratio
+          ? '<span style="font-size:9px;background:#0a0e1a;border:1px solid #1e3a5f;color:#94a3b8;padding:1px 5px;border-radius:3px;margin-left:5px">C/P ' + s.opt_cp_ratio + '</span>'
+          : '';
+        html += '<div style="padding:7px 14px;border-bottom:1px solid #0d1a26;display:flex;justify-content:space-between;align-items:center">'
+          + '<div>'
+          +   '<span style="font-size:14px;font-weight:bold;color:#fff">' + s.symbol + '</span>'
+          +   ' <span style="color:' + chgCol + ';font-size:12px;font-weight:bold">' + ((s.chg_pct||0)>=0?'+':'') + (s.chg_pct||0).toFixed(2) + '%</span>'
+          +   ' <span style="font-size:11px;color:#64748b">$' + (s.vol_usd_m||0) + 'M</span>'
+          +   cpBadge
+          + '</div>'
+          + '<span style="font-size:11px;font-weight:bold;padding:3px 8px;border-radius:6px;background:' + sigBg + ';color:' + sigCol + ';border:1px solid ' + sigBorder + '">' + sigArrow + '</span>'
+          + '</div>';
+      });
+    }
+    html += '</div>';
+  }
+
   // ── IBKR Most Traded — Weltgrößter Broker als Datenquelle ──────────────
   const ibkrData = data.ibkr_data || {};
   const ibkrScan = data.ibkr_scan || [];
@@ -4900,6 +4949,7 @@ def hermes_intel_api():
         # Claude Session
         'claude_session': claude_session,
         'claude_trades':  claude_trades[-5:],
+        'claude_movers':  state.get('claude_movers', {}),
         'hermes_ts':     state.get('hermes_ts', ''),
         'timestamp':     datetime.now().strftime('%H:%M'),
     })
@@ -5008,11 +5058,16 @@ def hermes_claude_push():
       'session_note': 'Morning session, watching NAS support',
     }
     """
-    body  = request.get_json(force=True) or {}
-    ibkr  = body.get('ibkr', {})
-    trade = body.get('trade', {})
-    note  = body.get('session_note', '')
-    ts    = datetime.now().strftime('%H:%M')
+    body   = request.get_json(force=True) or {}
+    ibkr   = body.get('ibkr', {})
+    trade  = body.get('trade', {})
+    note   = body.get('session_note', '')
+    movers = body.get('movers', {})
+    ts     = datetime.now().strftime('%H:%M')
+
+    # IBKR Mover-Daten speichern (mit Timestamp)
+    if movers:
+        state['claude_movers'] = {**movers, 'updated': ts}
 
     # IBKR-Daten speichern (Hermes liest diese beim nächsten Intel-Request)
     if ibkr:
