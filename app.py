@@ -385,6 +385,167 @@ def hermes_auto_trade(signal_result: dict):
         + (f'Fehler: {err}' if err else '')
     )
 
+def hermes_auto_trade_stock(signal_result: dict, reason: str = ''):
+    """
+    Kauft/shortet Aktien direkt bei Alpaca Paper.
+    Einfacher Signaltest: LONG=BUY, SHORT=SELL.
+    Betrag: AUTO_TRADE_AMOUNT Dollar pro Trade.
+    """
+    if not state.get('auto_trade_enabled'):
+        return
+    sym    = signal_result.get('t', '')
+    price  = float(signal_result.get('price', 0) or 0)
+    signal = signal_result.get('signal', '')
+    score  = int(signal_result.get('score', 0) or 0)
+    conv   = float(signal_result.get('conviction', 0) or 0)
+
+    if score < AUTO_TRADE_MIN_SCORE or not sym or price <= 0:
+        return
+    if signal not in ('LONG', 'SHORT'):
+        return
+    # Nur handelbare Aktien (kein ETF-Schrott unter $3, kein zu teures Stock)
+    if price < 3 or price > 2000:
+        return
+
+    # Bereits heute gehandelt?
+    today = datetime.now().strftime('%Y-%m-%d')
+    mem = load_memory()
+    trade_key = f'stk-{today}-{sym}'
+    if trade_key in mem.get('auto_trades_today', {}):
+        return
+
+    # Aktuelle Position prüfen → kein Doppel-Trade
+    try:
+        existing = _alpaca(f'/v2/positions/{sym}')
+        if isinstance(existing, dict) and float(existing.get('qty', 0)) != 0:
+            return
+    except Exception:
+        pass
+
+    side = 'buy' if signal == 'LONG' else 'sell'
+    qty  = max(1, int(AUTO_TRADE_AMOUNT / price))
+    cost = round(qty * price, 2)
+
+    body = {
+        'symbol':          sym,
+        'qty':             str(qty),
+        'side':            side,
+        'type':            'market',
+        'time_in_force':   'day',
+        'client_order_id': f'hermes-stk-{sym}-{int(time.time())}',
+    }
+    result = _alpaca('/v2/orders', method='POST', body=body)
+    ok  = 'id' in result
+    err = '' if ok else result.get('message', str(result))[:80]
+
+    lbl = reason or signal_result.get('top_reason', signal_result.get('kat_text', ''))[:60]
+    trade_entry = {
+        'sym': sym, 'type': 'STOCK', 'qty': qty,
+        'side': side, 'entry_price': price,
+        'cost': cost, 'score': score, 'signal': signal,
+        'conviction': round(conv, 2),
+        'time': datetime.now().strftime('%H:%M'), 'date': today,
+        'ok': ok, 'error': err, 'reason': lbl,
+    }
+    if 'auto_trades_today' not in mem:
+        mem['auto_trades_today'] = {}
+    mem['auto_trades_today'][trade_key] = trade_entry
+    save_memory(mem)
+    state['auto_trades'].append(trade_entry)
+
+    # Brain-Trades P&L Tracker eintragen
+    brain_entry = {
+        'sym': sym, 'signal': signal, 'score': score,
+        'conviction': round(conv, 2), 'type': 'STOCK', 'qty': qty,
+        'price_entry': price, 'price_current': price,
+        'pnl_pct': 0.0, 'pnl_dollar': 0.0, 'won': None,
+        'time': datetime.now().strftime('%H:%M'), 'date': today,
+        'reason': lbl,
+    }
+    state['brain_trades'] = ([brain_entry] + state.get('brain_trades', []))[:30]
+
+    emoji = '🟢' if signal == 'LONG' else '🔴'
+    tg_send(
+        f'{emoji} <b>HERMES STOCK TRADE</b> {datetime.now().strftime("%H:%M")}\n'
+        f'{"✅" if ok else "❌"} {signal} <b>{sym}</b> ${price:.2f}\n'
+        f'{qty} Aktie(n) = ${cost:.0f} | Score:{score} Conv:{round(conv*100)}%\n'
+        + (f'Fehler: {err}' if err else lbl),
+        key=f'stk_trade_{sym}_{today}'
+    )
+    return ok
+
+
+def hermes_update_brain_trade_pnl():
+    """Aktualisiert P&L aller offenen brain_trades aus Alpaca Positionen."""
+    trades = state.get('brain_trades', [])
+    if not trades:
+        return
+    try:
+        positions = _alpaca('/v2/positions')
+        if not isinstance(positions, list):
+            return
+        pos_map = {p['symbol']: p for p in positions}
+        updated = []
+        for t in trades:
+            if t.get('won') is not None:
+                updated.append(t)
+                continue
+            sym = t.get('sym', '')
+            p = pos_map.get(sym)
+            if p:
+                cur = float(p.get('current_price', t['price_entry']))
+                pnl_pct = float(p.get('unrealized_plpc', 0)) * 100
+                pnl_dollar = float(p.get('unrealized_pl', 0))
+                t = dict(t, price_current=round(cur, 2),
+                         pnl_pct=round(pnl_pct, 2),
+                         pnl_dollar=round(pnl_dollar, 2))
+            updated.append(t)
+        state['brain_trades'] = updated
+    except Exception:
+        pass
+
+
+def hermes_close_all_stock_positions():
+    """Schließt alle Hermes-geöffneten Aktien-Positionen (Market-Order)."""
+    try:
+        positions = _alpaca('/v2/positions')
+        if not isinstance(positions, list):
+            return
+        closed = []
+        for p in positions:
+            sym = p['symbol']
+            if parse_occ_symbol(sym):
+                continue  # Options überspringen
+            alpaca_side = p['side']
+            close_side = 'sell' if alpaca_side == 'long' else 'buy'
+            qty = abs(float(p['qty']))
+            result = _alpaca('/v2/orders', method='POST', body={
+                'symbol': sym, 'qty': str(int(qty)), 'side': close_side,
+                'type': 'market', 'time_in_force': 'day',
+                'client_order_id': f'hermes-close-{sym}-{int(time.time())}',
+            })
+            pl = round(float(p.get('unrealized_pl', 0)), 2)
+            closed.append({'sym': sym, 'pl': pl, 'ok': 'id' in result})
+            # Brain-Trade als geschlossen markieren
+            for t in state.get('brain_trades', []):
+                if t.get('sym') == sym and t.get('won') is None:
+                    pl_pct = round(float(p.get('unrealized_plpc', 0)) * 100, 2)
+                    t['won']      = pl_pct >= 0
+                    t['pnl_pct']  = pl_pct
+                    t['pnl_dollar'] = pl
+        if closed:
+            total_pl = sum(x['pl'] for x in closed)
+            wins = sum(1 for x in closed if x['pl'] >= 0)
+            tg_send(
+                f'🔒 <b>HERMES EOD CLOSE</b>\n'
+                f'{len(closed)} Positionen geschlossen\n'
+                f'Wins: {wins} | P&L: {"+" if total_pl>=0 else ""}${total_pl:.0f}',
+                key='eod_close'
+            )
+    except Exception:
+        pass
+
+
 # ── Hermes Memory (persistent) ────────────────────────────────────────────────
 
 def load_memory():
@@ -2086,6 +2247,9 @@ body { background: #0a0e1a; color: #e0e6f0; font-family: -apple-system, BlinkMac
       <div id="autotrade-btn" onclick="toggleAutoTrade()" style="background:#0a1a2a;border:1px solid #1e3a5f;border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700;color:#4a6a8a;cursor:pointer" title="Auto-Trade ein/ausschalten">
         🤖 AUTO AUS
       </div>
+      <div onclick="closeAllTrades()" style="background:#1a0a0a;border:1px solid #5f1e1e;border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700;color:#8a4a4a;cursor:pointer;margin-left:4px" title="Alle offenen Positionen schließen">
+        🔒 CLOSE ALL
+      </div>
     </div>
   </div>
   <div class="header-info" style="padding:0 0 6px">
@@ -2923,17 +3087,43 @@ function renderTab2(data) {
 
     // Brain Auto-Trades P&L
     if (bTrades.length > 0) {
-      html += '<div style="font-size:10px;color:#6b8cad;margin-top:8px;margin-bottom:5px;text-transform:uppercase;letter-spacing:1px">Brain Auto-Trades:</div>';
-      bTrades.slice(0,8).forEach(t => {
+      let openTrades  = bTrades.filter(t => t.won === null || t.won === undefined);
+      let closedTrades = bTrades.filter(t => t.won === true || t.won === false);
+      let totalPnlPct  = openTrades.reduce((s,t) => s + (t.pnl_pct||0), 0);
+      let totalPnlUSD  = bTrades.reduce((s,t) => s + (t.pnl_dollar||0), 0);
+      let wins = closedTrades.filter(t => t.won).length;
+      let losses = closedTrades.filter(t => !t.won).length;
+      let totalCol = totalPnlUSD >= 0 ? '#4dff91' : '#ff4d6b';
+      html += '<div style="font-size:10px;color:#6b8cad;margin-top:8px;margin-bottom:5px;text-transform:uppercase;letter-spacing:1px">'
+        + 'Hermes Auto-Trades — '
+        + '<span style="color:' + totalCol + ';font-weight:bold">'
+        + (totalPnlUSD >= 0 ? '+' : '') + '$' + totalPnlUSD.toFixed(0) + ' P&L'
+        + '</span>'
+        + ' | ✅' + wins + ' ❌' + losses + ' ⏳' + openTrades.length
+        + '</div>';
+      bTrades.slice(0,10).forEach(t => {
         let wonIcon = t.won === true ? '✅' : t.won === false ? '❌' : '⏳';
-        let sc = t.signal === 'LONG' ? '#4dff91' : '#ff4d6b';
-        let pnlStr = t.pnl_pct ? (t.pnl_pct >= 0 ? '+' : '') + t.pnl_pct.toFixed(1) + '%' : 'offen';
-        let pnlCol = (t.pnl_pct || 0) >= 0 ? '#4dff91' : '#ff4d6b';
-        html += '<div style="padding:4px 0;border-top:1px solid #1a1a2e;display:flex;justify-content:space-between">'
-          + '<div><span style="color:' + sc + ';font-weight:bold">' + wonIcon + ' ' + t.signal + ' ' + t.sym + '</span>'
-          + ' <span style="font-size:10px;color:#64748b">Score:' + t.score + ' Conviction:' + Math.round((t.conviction||0)*100) + '%</span>'
-          + '<div style="font-size:10px;color:#64748b">' + t.reason.slice(0,55) + ' | ' + t.time + '</div></div>'
-          + '<div style="text-align:right"><span style="color:' + pnlCol + ';font-size:12px;font-weight:bold">' + pnlStr + '</span></div>'
+        let sc  = t.signal === 'LONG' ? '#4dff91' : '#ff4d6b';
+        let pnlPct = t.pnl_pct || 0;
+        let pnlUSD = t.pnl_dollar || 0;
+        let pnlCol = pnlPct >= 0 ? '#4dff91' : '#ff4d6b';
+        let pnlStr = pnlPct !== 0
+          ? (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(1) + '% (' + (pnlUSD >= 0 ? '+' : '') + '$' + pnlUSD.toFixed(0) + ')'
+          : 'offen';
+        let typeBadge = t.type === 'STOCK'
+          ? '<span style="font-size:9px;background:#0d2a1a;color:#4dff91;padding:1px 4px;border-radius:3px;margin-left:4px">STK</span>'
+          : '<span style="font-size:9px;background:#0a0a2a;color:#a78bfa;padding:1px 4px;border-radius:3px;margin-left:4px">OPT</span>';
+        html += '<div style="padding:4px 0;border-top:1px solid #1a1a2e;display:flex;justify-content:space-between;align-items:center">'
+          + '<div>'
+          +   '<span style="color:' + sc + ';font-weight:bold">' + wonIcon + ' ' + t.signal + ' ' + t.sym + '</span>'
+          +   typeBadge
+          +   ' <span style="font-size:10px;color:#64748b">Score:' + t.score + ' ' + Math.round((t.conviction||0)*100) + '%</span>'
+          +   (t.qty ? ' <span style="font-size:10px;color:#64748b">×' + t.qty + '</span>' : '')
+          +   '<div style="font-size:10px;color:#64748b">' + (t.reason||'').slice(0,50) + ' | ' + (t.time||'') + '</div>'
+          + '</div>'
+          + '<div style="text-align:right">'
+          +   '<span style="color:' + pnlCol + ';font-size:12px;font-weight:bold">' + pnlStr + '</span>'
+          + '</div>'
           + '</div>';
       });
     }
@@ -3382,6 +3572,15 @@ function toggleAutoTrade() {
       btn.textContent = '🤖 AUTO AUS';
     }
   });
+}
+
+function closeAllTrades() {
+  if (!confirm('Alle offenen Aktien-Positionen jetzt schließen?')) return;
+  fetch('/hermes/close-trades', {method:'POST'})
+    .then(r => r.json()).then(d => {
+      alert(d.ok ? 'Positionen geschlossen! P&L in Portfolio-Sektion.' : 'Fehler: ' + d.error);
+      setTimeout(checkStatus, 2000);
+    });
 }
 
 function startScan() {
@@ -4220,20 +4419,10 @@ def hermes_brain_loop():
                                 key=f'bscan_{sym}_{_dt.now().strftime("%H%M")}'
                             )
 
-                            # Auto-Trade bei hoher Conviction (Schwelle höher als normaler Auto-Trade)
+                            # Auto-Trade bei hoher Conviction
                             if state.get('auto_trade_enabled') and score >= 12 and conviction >= 0.80:
-                                hermes_auto_trade(r)
-                                # Als Brain-Trade markieren
-                                entry = {
-                                    'sym': sym, 'signal': r['signal'], 'score': score,
-                                    'conviction': round(conviction, 2),
-                                    'price_entry': r['price'], 'price_current': r['price'],
-                                    'pnl_pct': 0.0, 'won': None,
-                                    'time': _dt.now().strftime('%H:%M'),
-                                    'date': _dt.now().strftime('%Y-%m-%d'),
-                                    'reason': r.get('kat_text', '')[:60],
-                                }
-                                state['brain_trades'] = ([entry] + state.get('brain_trades', []))[:30]
+                                hermes_auto_trade(r)          # Options
+                                hermes_auto_trade_stock(r)    # Aktien direkt
 
                         except Exception:
                             pass
@@ -4781,17 +4970,24 @@ def hermes_monitor():
                                 pass
                     threading.Thread(target=_scan_asch, args=(picks,), daemon=True).start()
 
-                    # 7) Auto-Trade — starke Signale direkt auf Alpaca als Options
+                    # 7) Auto-Trade — Aktien + Options bei starken Signalen
                     if state.get('auto_trade_enabled'):
-                        # Haupt-Scanner Signale
+                        # P&L offener brain_trades aktualisieren
+                        try:
+                            hermes_update_brain_trade_pnl()
+                        except Exception:
+                            pass
+                        # Haupt-Scanner Signale: Aktien + Options
                         for sig_r in data.get('longs', [])[:5] + data.get('shorts', [])[:3]:
                             try:
+                                hermes_auto_trade_stock(sig_r)
                                 hermes_auto_trade(sig_r)
                             except Exception:
                                 pass
                         # Hermes Picks (eigene Funde)
                         for sig_r in picks[:3]:
                             try:
+                                hermes_auto_trade_stock(sig_r)
                                 hermes_auto_trade(sig_r)
                             except Exception:
                                 pass
@@ -4804,6 +5000,13 @@ def hermes_monitor():
                     now_utc = datetime.now(timezone.utc)
                     is_close = (now_utc.hour == 20 and now_utc.minute < 15)
                     is_review = (now_utc.hour == 20 and 15 <= now_utc.minute < 30)
+                    # EOD Auto-Close: 19:45 UTC = 15:45 ET (15 Min vor Schluss)
+                    is_eod_close = (now_utc.hour == 19 and 44 <= now_utc.minute <= 50)
+                    if is_eod_close and state.get('auto_trade_enabled'):
+                        try:
+                            hermes_close_all_stock_positions()
+                        except Exception:
+                            pass
 
                     # Self-Review + Strategy Builder: Hermes lernt und entwickelt eigene Regeln
                     if is_review:
@@ -5462,6 +5665,17 @@ def hermes_autotrade_status():
         'amount':    AUTO_TRADE_AMOUNT,
         'trades':    trades[-20:],
     })
+
+@app.route('/hermes/close-trades', methods=['POST'])
+def hermes_close_trades_api():
+    """Schließt alle offenen Stock-Positionen manuell."""
+    try:
+        hermes_close_all_stock_positions()
+        hermes_update_brain_trade_pnl()
+        state['alpaca_portfolio'] = get_alpaca_portfolio()
+        return jsonify({'ok': True, 'msg': 'Positionen geschlossen'})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:100]})
 
 @app.route('/hermes/learning')
 def hermes_learning_api():
