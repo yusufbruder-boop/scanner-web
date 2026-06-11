@@ -3272,22 +3272,86 @@ FIB_RATIOS = {
 KEY_LEVELS = {'61.8', '78.6', '88.2'}
 
 
-def _fib_for_ticker(sym, lookback_days=60):
+def _find_swing(highs, lows, window=5):
+    """Findet das letzte relevante Swing-Hoch und Swing-Tief via Pivot-Methode."""
+    n = len(highs)
+    swing_high_idx = None
+    swing_low_idx  = None
+
+    for i in range(n - window - 1, window - 1, -1):
+        # Pivot-Hoch: höher als alle window Bars links und rechts
+        if swing_high_idx is None:
+            if all(highs[i] >= highs[i - j] for j in range(1, window + 1)) and \
+               all(highs[i] >= highs[i + j] for j in range(1, min(window + 1, n - i))):
+                swing_high_idx = i
+
+        # Pivot-Tief
+        if swing_low_idx is None:
+            if all(lows[i] <= lows[i - j] for j in range(1, window + 1)) and \
+               all(lows[i] <= lows[i + j] for j in range(1, min(window + 1, n - i))):
+                swing_low_idx = i
+
+        if swing_high_idx is not None and swing_low_idx is not None:
+            break
+
+    # Fallback: globales Max/Min der letzten 30 Bars
+    recent = min(30, n)
+    sh = highs[swing_high_idx] if swing_high_idx is not None else max(highs[-recent:])
+    sl = lows[swing_low_idx]   if swing_low_idx  is not None else min(lows[-recent:])
+    return sh, sl
+
+
+def _candle_pattern(opens, highs, lows, closes, idx=-1):
+    """Erkennt Kerzenformation am angegebenen Index."""
+    o, h, l, c = opens[idx], highs[idx], lows[idx], closes[idx]
+    body        = abs(c - o)
+    full_range  = h - l
+    if full_range == 0:
+        return 'DOJI'
+    upper_wick  = h - max(c, o)
+    lower_wick  = min(c, o) - l
+    is_bull     = c > o
+
+    # Hammer / Bullish Pin Bar: langer unterer Docht, kleiner Körper oben
+    if lower_wick >= body * 2 and upper_wick <= body * 0.5 and lower_wick / full_range >= 0.55:
+        return 'HAMMER'
+    # Shooting Star / Bearish Pin Bar
+    if upper_wick >= body * 2 and lower_wick <= body * 0.5 and upper_wick / full_range >= 0.55:
+        return 'SHOOTING_STAR'
+    # Bullish Engulfing (vergleich mit Vorkerze)
+    if idx >= 1 and is_bull:
+        po, pc = opens[idx - 1], closes[idx - 1]
+        if pc < po and c > po and o < pc:
+            return 'BULL_ENGULF'
+    # Bearish Engulfing
+    if idx >= 1 and not is_bull:
+        po, pc = opens[idx - 1], closes[idx - 1]
+        if pc > po and c < po and o > pc:
+            return 'BEAR_ENGULF'
+    # Doji
+    if body / full_range < 0.1:
+        return 'DOJI'
+    return 'BULL_CANDLE' if is_bull else 'BEAR_CANDLE'
+
+
+def _fib_for_ticker(sym, lookback_days=45):
     try:
         from_d = (datetime.now() - timedelta(days=lookback_days + 10)).strftime('%Y-%m-%d')
         to_d   = datetime.now().strftime('%Y-%m-%d')
-        data = al_bars(sym, from_d, to_d, limit=80)
-        bars = data.get('results', [])
-        if len(bars) < 10:
+        data   = al_bars(sym, from_d, to_d, limit=60)
+        bars   = data.get('results', [])
+        if len(bars) < 15:
             return None
 
+        opens   = [b['o'] for b in bars]
         highs   = [b['h'] for b in bars]
         lows    = [b['l'] for b in bars]
         closes  = [b['c'] for b in bars]
         vols    = [b.get('v', 0) for b in bars]
 
-        swing_high = max(highs)
-        swing_low  = min(lows)
+        # Pivot-basierter Swing (realistischer als globales Max/Min)
+        swing_high, swing_low = _find_swing(highs, lows, window=4)
+
         current    = closes[-1]
         prev_close = closes[-2] if len(closes) >= 2 else current
         rng        = swing_high - swing_low
@@ -3299,30 +3363,27 @@ def _fib_for_ticker(sym, lookback_days=60):
         vol_ratio = round(vols[-1] / avg_vol, 2) if avg_vol > 0 else 1.0
         chg_pct   = round((current - prev_close) / prev_close * 100, 2)
 
-        # Fibonacci-Levels berechnen: Retracement (von Hoch nach unten)
+        # Kerzenformation der letzten Kerze
+        candle_pattern = _candle_pattern(opens, highs, lows, closes, idx=-1)
+
+        # Fibonacci-Levels: Retracement von Swing-Hoch nach Swing-Tief
         levels = {}
         nearest_name  = None
         nearest_dist  = 999.0
         nearest_price = 0.0
-        nearest_dir   = ''
+        nearest_dir   = 'RETRACE'
 
         for name, ratio in FIB_RATIOS.items():
-            # Retracement: Preis faellt vom High zurueck
-            retrace_p = round(swing_high - rng * ratio, 4)
-            # Extension: Preis steigt vom Low aus
-            extend_p  = round(swing_low  + rng * ratio, 4)
+            retrace_p = round(swing_high - rng * ratio, 4)  # Level für LONG (Preis fällt)
+            extend_p  = round(swing_low  + rng * ratio, 4)  # Level für SHORT (Preis steigt)
 
             dist_ret = abs(current - retrace_p) / current * 100
             dist_ext = abs(current - extend_p)  / current * 100
 
             if dist_ret <= dist_ext:
-                use_price = retrace_p
-                use_dist  = dist_ret
-                use_dir   = 'RETRACE'
+                use_price, use_dist, use_dir = retrace_p, dist_ret, 'RETRACE'
             else:
-                use_price = extend_p
-                use_dist  = dist_ext
-                use_dir   = 'EXTENSION'
+                use_price, use_dist, use_dir = extend_p,  dist_ext, 'EXTENSION'
 
             levels[name] = {
                 'retrace':  retrace_p,
@@ -3331,46 +3392,69 @@ def _fib_for_ticker(sym, lookback_days=60):
                 'dist_pct': round(use_dist, 3),
                 'dir':      use_dir,
             }
-
             if use_dist < nearest_dist:
                 nearest_dist  = use_dist
                 nearest_name  = name
                 nearest_price = use_price
                 nearest_dir   = use_dir
 
-        at_level  = nearest_dist < 0.5
-        near_key  = nearest_name in KEY_LEVELS and nearest_dist < 1.5
-        near_882  = nearest_name == '88.2' and nearest_dist < 2.0
+        # Toleranzen (enger = schärfere Signale)
+        at_level = nearest_dist < 0.4    # Exakt am Level
+        near_882 = nearest_name == '88.2' and nearest_dist < 1.5
+        near_key = nearest_name in KEY_LEVELS and nearest_dist < 1.2
 
-        # Bounce-Signal: Preis steigt an einem Unterstuetzungs-Level
-        bounce    = chg_pct > 0 and at_level
-        rejection = chg_pct < 0 and at_level
+        # Bounce: Bullische Kerze AN einem Support-Level (LONG-Signal)
+        bull_pattern = candle_pattern in ('HAMMER', 'BULL_ENGULF', 'BULL_CANDLE')
+        bear_pattern = candle_pattern in ('SHOOTING_STAR', 'BEAR_ENGULF', 'BEAR_CANDLE')
+        bounce    = (chg_pct > 0.2 or bull_pattern) and (at_level or near_882)
+        rejection = (chg_pct < -0.2 or bear_pattern) and (at_level or near_882)
+
+        # ── FIB 0.882 Sniper TP/SL (nach PDF-Strategie) ─────────────────────
+        # LONG Setup: Preis retraciert auf 0.882, TP in Richtung Swing-Hoch
+        f882_price = levels['88.2']['retrace']
+        tp1 = round(swing_high - rng * 0.786, 4)   # TP1 @ 0.786 (20%)
+        tp2 = round(swing_high - rng * 0.650, 4)   # TP2 @ 0.65  (50%)
+        tp3 = round(swing_high - rng * 0.500, 4)   # TP3 @ 0.5   (25%)
+        sl  = round(swing_low  * 0.998,        4)   # SL leicht unter Swing-Low
+
+        # Risk/Reward bei Einstieg am 0.882 Level
+        risk   = max(0.0001, f882_price - sl)
+        reward = max(0.0001, tp2 - f882_price)
+        rr     = round(reward / risk, 2)
 
         return {
-            'sym':           sym,
-            'price':         round(current, 4),
-            'chg_pct':       chg_pct,
-            'swing_high':    round(swing_high, 4),
-            'swing_low':     round(swing_low, 4),
-            'range':         round(rng, 4),
-            'nearest_fib':   nearest_name,
-            'nearest_price': round(nearest_price, 4),
-            'nearest_dist':  round(nearest_dist, 3),
-            'nearest_dir':   nearest_dir,
-            'vol_ratio':     vol_ratio,
-            'levels':        levels,
-            'at_level':      at_level,
-            'near_key':      near_key,
-            'near_882':      near_882,
-            'bounce':        bounce,
-            'rejection':     rejection,
+            'sym':            sym,
+            'price':          round(current, 4),
+            'chg_pct':        chg_pct,
+            'swing_high':     round(swing_high, 4),
+            'swing_low':      round(swing_low, 4),
+            'range':          round(rng, 4),
+            'nearest_fib':    nearest_name,
+            'nearest_price':  round(nearest_price, 4),
+            'nearest_dist':   round(nearest_dist, 3),
+            'nearest_dir':    nearest_dir,
+            'vol_ratio':      vol_ratio,
+            'levels':         levels,
+            'at_level':       at_level,
+            'near_key':       near_key,
+            'near_882':       near_882,
+            'bounce':         bounce,
+            'rejection':      rejection,
+            'candle':         candle_pattern,
+            # 0.882 Sniper TP/SL
+            'f882_entry':     round(f882_price, 4),
+            'tp1':            tp1,
+            'tp2':            tp2,
+            'tp3':            tp3,
+            'sl':             sl,
+            'rr':             rr,
             'signal': (
-                'AT_882'      if nearest_name == '88.2' and at_level else
-                'AT_618'      if nearest_name == '61.8' and at_level else
-                'AT_786'      if nearest_name == '78.6' and at_level else
-                'NEAR_882'    if near_882 else
-                'NEAR_KEY'    if near_key else
-                'NEAR_382'    if nearest_name == '38.2' and nearest_dist < 1.5 else
+                'AT_882'   if nearest_name == '88.2' and at_level else
+                'AT_618'   if nearest_name == '61.8' and at_level else
+                'AT_786'   if nearest_name == '78.6' and at_level else
+                'NEAR_882' if near_882 else
+                'NEAR_KEY' if near_key else
+                'NEAR_382' if nearest_name == '38.2' and nearest_dist < 1.5 else
                 'MONITORING'
             ),
         }

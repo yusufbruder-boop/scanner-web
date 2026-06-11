@@ -5946,11 +5946,11 @@ def hermes_fib_loop():
                 state['fib_results']   = results
                 state['fib_last_scan'] = now.strftime('%H:%M')
 
-                # ── Auto-Trade: AT_882 / NEAR_882 ────────────────────────────
+                # ── Auto-Trade: FIB 0.882 Sniper ─────────────────────────────
                 if state.get('auto_trade_enabled'):
                     for r in results:
-                        sig = r.get('signal', '')
-                        sym = r.get('sym', '')
+                        sig    = r.get('signal', '')
+                        sym    = r.get('sym', '')
                         if sig not in ('AT_882', 'NEAR_882'):
                             continue
                         if sym in _fib_traded_today:
@@ -5961,26 +5961,50 @@ def hermes_fib_loop():
                         rejection = r.get('rejection', False)
                         chg_pct   = r.get('chg_pct', 0)
                         vol_ratio = r.get('vol_ratio', 1.0)
+                        candle    = r.get('candle', '')
+                        rr        = r.get('rr', 0)
 
-                        # Richtung: Rejection = SHORT, alles andere = LONG
-                        direction = 'SHORT' if rejection else 'LONG'
+                        # Mindest-Filter: R/R >= 1.5 und entweder Bounce oder Kerzenformation
+                        bull_candle = candle in ('HAMMER', 'BULL_ENGULF', 'BULL_CANDLE')
+                        bear_candle = candle in ('SHOOTING_STAR', 'BEAR_ENGULF', 'BEAR_CANDLE')
 
-                        # Score: AT_882 = 14, NEAR_882 = 11; Bonus bei Bounce
-                        score = (14 if sig == 'AT_882' else 11) + (2 if bounce else 0)
+                        if rejection and bear_candle:
+                            direction = 'SHORT'
+                        elif bounce and bull_candle:
+                            direction = 'LONG'
+                        elif sig == 'AT_882' and bounce:
+                            direction = 'LONG'
+                        elif sig == 'AT_882' and rejection:
+                            direction = 'SHORT'
+                        else:
+                            continue  # Kein klares Signal — kein Trade
 
-                        # Conviction: Volumen-Ratio als Proxy
-                        conviction = min(0.95, 0.70 + (vol_ratio - 1.0) * 0.1)
+                        # R/R-Check: nur handeln wenn >= 1.5
+                        if rr < 1.5:
+                            continue
 
-                        reason_parts = [f'Fib {sig.replace("_","@")}']
-                        if bounce:
-                            reason_parts.append('Bounce↑')
-                        if rejection:
-                            reason_parts.append('Rejection↓')
+                        # Score: AT_882 = 14 (exakt), NEAR_882 = 11; Bonus für Kerzen + Vol
+                        score = (14 if sig == 'AT_882' else 11)
+                        if candle in ('HAMMER', 'SHOOTING_STAR'):
+                            score += 3
+                        elif candle in ('BULL_ENGULF', 'BEAR_ENGULF'):
+                            score += 2
                         if vol_ratio > 1.5:
-                            reason_parts.append(f'Vol×{vol_ratio:.1f}')
+                            score += 2
+                        if vol_ratio > 2.0:
+                            score += 1
+
+                        conviction = min(0.95, 0.68 + (vol_ratio - 1.0) * 0.08
+                                         + (0.05 if candle in ('HAMMER','SHOOTING_STAR','BULL_ENGULF','BEAR_ENGULF') else 0))
+
+                        reason_parts = [f'Fib 0.882 Sniper ({sig})']
+                        reason_parts.append(f'Kerze:{candle}')
+                        if bounce:    reason_parts.append('Bounce↑')
+                        if rejection: reason_parts.append('Rejection↓')
+                        if vol_ratio > 1.5: reason_parts.append(f'Vol×{vol_ratio:.1f}')
+                        reason_parts.append(f'R/R:{rr:.1f}')
                         reason = ' | '.join(reason_parts)
 
-                        # Signal-Dict kompatibel mit hermes_auto_trade_stock()
                         fib_signal = {
                             't':          sym,
                             'price':      price,
@@ -5994,12 +6018,25 @@ def hermes_fib_loop():
                         if ok:
                             _fib_traded_today.add(sym)
                             fib_trade_entry = {
-                                'sym': sym, 'signal': direction, 'score': score,
-                                'fib_level': '88.2%', 'fib_signal': sig,
-                                'price': price, 'chg_pct': chg_pct,
-                                'vol_ratio': vol_ratio, 'bounce': bounce,
-                                'rejection': rejection, 'reason': reason,
-                                'time': now.strftime('%H:%M'), 'date': today,
+                                'sym':       sym,
+                                'signal':    direction,
+                                'score':     score,
+                                'fib_level': '88.2%',
+                                'fib_signal': sig,
+                                'candle':    candle,
+                                'price':     price,
+                                'chg_pct':   chg_pct,
+                                'vol_ratio': vol_ratio,
+                                'tp1':       r.get('tp1'),
+                                'tp2':       r.get('tp2'),
+                                'tp3':       r.get('tp3'),
+                                'sl':        r.get('sl'),
+                                'rr':        rr,
+                                'bounce':    bounce,
+                                'rejection': rejection,
+                                'reason':    reason,
+                                'time':      now.strftime('%H:%M'),
+                                'date':      today,
                             }
                             state['fib_trades'] = ([fib_trade_entry] + state.get('fib_trades', []))[:50]
 
