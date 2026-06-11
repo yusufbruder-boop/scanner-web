@@ -3630,6 +3630,8 @@ def results():
             out['brain_worldview']         = state.get('brain_worldview', {})
             out['brain_trades']            = state.get('brain_trades', [])
             out['brain_news']              = state.get('brain_news', [])
+            out['claude_ibkr']             = state.get('claude_ibkr', {})
+            out['claude_movers']           = state.get('claude_movers', {})
         return jsonify(_to_json_safe(out))
     except Exception as e:
         return jsonify({'error': f'Server Fehler: {str(e)[:120]}'})
