@@ -2616,18 +2616,22 @@ function renderResults(data, isNew) {
     });
   }
 
-  const displayLongs  = (data.longs  && data.longs.length  > 0)
-    ? data.longs.map(enrichWithIbkr)
+  // Strikt trennen: LONG-Sektion = nur LONG-Signale, SHORT-Sektion = nur SHORT-Signale
+  const trueLongsFromSrv  = (data.longs  || []).map(enrichWithIbkr).filter(r => r.signal === 'LONG');
+  const trueShortsFromSrv = (data.shorts || []).map(enrichWithIbkr).filter(r => r.signal === 'SHORT');
+
+  const displayLongs  = trueLongsFromSrv.length  > 0
+    ? trueLongsFromSrv
     : fallbackLongs.slice(0,5).map(a => enrichWithIbkr(alertToCard(a,'LONG')));
-  const displayShorts = (data.shorts && data.shorts.length > 0)
-    ? data.shorts.map(enrichWithIbkr)
+  const displayShorts = trueShortsFromSrv.length > 0
+    ? trueShortsFromSrv
     : fallbackShorts.slice(0,5).map(a => enrichWithIbkr(alertToCard(a,'SHORT')));
-  const usingFallback = (!data.longs || data.longs.length === 0);
+  const usingFallback = trueLongsFromSrv.length === 0;
 
   html += '<div class="section"><div class="section-title long">▲ TOP LONG — Options Flow + Katalysator'
     + (usingFallback ? hermBadge : ahBadge) + '</div>';
   if (displayLongs.length === 0) {
-    html += '<div class="empty">Morgen ab 13:30 UTC — Markt öffnet.</div>';
+    html += '<div style="padding:12px 16px;color:#4a6a8a;font-size:12px">Keine LONG Signale — Markt ist BEAR. Warte auf LONG Katalysator.</div>';
   } else {
     displayLongs.slice(0, 5).forEach(r => { html += renderCard(r, 'long', isNew); });
   }
@@ -4359,16 +4363,26 @@ def hermes_monitor():
                                     alerts = state.get('hermes_alerts', [])
                                     if alerts:
                                         s_alerts = sorted(alerts, key=lambda x: -x.get('score',0))
-                                        longs_fb  = [a for a in s_alerts if a.get('call_sweeps',0) >= a.get('put_sweeps',0)]
-                                        shorts_fb = [a for a in s_alerts if a.get('put_sweeps',0) > a.get('call_sweeps',0)]
-                                        ah_data['longs']  = [{'t':a['ticker'],'score':a['score'],'price':a.get('price',0),
-                                                               'reasons':a.get('reasons',[]),'signal':'LONG',
-                                                               'label':'Hermes Hunt','best':None}
-                                                              for a in longs_fb[:6]]
-                                        ah_data['shorts'] = [{'t':a['ticker'],'score':a['score'],'price':a.get('price',0),
-                                                               'reasons':a.get('reasons',[]),'signal':'SHORT',
-                                                               'label':'Hermes Hunt','best':None}
-                                                              for a in shorts_fb[:4]]
+                                        # LONG: explizit LONG-Richtung UND positiver Kurs heute
+                                        longs_fb  = [a for a in s_alerts
+                                                     if a.get('net_direction') == 'LONG'
+                                                     and (a.get('prev_chg') or 0) > 0]
+                                        # SHORT: explizit SHORT oder fallender Kurs (< -1%)
+                                        shorts_fb = [a for a in s_alerts
+                                                     if a.get('net_direction') == 'SHORT'
+                                                     or (a.get('prev_chg') or 0) < -1]
+                                        if ah_data.get('longs') is None: ah_data['longs'] = []
+                                        if ah_data.get('shorts') is None: ah_data['shorts'] = []
+                                        if longs_fb:
+                                            ah_data['longs']  = [{'t':a['ticker'],'score':a['score'],'price':a.get('price',0),
+                                                                   'reasons':a.get('reasons',[]),'signal':'LONG',
+                                                                   'label':'Hermes Hunt','best':None}
+                                                                  for a in longs_fb[:5]]
+                                        if shorts_fb:
+                                            ah_data['shorts'] = [{'t':a['ticker'],'score':a['score'],'price':a.get('price',0),
+                                                                   'reasons':a.get('reasons',[]),'signal':'SHORT',
+                                                                   'label':'Hermes Hunt','best':None}
+                                                                  for a in shorts_fb[:5]]
                                 # Label + Web-Scanner aktualisieren
                                 ah_data['label'] = f'{label} Intelligence'
                                 with _hermes_lock:
