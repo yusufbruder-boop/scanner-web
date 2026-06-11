@@ -2169,8 +2169,11 @@ function optionBox(b, otype, mult, today) {
 
 function renderCard(r, cls, isNew) {
   let b = r.best;
-  let sigColor = cls === 'long' ? 'signal-long' : (cls === 'short' ? 'signal-short' : 'signal-mover');
-  let badge    = cls === 'long' ? 'badge-long'  : (cls === 'short' ? 'badge-short'  : 'badge-mover');
+  // Signal-Farbe immer nach echtem Signal, nicht nach Sektion
+  let realSig = r.signal || (cls === 'long' ? 'LONG' : cls === 'short' ? 'SHORT' : 'MOVER');
+  let sigColor = realSig === 'LONG' ? 'signal-long' : (realSig === 'SHORT' ? 'signal-short' : 'signal-mover');
+  let badge    = realSig === 'LONG' ? 'badge-long'  : (realSig === 'SHORT' ? 'badge-short'  : 'badge-mover');
+  let ibkrLiveBadge = r.ibkr_live ? ' <span style="font-size:9px;background:#001a33;border:1px solid #00e5ff66;color:#00e5ff;padding:1px 5px;border-radius:3px">🏦 IBKR LIVE</span>' : '';
   let katStr = r.kat_strength || 'NORMAL';
   let katBadge = '';
   if (r.katalysator && r.katalysator !== 'KEIN') {
@@ -2243,9 +2246,9 @@ function renderCard(r, cls, isNew) {
   return '<div class="card' + flash + '">'
     + '<div class="card-header">'
     +   '<div><span class="ticker">' + r.t + '</span>'
-    +   '<span class="price ' + sigColor + '" style="margin-left:10px">$' + r.price + '</span></div>'
+    +   '<span class="price ' + sigColor + '" style="margin-left:10px">$' + r.price + '</span>' + ibkrLiveBadge + '</div>'
     +   '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' + earnBadge + convBadge + katBadge + conflictBadge + socialBadge + dpBadge + swBadge
-    +   '<span class="badge ' + badge + '">' + r.signal + (r.score > 0 ? ' ' + r.score : '') + '</span></div>'
+    +   '<span class="badge ' + badge + '">' + realSig + (r.score > 0 ? ' ' + r.score : '') + '</span></div>'
     + '</div>'
     + '<div class="card-body">'
     +   '<div class="row">'
@@ -2561,20 +2564,29 @@ function renderResults(data, isNew) {
 
   // Fallback: wenn Scanner leer → Hermes Hunt Alerts als LONG/SHORT nutzen
   const hermAlertsSorted = (data.hermes_alerts||[]).slice().sort((a,b)=>b.score-a.score);
-  let fallbackLongs  = hermAlertsSorted.filter(a => a.net_direction==='LONG'  || a.call_sweeps >= a.put_sweeps);
-  let fallbackShorts = hermAlertsSorted.filter(a => a.net_direction==='SHORT' || a.put_sweeps > a.call_sweeps);
-  // Wenn keine Shorts: die stärksten Verlierer aus den Alerts nehmen
+  // LONG: explizit LONG-Richtung UND positiver Trend — NIEMALS SHORT-Signale in LONG zeigen
+  let fallbackLongs  = hermAlertsSorted.filter(a =>
+    a.net_direction === 'LONG' && (a.prev_chg||0) > 0
+  );
+  // SHORT: explizit SHORT oder fallende Aktien
+  let fallbackShorts = hermAlertsSorted.filter(a =>
+    a.net_direction === 'SHORT' || (a.prev_chg||0) < -2
+  );
+  // Wenn keine Longs: Top-Gainer nehmen
+  if (fallbackLongs.length === 0 && hermAlertsSorted.length > 0) {
+    const gainers = hermAlertsSorted.filter(a => (a.prev_chg||0) > 1).slice(0,3);
+    fallbackLongs = gainers.map(a => Object.assign({}, a, {net_direction:'LONG'}));
+  }
+  // Wenn keine Shorts: stärkste Verlierer
   if (fallbackShorts.length === 0 && hermAlertsSorted.length > 0) {
     const losers = hermAlertsSorted
-      .filter(a => (a.prev_chg || 0) < -2)
+      .filter(a => (a.prev_chg||0) < -2)
       .sort((a,b) => (a.prev_chg||0) - (b.prev_chg||0));
-    if (losers.length > 0) {
-      fallbackShorts = losers.slice(0,3).map(a => Object.assign({}, a, {net_direction:'SHORT'}));
-    }
+    fallbackShorts = losers.slice(0,3).map(a => Object.assign({}, a, {net_direction:'SHORT'}));
   }
 
-  // Hermes Hunt Alert → Scanner-Karten Format konvertieren
-  function alertToCard(a) {
+  // Hermes Hunt Alert → Scanner-Karten Format konvertieren (dir erzwingen)
+  function alertToCard(a, forceSig) {
     return {
       t:        a.ticker,
       score:    a.score,
@@ -2584,15 +2596,32 @@ function renderResults(data, isNew) {
       pc:       a.pc       != null ? a.pc       : null,
       drop_high: a.drop_high != null ? a.drop_high : null,
       reasons:  a.reasons || [],
-      signal:   a.net_direction || 'LONG',
+      signal:   forceSig || a.net_direction || 'LONG',
       label:    '🤖 Hermes Hunt',
       best:     null,
     };
   }
   const hermBadge = ' <span style="font-size:10px;background:#0a1f2e;color:#00e5ff;padding:2px 7px;border-radius:3px;margin-left:6px">🤖 HERMES HUNT</span>';
 
-  const displayLongs  = (data.longs  && data.longs.length  > 0) ? data.longs  : fallbackLongs.slice(0,5).map(alertToCard);
-  const displayShorts = (data.shorts && data.shorts.length > 0) ? data.shorts : fallbackShorts.slice(0,5).map(alertToCard);
+  // IBKR Preise als Map für Preis-Update
+  const ibkrPriceMap = {};
+  (cm.most_traded_usd || []).forEach(s => { if (s.symbol && s.price) ibkrPriceMap[s.symbol] = s; });
+  function enrichWithIbkr(r) {
+    const ib = ibkrPriceMap[r.t];
+    if (!ib) return r;
+    return Object.assign({}, r, {
+      price:    ib.price,
+      prev_chg: ib.chg_pct,
+      ibkr_live: true,
+    });
+  }
+
+  const displayLongs  = (data.longs  && data.longs.length  > 0)
+    ? data.longs.map(enrichWithIbkr)
+    : fallbackLongs.slice(0,5).map(a => enrichWithIbkr(alertToCard(a,'LONG')));
+  const displayShorts = (data.shorts && data.shorts.length > 0)
+    ? data.shorts.map(enrichWithIbkr)
+    : fallbackShorts.slice(0,5).map(a => enrichWithIbkr(alertToCard(a,'SHORT')));
   const usingFallback = (!data.longs || data.longs.length === 0);
 
   html += '<div class="section"><div class="section-title long">▲ TOP LONG — Options Flow + Katalysator'
