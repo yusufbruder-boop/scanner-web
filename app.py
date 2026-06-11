@@ -188,6 +188,8 @@ state = {
     'fib_results':     [],          # letzter Fib-Scan (alle Symbole mit Levels)
     'fib_trades':      [],          # Fib-882 Auto-Trades des heutigen Tages
     'fib_last_scan':   None,        # Zeitstempel letzter Fib-Scan
+    # Trump/Makro Katalysator — marktweiter Move
+    'trump_catalyst':  None,        # {direction, headline, strength, ts, age_min}
 }
 _hermes_lock = threading.Lock()
 _scan_lock   = threading.Lock()   # verhindert gleichzeitige Scans
@@ -4267,6 +4269,78 @@ def hermes_classify_news(headline: str, tickers: list) -> dict:
     return {}
 
 
+def detect_macro_catalyst(headline: str) -> dict | None:
+    """
+    Erkennt marktweite Katalysatoren (Trump, Geopolitik, Fed, Kriege).
+    Gibt {direction, strength, reason} zurück oder None.
+    Trump-News bewegen den gesamten Markt +/-100-300pt sofort.
+    """
+    hl = headline.lower()
+
+    # ── STARK BULLISH — alles steigt ──────────────────────────────────────
+    bull_strong = [
+        'no attack', 'no attacks', 'ceasefire', 'cease-fire', 'peace deal',
+        'trade deal', 'trade agreement', 'tariffs removed', 'tariffs lifted',
+        'tariff relief', 'no tariffs', 'tariff pause', 'pause tariffs',
+        'rate cut', 'fed cuts', 'powell cut', 'stimulus', 'bailout approved',
+        'debt ceiling resolved', 'shutdown avoided', 'trump deal',
+        'trump signs', 'trump agreement', 'trump peace', 'trump truce',
+        'war ends', 'conflict ends', 'troops withdraw', 'sanctions lifted',
+        'trump no war', 'trump ceasefire', 'negotiations succeed',
+    ]
+    bull_normal = [
+        'trump positive', 'market positive', 'rally', 'surge expected',
+        'stocks rise', 'inflation falls', 'jobs beat', 'gdp beat',
+        'consumer confidence', 'rate hold', 'soft landing',
+    ]
+
+    # ── STARK BEARISH — alles fällt ───────────────────────────────────────
+    bear_strong = [
+        'new tariffs', 'tariff hike', 'tariff increase', 'tariffs announced',
+        'tariff threat', 'tariff on', 'tariff war', 'trade war',
+        'trump tariff', 'trump threatens', 'trump sanctions',
+        'military strike', 'attack launched', 'missile', 'war declared',
+        'invasion', 'escalation', 'nuclear', 'government shutdown',
+        'debt ceiling crisis', 'recession', 'rate hike emergency',
+        'trump attacks', 'trump bombs', 'trump declares war',
+        'sanctions imposed', 'sanctions expand',
+    ]
+    bear_normal = [
+        'stocks fall', 'market crash', 'sell-off', 'inflation surge',
+        'jobs miss', 'gdp miss', 'recession fears', 'banking crisis',
+    ]
+
+    # Trump-Erkennung: jede Trump-Nachricht prüfen
+    is_trump = any(k in hl for k in ['trump', 'white house', 'president trump', 'oval office'])
+
+    for k in bull_strong:
+        if k in hl:
+            strength = 'EXTREME' if is_trump else 'STARK'
+            return {'direction': 'LONG', 'strength': strength,
+                    'reason': f'Makro-Katalysator: {k}', 'trump': is_trump}
+    for k in bull_normal:
+        if k in hl:
+            return {'direction': 'LONG', 'strength': 'NORMAL',
+                    'reason': f'Makro bullish: {k}', 'trump': is_trump}
+    for k in bear_strong:
+        if k in hl:
+            strength = 'EXTREME' if is_trump else 'STARK'
+            return {'direction': 'SHORT', 'strength': strength,
+                    'reason': f'Makro-Risiko: {k}', 'trump': is_trump}
+    for k in bear_normal:
+        if k in hl:
+            return {'direction': 'SHORT', 'strength': 'NORMAL',
+                    'reason': f'Makro bearish: {k}', 'trump': is_trump}
+
+    # Allgemeiner Trump-Check (wenn Nachricht Trump erwähnt → AI entscheiden)
+    if is_trump and len(hl) > 20:
+        result = hermes_classify_news(headline, [])
+        if result.get('action') in ('LONG', 'SHORT'):
+            return {'direction': result['action'], 'strength': 'NORMAL',
+                    'reason': result.get('reason', 'Trump News'), 'trump': True}
+    return None
+
+
 def hermes_brain_loop():
     """
     Hermes Gehirn — läuft 24/7 unabhängig vom 5-Min-Scanner.
@@ -4372,7 +4446,42 @@ def hermes_brain_loop():
                     symbols  = [s.get('symbol', '') for s in n.get('symbols', [])
                                 if s.get('symbol', '') and len(s.get('symbol','')) <= 5][:3]
 
-                    # Schnell-Filter: nur marktbewegende News
+                    # ── Trump/Makro Katalysator: ZUERST prüfen (vor allem anderen) ──
+                    macro = detect_macro_catalyst(headline)
+                    if macro:
+                        direction = macro['direction']
+                        strength  = macro['strength']
+                        reason    = macro['reason']
+                        is_trump  = macro.get('trump', False)
+                        trump_entry = {
+                            'direction': direction,
+                            'strength':  strength,
+                            'headline':  headline[:120],
+                            'reason':    reason,
+                            'trump':     is_trump,
+                            'ts':        datetime.now().isoformat(),
+                            'ts_str':    datetime.now().strftime('%H:%M'),
+                        }
+                        state['trump_catalyst'] = trump_entry
+
+                        emoji = '🚀' if direction == 'LONG' else '💥'
+                        trump_tag = ' 🇺🇸 TRUMP' if is_trump else ' 🌍 MAKRO'
+                        tg_send(
+                            f'{emoji}<b> MAKRO KATALYSATOR{trump_tag} — {direction} {strength}</b>\n'
+                            f'"{headline[:100]}"\n'
+                            f'Grund: {reason}\n'
+                            f'⚡ Bitget Bot handelt ALLE Symbole {direction}!',
+                            key=f'trump_{nid[:25]}'
+                        )
+                        # Auch in brain_news loggen
+                        state['brain_news'] = ([{
+                            'time':     datetime.now().strftime('%H:%M'),
+                            'action':   direction, 'strength': strength,
+                            'headline': headline[:80], 'tickers': ['ALL'],
+                            'reason':   reason, 'ai': False,
+                        }] + state.get('brain_news', []))[:20]
+
+                    # Schnell-Filter für Einzel-Aktien News
                     hl = headline.lower()
                     keywords_check = (
                         'dilut','offering','earnings','beat','miss','guidance','fda',
@@ -5166,6 +5275,30 @@ Marktschluss-Zusammenfassung (Deutsch, max 150 Wörter):
             time.sleep(60)
 
 
+def _build_trump_catalyst():
+    """Gibt Trump-Katalysator zurück wenn er < 20 Minuten alt ist, sonst None."""
+    tc = state.get('trump_catalyst')
+    if not tc:
+        return None
+    try:
+        ts  = datetime.fromisoformat(tc['ts'])
+        age = (datetime.now() - ts).total_seconds() / 60
+        if age > 20:
+            return None   # abgelaufen
+        return {
+            'direction': tc['direction'],
+            'strength':  tc['strength'],
+            'headline':  tc['headline'],
+            'reason':    tc['reason'],
+            'trump':     tc.get('trump', False),
+            'ts':        tc['ts_str'],
+            'age_min':   round(age, 1),
+            'active':    True,
+        }
+    except Exception:
+        return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MULTI-AGENT KOMMUNIKATION — Hermes ↔ Bots ↔ Claude
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5252,6 +5385,8 @@ def hermes_intel_api():
         # News
         'breaking_news': latest_news[:120],
         'recent_news':   recent_news,
+        # Trump/Makro Katalysator (Bot handelt ALLE Symbole wenn aktiv)
+        'trump_catalyst': _build_trump_catalyst(),
         # Top Signale
         'top_longs':     [r['t'] for r in longs  if r.get('score', 0) >= 7][:5],
         'top_shorts':    [r['t'] for r in shorts if r.get('score', 0) >= 7][:5],
