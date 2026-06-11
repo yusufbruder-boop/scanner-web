@@ -184,6 +184,10 @@ state = {
     'claude_session':  {},          # aktive Claude-Trading-Session mit IBKR-Daten
     'claude_trades':   [],          # Claude-Trades (manuell MT5)
     'claude_ibkr':     {},          # IBKR-Daten von Claude gepusht
+    # Fibonacci 88.2% Auto-Trade Loop
+    'fib_results':     [],          # letzter Fib-Scan (alle Symbole mit Levels)
+    'fib_trades':      [],          # Fib-882 Auto-Trades des heutigen Tages
+    'fib_last_scan':   None,        # Zeitstempel letzter Fib-Scan
 }
 _hermes_lock = threading.Lock()
 _scan_lock   = threading.Lock()   # verhindert gleichzeitige Scans
@@ -3445,9 +3449,12 @@ function loadFibScan() {
   fetch('/fib-scan')
     .then(r => r.json())
     .then(d => {
+      let tradedMsg = d.traded && d.traded.length > 0
+        ? ' &nbsp;|&nbsp; <span style="color:#4dff91;font-weight:bold">🤖 AUTO-TRADE: ' + d.traded.join(', ') + '</span>'
+        : '';
       document.getElementById('fib-status').innerHTML =
-        d.count + ' Instrumente gescannt &nbsp;|&nbsp; ' + (d.time||'');
-      document.getElementById('fib-content').innerHTML = renderFibResults(d.results || []);
+        d.count + ' Instrumente &nbsp;|&nbsp; ' + (d.time||'') + tradedMsg;
+      document.getElementById('fib-content').innerHTML = renderFibResults(d.results || [], _lastData);
     })
     .catch(e => {
       document.getElementById('fib-status').innerHTML = 'Fehler: ' + e;
@@ -3467,26 +3474,46 @@ const SIG_LABELS = {
   'MONITORING':['MONITORING','#4a6a8a'],
 };
 
-function renderFibResults(results) {
+function renderFibResults(results, latestData) {
   if (!results.length) return '<div class="empty">Keine Ergebnisse</div>';
+
+  // Fib-Trades aus letztem Scan ermitteln
+  const fibTrades = (latestData && latestData.fib_trades) ? latestData.fib_trades : [];
+  const fibTraded = new Set(fibTrades.map(t => t.sym));
 
   // Gruppen
   const at882   = results.filter(r => r.signal === 'AT_882');
+  const near882 = results.filter(r => r.signal === 'NEAR_882');
   const at618   = results.filter(r => r.signal === 'AT_618');
   const at786   = results.filter(r => r.signal === 'AT_786');
   const nearKey = results.filter(r => r.signal === 'NEAR_KEY');
-  const others  = results.filter(r => !['AT_882','AT_618','AT_786','NEAR_KEY'].includes(r.signal));
+  const others  = results.filter(r => !['AT_882','NEAR_882','AT_618','AT_786','NEAR_KEY'].includes(r.signal));
 
   let html = '';
+
+  // Fib-Trades Übersicht falls vorhanden
+  if (fibTrades.length > 0) {
+    html += '<div style="margin:8px;background:#0a1a0a;border:1px solid #2d9e5744;border-radius:8px;padding:10px 12px">';
+    html += '<div style="font-size:10px;font-weight:bold;color:#4dff91;letter-spacing:2px;margin-bottom:6px">🤖 FIB 88.2% AUTO-TRADES HEUTE (' + fibTrades.length + ')</div>';
+    fibTrades.slice(0,6).forEach(t => {
+      let sc = t.signal === 'LONG' ? '#4dff91' : '#ff4d6b';
+      html += '<div style="display:flex;justify-content:space-between;padding:3px 0;border-top:1px solid #1a2a1a">'
+        + '<span style="color:' + sc + ';font-weight:bold">' + t.signal + ' ' + t.sym + '</span>'
+        + '<span style="color:#4a6a8a;font-size:10px">' + (t.reason||'') + ' | ' + (t.time||'') + '</span>'
+        + '</div>';
+    });
+    html += '</div>';
+  }
 
   function cardGroup(title, items, color) {
     if (!items.length) return '';
     let h = '<div class="fib-section-title" style="color:' + color + '">' + title + ' (' + items.length + ')</div>';
-    items.forEach(r => { h += fibCard(r); });
+    items.forEach(r => { h += fibCard(r, fibTraded.has(r.sym)); });
     return h;
   }
 
-  html += cardGroup('AT 88.2% — DEEP RETRACE (KEY ENTRY)', at882, '#ff6b35');
+  html += cardGroup('AT 88.2% — DEEP RETRACE 🎯 AUTO-TRADE', at882, '#ff6b35');
+  html += cardGroup('NEAR 88.2% — APPROACHING LEVEL', near882, '#ff9500');
   html += cardGroup('AT 61.8% — GOLDEN RATIO', at618, '#ffd700');
   html += cardGroup('AT 78.6% — STRONG RETRACE', at786, '#ff9500');
   html += cardGroup('NEAR KEY LEVEL (61.8 / 78.6 / 88.2)', nearKey, '#4dffaa');
@@ -3495,7 +3522,7 @@ function renderFibResults(results) {
   return html;
 }
 
-function fibCard(r) {
+function fibCard(r, isTraded) {
   const sig      = r.signal || 'MONITORING';
   const sigInfo  = SIG_LABELS[sig] || ['?','#4a6a8a'];
   const chgCls   = r.chg_pct >= 0 ? 'pct-pos' : 'pct-neg';
@@ -3524,9 +3551,13 @@ function fibCard(r) {
     });
   }
 
+  const tradedBadge = isTraded
+    ? ' <span style="font-size:9px;background:#0a2a0a;border:1px solid #4dff91;color:#4dff91;padding:1px 5px;border-radius:3px;font-weight:700">✅ TRADED</span>'
+    : '';
+
   return '<div class="fib-card ' + cardCls + '">' +
     '<div style="display:flex;justify-content:space-between;align-items:center">' +
-      '<span class="fib-sym">' + r.sym + '</span>' +
+      '<span class="fib-sym">' + r.sym + tradedBadge + '</span>' +
       '<span style="font-size:11px;background:' + sigInfo[1] + ';color:' + (sig==='AT_618'||sig==='AT_786'?'#000':'#fff') + ';padding:2px 7px;border-radius:4px;font-weight:700">' + sigInfo[0] + '</span>' +
     '</div>' +
     '<div style="display:flex;align-items:center;gap:10px;margin:4px 0">' +
@@ -3831,6 +3862,9 @@ def results():
             out['brain_news']              = state.get('brain_news', [])
             out['claude_ibkr']             = state.get('claude_ibkr', {})
             out['claude_movers']           = state.get('claude_movers', {})
+            out['fib_results']             = state.get('fib_results', [])
+            out['fib_trades']              = state.get('fib_trades', [])
+            out['fib_last_scan']           = state.get('fib_last_scan')
         return jsonify(_to_json_safe(out))
     except Exception as e:
         return jsonify({'error': f'Server Fehler: {str(e)[:120]}'})
@@ -5711,7 +5745,38 @@ def fib_scan():
     from scanner import fibonacci_scan
     try:
         results = fibonacci_scan()
+        state['fib_results']   = results
+        state['fib_last_scan'] = datetime.now().strftime('%H:%M')
+
+        # Auto-Trade: AT_882 / NEAR_882 direkt handeln wenn aktiviert
+        traded = []
+        if state.get('auto_trade_enabled'):
+            today = datetime.now().strftime('%Y-%m-%d')
+            already_today = {t['sym'] for t in state.get('fib_trades', []) if t.get('date') == today}
+            for r in results:
+                sig = r.get('signal', '')
+                sym = r.get('sym', '')
+                if sig not in ('AT_882', 'NEAR_882') or sym in already_today:
+                    continue
+                direction  = 'SHORT' if r.get('rejection') else 'LONG'
+                score      = (14 if sig == 'AT_882' else 11) + (2 if r.get('bounce') else 0)
+                vol_ratio  = r.get('vol_ratio', 1.0)
+                conviction = min(0.95, 0.70 + (vol_ratio - 1.0) * 0.1)
+                reason     = f'Fib {sig} | {"Bounce" if r.get("bounce") else "Rejection" if r.get("rejection") else "Level"} | Vol×{vol_ratio:.1f}'
+                fib_signal = {'t': sym, 'price': r['price'], 'signal': direction,
+                              'score': score, 'conviction': round(conviction, 2), 'top_reason': reason}
+                ok = hermes_auto_trade_stock(fib_signal, reason=reason)
+                if ok:
+                    state['fib_trades'] = ([{
+                        'sym': sym, 'signal': direction, 'score': score,
+                        'fib_level': '88.2%', 'fib_signal': sig,
+                        'price': r['price'], 'reason': reason,
+                        'time': datetime.now().strftime('%H:%M'), 'date': today,
+                    }] + state.get('fib_trades', []))[:50]
+                    traded.append(sym)
+
         return jsonify({'results': results, 'count': len(results),
+                        'traded': traded,
                         'time': datetime.now().strftime('%Y-%m-%d %H:%M')})
     except Exception as e:
         return jsonify({'error': str(e), 'results': []}), 500
@@ -5830,6 +5895,120 @@ except Exception:
     pass
 
 # Auto-Scheduler im Hintergrund starten
+def hermes_fib_loop():
+    """
+    Fibonacci 88.2% Auto-Trade Loop — läuft alle 20 Minuten.
+    Scannt FIB_UNIVERSE + Hermes-Universe nach 88.2% Retracement.
+    AT_882 oder NEAR_882 + Bounce → LONG Trade
+    AT_882 + Rejection → SHORT Trade
+    """
+    import time as _time
+    _time.sleep(45)  # Startup-Delay: warten bis App bereit
+    _fib_traded_today = set()
+    _fib_last_day     = ''
+
+    while True:
+        try:
+            now     = datetime.now()
+            today   = now.strftime('%Y-%m-%d')
+            now_utc = datetime.now(timezone.utc)
+
+            # Reset täglich
+            if today != _fib_last_day:
+                _fib_traded_today.clear()
+                _fib_last_day = today
+
+            # Nur während Marktzeiten (13:30–20:00 UTC = 9:30–16:00 ET)
+            is_market = (now_utc.hour == 13 and now_utc.minute >= 30) or \
+                        (13 < now_utc.hour < 20) or \
+                        (now_utc.hour == 20 and now_utc.minute == 0)
+
+            if is_market:
+                from scanner import fibonacci_scan, FIB_UNIVERSE
+
+                # Universe dynamisch erweitern mit Hermes-Symbolen
+                hermes_uni = list(state.get('hermes_universe', set()))
+                extra = [s for s in hermes_uni if s not in FIB_UNIVERSE][:30]
+                dyn_universe = list(FIB_UNIVERSE) + extra
+
+                # Fib-Scan starten (nutzt internen FIB_UNIVERSE in scanner.py)
+                results = fibonacci_scan()
+
+                # Zusätzliche Symbole aus Hermes-Universe einzeln prüfen
+                if extra:
+                    from scanner import _fib_for_ticker
+                    for sym in extra[:20]:
+                        r = _fib_for_ticker(sym)
+                        if r:
+                            results.append(r)
+
+                # Ergebnisse in State speichern (für UI)
+                state['fib_results']   = results
+                state['fib_last_scan'] = now.strftime('%H:%M')
+
+                # ── Auto-Trade: AT_882 / NEAR_882 ────────────────────────────
+                if state.get('auto_trade_enabled'):
+                    for r in results:
+                        sig = r.get('signal', '')
+                        sym = r.get('sym', '')
+                        if sig not in ('AT_882', 'NEAR_882'):
+                            continue
+                        if sym in _fib_traded_today:
+                            continue
+
+                        price     = r.get('price', 0)
+                        bounce    = r.get('bounce', False)
+                        rejection = r.get('rejection', False)
+                        chg_pct   = r.get('chg_pct', 0)
+                        vol_ratio = r.get('vol_ratio', 1.0)
+
+                        # Richtung: Rejection = SHORT, alles andere = LONG
+                        direction = 'SHORT' if rejection else 'LONG'
+
+                        # Score: AT_882 = 14, NEAR_882 = 11; Bonus bei Bounce
+                        score = (14 if sig == 'AT_882' else 11) + (2 if bounce else 0)
+
+                        # Conviction: Volumen-Ratio als Proxy
+                        conviction = min(0.95, 0.70 + (vol_ratio - 1.0) * 0.1)
+
+                        reason_parts = [f'Fib {sig.replace("_","@")}']
+                        if bounce:
+                            reason_parts.append('Bounce↑')
+                        if rejection:
+                            reason_parts.append('Rejection↓')
+                        if vol_ratio > 1.5:
+                            reason_parts.append(f'Vol×{vol_ratio:.1f}')
+                        reason = ' | '.join(reason_parts)
+
+                        # Signal-Dict kompatibel mit hermes_auto_trade_stock()
+                        fib_signal = {
+                            't':          sym,
+                            'price':      price,
+                            'signal':     direction,
+                            'score':      score,
+                            'conviction': round(conviction, 2),
+                            'top_reason': reason,
+                        }
+
+                        ok = hermes_auto_trade_stock(fib_signal, reason=reason)
+                        if ok:
+                            _fib_traded_today.add(sym)
+                            fib_trade_entry = {
+                                'sym': sym, 'signal': direction, 'score': score,
+                                'fib_level': '88.2%', 'fib_signal': sig,
+                                'price': price, 'chg_pct': chg_pct,
+                                'vol_ratio': vol_ratio, 'bounce': bounce,
+                                'rejection': rejection, 'reason': reason,
+                                'time': now.strftime('%H:%M'), 'date': today,
+                            }
+                            state['fib_trades'] = ([fib_trade_entry] + state.get('fib_trades', []))[:50]
+
+        except Exception:
+            pass
+
+        _time.sleep(1200)  # alle 20 Minuten
+
+
 sched = threading.Thread(target=auto_scheduler, daemon=True)
 sched.start()
 
@@ -5844,6 +6023,10 @@ brain_thread.start()
 # Squeeze Scanner Monitor starten
 squeeze_thread = threading.Thread(target=squeeze_monitor, daemon=True)
 squeeze_thread.start()
+
+# Fibonacci 88.2% Auto-Trade Loop
+fib_thread = threading.Thread(target=hermes_fib_loop, daemon=True)
+fib_thread.start()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
