@@ -2515,6 +2515,20 @@ function renderResults(data, isNew) {
       + '</div>';
   }
 
+  // ── Geopolitik-Katalysator Banner (ZeroHedge/Reuters/GoogleNews) ──────────
+  const geo = data.geo_catalyst || {};
+  if (geo.alert && geo.headline) {
+    const geoCol  = geo.direction === 'BULL' ? '#00ff88' : geo.direction === 'BEAR' ? '#ff4d6b' : '#ffd700';
+    const geoBg   = geo.direction === 'BULL' ? '#051a10' : geo.direction === 'BEAR' ? '#1a0508' : '#1a1505';
+    const geoBdr  = geo.direction === 'BULL' ? '#00ff8866' : geo.direction === 'BEAR' ? '#ff224466' : '#ffd70066';
+    html += '<div style="margin:8px;background:'+geoBg+';border:2px solid '+geoBdr+';border-radius:10px;padding:10px 14px">'
+      + '<div style="font-size:10px;font-weight:bold;color:'+geoCol+';letter-spacing:2px;margin-bottom:4px">'
+      + '⚡ GEOPOLITIK KATALYSATOR [' + (geo.source||'') + '] ' + (geo.ts||'') + '</div>'
+      + '<div style="font-size:12px;color:#e0e8f0;margin-bottom:4px">' + (geo.headline||'') + '</div>'
+      + '<div style="font-size:11px;font-weight:bold;color:'+geoCol+'">' + (geo.alert||'') + '</div>'
+      + '</div>';
+  }
+
   // ── Markt-Regime (QQQ Gap, TLT Zinsen, VXX, Sektor-Rotation) ───────────
   const mc = data.market_context || {};
   if (mc.bias && mc.bias !== 'NEUTRAL') {
@@ -4059,6 +4073,12 @@ def results():
             out['running']             = state.get('running', False)
             out['market_sentiment']    = state.get('market_sentiment', {})
             out['market_context']      = state.get('market_context', {})
+            # Geopolitik-Katalysator live abrufen (3 Min Cache in scanner)
+            try:
+                from scanner import get_geopolitical_catalyst
+                out['geo_catalyst'] = get_geopolitical_catalyst()
+            except Exception:
+                out['geo_catalyst'] = {}
             out['mt5_status']          = state.get('mt5_status', {})
             out['sector_rotation']     = state.get('sector_rotation', {})
             out['max_pain']            = state.get('max_pain', {})

@@ -581,6 +581,14 @@ def get_cached_social():
 _INFLUENCER_FEEDS = [
     ('https://www.astralcodexten.com/feed', 'Scott Alexander (ACX)'),
     ('https://www.noahpinion.blog/feed',    'Noah Smith'),
+    # Breaking Market News — NAS/GOLD Katalysatoren
+    ('https://feeds.feedburner.com/zerohedge/feed',            'ZeroHedge'),
+    ('https://feeds.reuters.com/reuters/businessNews',          'Reuters Business'),
+    ('https://feeds.reuters.com/reuters/topNews',               'Reuters Top'),
+    ('https://news.google.com/rss/search?q=iran+nuclear+deal+araghchi&hl=en-US&gl=US&ceid=US:en', 'Iran Deal (Google)'),
+    ('https://news.google.com/rss/search?q=oil+price+opec+production&hl=en-US&gl=US&ceid=US:en', 'Oil/OPEC (Google)'),
+    ('https://news.google.com/rss/search?q=kobeissi+letter+market&hl=en-US&gl=US&ceid=US:en',    'Kobeissi Letter'),
+    ('https://news.google.com/rss/search?q=federal+reserve+rate+decision&hl=en-US&gl=US&ceid=US:en', 'Fed News'),
 ]
 _influencer_cache: list = []
 _influencer_ts: float   = 0.0
@@ -700,6 +708,89 @@ HIGH_IMPACT_NEG = ['sec charges','doj investigation','class action','criminal ch
                    'clinical failure','trial failed','missed revenue','massive loss',
                    'accounting fraud','restatement','deregistered','delisted',
                    'short seller report']
+
+# ── Geopolitical Catalyst Scanner ────────────────────────────────────────────
+_geo_cache = {'data': {}, 'ts': 0}
+
+GEO_RULES = [
+    # Iran/Middle East — GOLD hoch, OIL hoch, NAS volatil
+    (['iran deal','nuclear agreement','araghchi','ceasefire agreement','peace deal'],
+     'BULL', 'Iran Deal nah — Risk-On: NAS LONG, GOLD neutral'),
+    (['iran rejects','deal fails','no agreement','tensions escalate','military strike','attack iran'],
+     'BEAR', 'Iran Eskalation — Risk-Off: GOLD LONG, NAS SHORT'),
+    (['araghchi denies','fake news iran','iran denies'],
+     'BEAR', 'Iran Deal abgelehnt — Risk-Off Spike: GOLD LONG'),
+    # Oil/OPEC
+    (['opec cut','opec production cut','oil supply cut'],
+     'BULL', 'OPEC Kuerzt — OIL hoch, Inflation: NAS SHORT, GOLD LONG'),
+    (['opec increase','oil glut','supply increase'],
+     'BEAR_NAS', 'OPEC mehr Oel — Inflation runter: NAS LONG'),
+    # Fed / Zinsen
+    (['rate cut','fed cuts','pivot','dovish fed','lower rates'],
+     'BULL', 'Fed Zinssenkung — NAS LONG stark, GOLD LONG'),
+    (['rate hike','fed hikes','hawkish','higher for longer','inflation hot'],
+     'BEAR', 'Fed Zinserhohung — NAS SHORT, GOLD SHORT'),
+    # Trump / Tariffs
+    (['trump tariff','tariffs increase','trade war escalates'],
+     'BEAR', 'Trump Zoelle — NAS SHORT, GOLD LONG'),
+    (['tariff pause','trade deal','tariffs removed','exemption'],
+     'BULL', 'Zoelle pausiert — NAS LONG stark'),
+    # China
+    (['china slowdown','china recession','china property'],
+     'BEAR', 'China Schwaeche — NAS SHORT, Commodities runter'),
+    (['china stimulus','china rate cut','pboc'],
+     'BULL', 'China Stimulus — NAS LONG, Copper/GOLD hoch'),
+]
+
+def get_geopolitical_catalyst() -> dict:
+    """Scannt Geo-News RSS alle 3 Min — gibt Richtungs-Alert fuer NAS/GOLD."""
+    if time.time() - _geo_cache['ts'] < 180 and _geo_cache['data']:
+        return _geo_cache['data']
+
+    result = {'alert': '', 'direction': '', 'source': '', 'headline': '', 'ts': ''}
+    import xml.etree.ElementTree as ET, html as _html
+
+    GEO_FEEDS = [
+        'https://feeds.reuters.com/reuters/topNews',
+        'https://news.google.com/rss/search?q=iran+nuclear+araghchi+deal&hl=en-US&gl=US&ceid=US:en',
+        'https://news.google.com/rss/search?q=fed+rate+trump+tariff+opec&hl=en-US&gl=US&ceid=US:en',
+        'https://news.google.com/rss/search?q=oil+price+geopolitical+market+catalyst&hl=en-US&gl=US&ceid=US:en',
+    ]
+
+    headlines = []
+    for feed_url in GEO_FEEDS:
+        try:
+            req = urllib.request.Request(feed_url, headers={'User-Agent': 'scanner/3.0'})
+            with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+                root = ET.fromstring(r.read())
+            for item in root.findall('.//item')[:5]:
+                t = item.find('title')
+                title = _html.unescape(t.text or '') if t is not None else ''
+                if title:
+                    headlines.append((title.lower(), title, feed_url))
+        except Exception:
+            pass
+
+    # Treffersuche
+    for keywords, direction, alert in GEO_RULES:
+        for kw in keywords:
+            for h_lower, h_orig, src in headlines:
+                if kw in h_lower:
+                    result = {
+                        'alert': alert,
+                        'direction': direction,
+                        'source': 'Reuters' if 'reuters' in src else 'Google News',
+                        'headline': h_orig[:120],
+                        'ts': datetime.now().strftime('%H:%M'),
+                        'keyword': kw,
+                    }
+                    _geo_cache['data'] = result
+                    _geo_cache['ts']   = time.time()
+                    return result
+
+    _geo_cache['data'] = result
+    _geo_cache['ts']   = time.time()
+    return result
 
 # ── Macro Context (VIX, Yields, Indices, Fed) ────────────────────────────────
 _macro_cache = {'data': {}, 'ts': 0}
