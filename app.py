@@ -3407,9 +3407,23 @@ function renderTab2(data) {
   // ── Kanal-Pattern Scanner ────────────────────────────────────────────────────
   const chActive  = data.channel_active  || [];
   const chSignals = data.channel_signals || [];
-  if (chActive.length > 0 || chSignals.length > 0) {
+  const chWatch   = data.channel_watch   || ['NVDA','AMD','INTC','META','AAPL','TSLA','MSFT','AMZN','GOOGL','MU'];
+  {
     html += '<div style="margin:8px;background:linear-gradient(135deg,#0a1218,#0d1a24);border:1px solid #f59e0b44;border-radius:10px;padding:12px 14px">'
-      + '<div style="font-size:10px;font-weight:bold;color:#f59e0b;letter-spacing:2px;margin-bottom:8px">📊 KANAL-MUSTER — PING-PONG AKTIEN</div>';
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+      + '<span style="font-size:10px;font-weight:bold;color:#f59e0b;letter-spacing:2px">📊 KANAL-MUSTER — PING-PONG AKTIEN</span>'
+      + '<span style="font-size:9px;color:#64748b">' + chActive.length + ' aktiv | ' + chSignals.length + ' Signale</span>'
+      + '</div>'
+      // Watch-Liste immer anzeigen
+      + '<div style="margin-bottom:8px;display:flex;flex-wrap:wrap;gap:4px">'
+      + chWatch.map(s => {
+          let active = chActive.find(a => a.sym === s);
+          let col = active ? (active.price >= active.resistance - (active.resistance-active.support)*0.25 ? '#ff4d6b' : active.price <= active.support + (active.resistance-active.support)*0.25 ? '#4dff91' : '#f59e0b') : '#334155';
+          let border = active ? col : '#334155';
+          return '<span style="font-size:10px;font-weight:bold;padding:2px 7px;border-radius:4px;background:#0d1520;border:1px solid ' + border + ';color:' + col + '">'
+            + s + (active ? ' ↔' : '') + '</span>';
+        }).join('')
+      + '</div>';
 
     // Aktive Kanäle (Aktien die gerade im Muster sind)
     if (chActive.length > 0) {
@@ -3475,6 +3489,13 @@ function renderTab2(data) {
           + '</div>'
           + '</div>';
       });
+    }
+
+    // Leer-Zustand (Markt zu oder noch keine Muster gefunden)
+    if (chActive.length === 0 && chSignals.length === 0) {
+      html += '<div style="text-align:center;padding:10px;color:#475569;font-size:11px">'
+        + '⏳ Scanner läuft — Muster werden während Marktzeiten erkannt (00:00–22:00 UTC)'
+        + '</div>';
     }
 
     html += '</div>';
@@ -4406,6 +4427,7 @@ def results():
             out['brain_news']              = state.get('brain_news', [])
             out['channel_active']          = state.get('channel_active', [])
             out['channel_signals']         = state.get('channel_signals', [])[:20]
+            out['channel_watch']           = state.get('channel_watch', [])
             out['vwap_signals']            = state.get('vwap_signals', [])[:10]
             out['gap_signals']             = state.get('gap_signals', [])[:10]
             out['trading_blackout']        = state.get('trading_blackout', False)
