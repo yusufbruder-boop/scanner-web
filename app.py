@@ -203,6 +203,13 @@ state = {
     'gap_signals':     [],          # [{sym, gap_pct, prev_close, pre_price, signal, time}]
     # Trading Blackout (Fed/CPI/NFP)
     'trading_blackout': False,
+    # ORB (Opening Range Breakout) Scanner
+    'orb_ranges':   {},   # {sym: {high, low, captured_at}}
+    'orb_signals':  [],   # [{sym, signal, price, orb_high, orb_low, vol_ratio, sl, tp, rr, time}]
+    # RSI Divergence Scanner
+    'rsi_div_signals': [],  # [{sym, div_type, price, rsi, time}]
+    # EMA Cross Scanner
+    'ema_cross_signals': [],  # [{sym, cross_type, price, ema50, ema200, time}]
 }
 _hermes_lock = threading.Lock()
 _scan_lock   = threading.Lock()   # verhindert gleichzeitige Scans
@@ -3567,6 +3574,90 @@ function renderTab2(data) {
     html += '</div>';
   }
 
+  // ── ORB (Opening Range Breakout) ─────────────────────────────────────────────
+  {
+    const orbSigs   = data.orb_signals  || [];
+    const orbRanges = data.orb_ranges   || {};
+    const orbCount  = Object.keys(orbRanges).length;
+    html += '<div style="margin:8px;background:linear-gradient(135deg,#0a1a14,#0d2418);border:1px solid #22c55e44;border-radius:10px;padding:12px 14px">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+      + '<span style="font-size:10px;font-weight:bold;color:#22c55e;letter-spacing:2px">🎯 ORB — OPENING RANGE BREAKOUT</span>'
+      + '<span style="font-size:9px;color:#64748b">' + orbCount + ' Ranges | ' + orbSigs.length + ' Breakouts</span>'
+      + '</div>';
+    if (orbSigs.length > 0) {
+      orbSigs.slice(0, 6).forEach(s => {
+        let sc  = s.signal === 'LONG' ? '#4dff91' : '#ff4d6b';
+        let ico = s.signal === 'LONG' ? '🟢' : '🔴';
+        html += '<div style="display:flex;justify-content:space-between;padding:5px 0;border-top:1px solid #1a2a20">'
+          + '<div><span style="font-size:12px;font-weight:bold;color:#fff">' + ico + ' ' + s.sym + '</span>'
+          + ' <span style="color:' + sc + ';font-weight:bold">' + s.signal + '</span><br>'
+          + '<span style="font-size:9px;color:#64748b">ORB $' + s.orb_low + '–$' + s.orb_high + ' | Vol ' + s.vol_ratio + 'x | ' + s.time + '</span></div>'
+          + '<div style="text-align:right">'
+          + '<span style="font-size:12px;color:#fff">$' + s.price + '</span><br>'
+          + '<span style="font-size:10px;color:#64748b">SL $' + s.sl + ' TP $' + s.tp + ' R/R ' + s.rr + ':1</span>'
+          + '</div></div>';
+      });
+    } else {
+      html += '<div style="color:#475569;font-size:11px;text-align:center;padding:6px">'
+        + '⏳ Aktiv 09:30–15:30 ET — erste 30 Min Range → Breakout-Signal</div>';
+    }
+    html += '</div>';
+  }
+
+  // ── RSI Divergenz ────────────────────────────────────────────────────────────
+  {
+    const rsiSigs = data.rsi_div_signals || [];
+    html += '<div style="margin:8px;background:linear-gradient(135deg,#1a0a18,#240d20);border:1px solid #a855f744;border-radius:10px;padding:12px 14px">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+      + '<span style="font-size:10px;font-weight:bold;color:#a855f7;letter-spacing:2px">📊 RSI DIVERGENZ</span>'
+      + '<span style="font-size:9px;color:#64748b">' + rsiSigs.length + ' Signale</span>'
+      + '</div>';
+    if (rsiSigs.length > 0) {
+      rsiSigs.slice(0, 6).forEach(s => {
+        let sc  = s.div_type === 'BULLISH' ? '#4dff91' : '#ff4d6b';
+        let ico = s.div_type === 'BULLISH' ? '🟢' : '🔴';
+        let desc = s.div_type === 'BULLISH' ? 'Preis Low ↓ aber RSI ↑ → LONG' : 'Preis High ↑ aber RSI ↓ → SHORT';
+        html += '<div style="display:flex;justify-content:space-between;padding:5px 0;border-top:1px solid #2a1a28">'
+          + '<div><span style="font-size:12px;font-weight:bold;color:#fff">' + ico + ' ' + s.sym + '</span>'
+          + ' <span style="color:' + sc + ';font-weight:bold">' + s.div_type + '</span><br>'
+          + '<span style="font-size:9px;color:#64748b">' + desc + ' | RSI ' + s.rsi + ' | ' + s.time + '</span></div>'
+          + '<div style="text-align:right"><span style="font-size:12px;color:#fff">$' + s.price + '</span><br>'
+          + '<span style="font-size:10px;color:' + sc + ';font-weight:bold">' + s.signal + '</span></div></div>';
+      });
+    } else {
+      html += '<div style="color:#475569;font-size:11px;text-align:center;padding:6px">'
+        + '⏳ Preis vs. RSI Divergenz — Umkehrsignal bei Extremwerten</div>';
+    }
+    html += '</div>';
+  }
+
+  // ── EMA Cross ────────────────────────────────────────────────────────────────
+  {
+    const emaSigs = data.ema_cross_signals || [];
+    html += '<div style="margin:8px;background:linear-gradient(135deg,#1a1000,#241800);border:1px solid #f59e0b44;border-radius:10px;padding:12px 14px">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+      + '<span style="font-size:10px;font-weight:bold;color:#f59e0b;letter-spacing:2px">✨ EMA CROSS — GOLDEN/DEATH CROSS</span>'
+      + '<span style="font-size:9px;color:#64748b">' + emaSigs.length + ' Crossovers</span>'
+      + '</div>';
+    if (emaSigs.length > 0) {
+      emaSigs.slice(0, 6).forEach(s => {
+        let sc     = s.signal === 'LONG' ? '#4dff91' : '#ff4d6b';
+        let ico    = s.signal === 'LONG' ? '✨' : '💀';
+        let power  = s.cross_type.includes('50_200') ? ' <span style="color:#f59e0b">⭐⭐⭐ STARK</span>' : ' <span style="color:#94a3b8">⭐⭐</span>';
+        html += '<div style="display:flex;justify-content:space-between;padding:5px 0;border-top:1px solid #2a1e00">'
+          + '<div><span style="font-size:12px;font-weight:bold;color:#fff">' + ico + ' ' + s.sym + '</span>'
+          + power + '<br>'
+          + '<span style="font-size:9px;color:#64748b">' + s.cross_type.replace('_','/')+' | Fast $'+s.ema_fast+' / Slow $'+s.ema_slow + ' | ' + s.time + '</span></div>'
+          + '<div style="text-align:right"><span style="font-size:12px;color:#fff">$' + s.price + '</span><br>'
+          + '<span style="font-size:10px;color:' + sc + ';font-weight:bold">' + s.signal + '</span></div></div>';
+      });
+    } else {
+      html += '<div style="color:#475569;font-size:11px;text-align:center;padding:6px">'
+        + '⏳ EMA9/21 (intraday) und EMA50/200 (stark) Kreuzungen auf 15-Min Bars</div>';
+    }
+    html += '</div>';
+  }
+
   // ── Alpaca Portfolio ─────────────────────────────────────────────────────────
   const ap = data.alpaca_portfolio || {};
   if (ap.equity) {
@@ -4458,6 +4549,10 @@ def results():
             out['channel_watch']           = state.get('channel_watch', [])
             out['vwap_signals']            = state.get('vwap_signals', [])[:10]
             out['gap_signals']             = state.get('gap_signals', [])[:10]
+            out['orb_ranges']              = state.get('orb_ranges', {})
+            out['orb_signals']             = state.get('orb_signals', [])[:15]
+            out['rsi_div_signals']         = state.get('rsi_div_signals', [])[:15]
+            out['ema_cross_signals']       = state.get('ema_cross_signals', [])[:15]
             out['trading_blackout']        = state.get('trading_blackout', False)
             out['claude_ibkr']             = state.get('claude_ibkr', {})
             out['claude_movers']           = state.get('claude_movers', {})
@@ -5523,6 +5618,422 @@ def channel_bounce_loop():
             pass
 
         _t.sleep(60)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ORB — Opening Range Breakout Scanner
+# ─────────────────────────────────────────────────────────────────────────────
+def orb_scanner_loop():
+    """
+    ORB-Scanner: 09:30-10:00 ET (13:30-14:00 UTC) High/Low erfassen,
+    danach Breakout mit Vol ×1.3 detektieren → LONG oder SHORT.
+    Reset täglich um 13:25 UTC.
+    """
+    import time as _t
+    _t.sleep(90)
+
+    UNIVERSE = ['NVDA','AMD','INTC','META','AAPL','TSLA','MSFT','AMZN','GOOGL',
+                'MU','QQQ','SPY','SMCI','PLTR','ARM','MSTR','COIN','UBER','LYFT']
+
+    while True:
+        try:
+            import time as _t2
+            now_utc = datetime.now(timezone.utc)
+            h, m = now_utc.hour, now_utc.minute
+            utc_min = h * 60 + m
+
+            # Tägliches Reset 13:25 UTC
+            if h == 13 and 23 <= m <= 27:
+                state['orb_ranges'] = {}
+
+            # ORB-Erfassung: 13:30–14:05 UTC (erste 30 Min nach NY Open)
+            if 13 * 60 + 30 <= utc_min <= 14 * 60 + 5:
+                ctx = ssl.create_default_context()
+                for sym in UNIVERSE + list(state.get('channel_watch', []))[:10]:
+                    if sym in state.get('orb_ranges', {}) and state['orb_ranges'][sym].get('ready'):
+                        continue
+                    try:
+                        url = (f'https://data.alpaca.markets/v2/stocks/{sym}/bars'
+                               f'?timeframe=5Min&limit=8&feed=iex&adjustment=raw')
+                        req = urllib.request.Request(url, headers={
+                            'APCA-API-KEY-ID':     ALPACA_KEY,
+                            'APCA-API-SECRET-KEY': ALPACA_SECRET,
+                        })
+                        with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+                            bars = json.loads(r.read()).get('bars', [])
+                        if len(bars) < 4:
+                            continue
+                        orb_high = max(b['h'] for b in bars)
+                        orb_low  = min(b['l'] for b in bars)
+                        state.setdefault('orb_ranges', {})[sym] = {
+                            'high': orb_high, 'low': orb_low,
+                            'ready': utc_min >= 14 * 60,
+                            'captured_at': now_utc.strftime('%H:%M'),
+                        }
+                    except Exception:
+                        pass
+
+            # Breakout-Erkennung: 14:05–19:30 UTC (10:05-15:30 ET)
+            elif 14 * 60 + 5 <= utc_min <= 19 * 60 + 30:
+                if not state.get('orb_ranges'):
+                    _t.sleep(30)
+                    continue
+
+                ctx = ssl.create_default_context()
+                for sym, orb in list(state.get('orb_ranges', {}).items()):
+                    if not orb.get('ready'):
+                        continue
+                    try:
+                        # Snapshot (aktueller Preis + Volumen)
+                        snap_url = (f'https://data.alpaca.markets/v2/stocks/snapshots'
+                                    f'?symbols={sym}&feed=iex')
+                        snap_req = urllib.request.Request(snap_url, headers={
+                            'APCA-API-KEY-ID':     ALPACA_KEY,
+                            'APCA-API-SECRET-KEY': ALPACA_SECRET,
+                        })
+                        with urllib.request.urlopen(snap_req, context=ctx, timeout=8) as r:
+                            snap  = json.loads(r.read())
+                        sd    = snap.get(sym, {})
+                        price = float((sd.get('latestTrade') or {}).get('p', 0))
+                        if price <= 0:
+                            continue
+
+                        vol_ratio = _get_volume_ratio(sym)
+                        if vol_ratio < 1.3:
+                            continue
+
+                        orb_high = orb['high']
+                        orb_low  = orb['low']
+                        signal   = None
+
+                        if price > orb_high * 1.001:    # 0.1% über ORB High
+                            signal = 'LONG'
+                            sl     = round(orb_high * 0.997, 2)
+                            rng    = orb_high - orb_low
+                            tp     = round(orb_high + rng * 1.5, 2)
+                        elif price < orb_low * 0.999:   # 0.1% unter ORB Low
+                            signal = 'SHORT'
+                            sl     = round(orb_low  * 1.003, 2)
+                            rng    = orb_high - orb_low
+                            tp     = round(orb_low  - rng * 1.5, 2)
+
+                        if not signal:
+                            continue
+
+                        # 30-Min Cooldown pro Sym+Signal
+                        prev = [s for s in state.get('orb_signals', [])[-30:]
+                                if s['sym'] == sym and s['signal'] == signal]
+                        if prev and (_t2.time() - prev[-1].get('ts', 0)) < 1800:
+                            continue
+
+                        rr = round(abs(tp - price) / max(abs(sl - price), 0.01), 1)
+                        entry = {
+                            'sym':      sym,     'signal':    signal,
+                            'price':    price,   'orb_high':  round(orb_high, 2),
+                            'orb_low':  round(orb_low, 2),
+                            'vol_ratio':round(vol_ratio, 1),
+                            'sl':       sl,      'tp':        tp,
+                            'rr':       rr,      'time':      now_utc.strftime('%H:%M'),
+                            'ts':       _t2.time(),
+                        }
+                        state['orb_signals'] = ([entry] + state.get('orb_signals', []))[:50]
+
+                        ico = '🟢' if signal == 'LONG' else '🔴'
+                        tg_send(
+                            f'{ico} <b>ORB {signal}: {sym}</b>\n'
+                            f'${price:.2f} | ORB ${orb_low:.2f}–${orb_high:.2f}\n'
+                            f'Vol {vol_ratio:.1f}x | SL ${sl:.2f} | TP ${tp:.2f} | R/R {rr}:1',
+                            key=f'orb_{sym}_{signal}_{now_utc.strftime("%H%M")}'
+                        )
+
+                        if state.get('auto_trade_enabled') and rr >= 1.5:
+                            sig_obj = {
+                                't': sym, 'signal': signal, 'price': price,
+                                'score': 13, 'conviction': 0.78,
+                            }
+                            hermes_auto_trade_stock(sig_obj, reason=f'ORB {signal} Vol {vol_ratio:.1f}x')
+
+                    except Exception:
+                        pass
+
+        except Exception:
+            pass
+
+        _t.sleep(45)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RSI Divergenz Scanner
+# ─────────────────────────────────────────────────────────────────────────────
+def rsi_divergence_loop():
+    """
+    RSI Divergenz Scanner: alle 3 Min.
+    Bullish Div: Preis new low + RSI higher low → LONG
+    Bearish Div: Preis new high + RSI lower high → SHORT
+    """
+    import time as _t
+    _t.sleep(200)
+
+    def _calc_rsi(closes, period=14):
+        if len(closes) < period + 1:
+            return None
+        gains, losses = [], []
+        for i in range(1, len(closes)):
+            d = closes[i] - closes[i-1]
+            gains.append(max(d, 0))
+            losses.append(max(-d, 0))
+        ag = sum(gains[-period:]) / period
+        al = sum(losses[-period:]) / period
+        if al == 0:
+            return 100.0
+        rs = ag / al
+        return round(100 - (100 / (1 + rs)), 2)
+
+    UNIVERSE = ['NVDA','AMD','INTC','META','AAPL','TSLA','MSFT','AMZN','GOOGL',
+                'MU','QQQ','SPY','PLTR','ARM','SMCI','MSTR','COIN']
+
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            h = now_utc.hour
+            if not (13 <= h < 20):
+                _t.sleep(180)
+                continue
+
+            ctx = ssl.create_default_context()
+            all_syms = list(dict.fromkeys(
+                UNIVERSE + list(state.get('channel_watch', []))[:10]
+            ))
+
+            for sym in all_syms:
+                try:
+                    url = (f'https://data.alpaca.markets/v2/stocks/{sym}/bars'
+                           f'?timeframe=5Min&limit=35&feed=iex&adjustment=raw')
+                    req = urllib.request.Request(url, headers={
+                        'APCA-API-KEY-ID':     ALPACA_KEY,
+                        'APCA-API-SECRET-KEY': ALPACA_SECRET,
+                    })
+                    with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+                        bars = json.loads(r.read()).get('bars', [])
+
+                    if len(bars) < 20:
+                        continue
+
+                    closes = [b['c'] for b in bars]
+                    highs  = [b['h'] for b in bars]
+                    lows   = [b['l'] for b in bars]
+
+                    # RSI für jeden Zeitpunkt berechnen (letzte 10 Bars)
+                    rsi_series = []
+                    for i in range(len(closes) - 10, len(closes)):
+                        r_val = _calc_rsi(closes[:i+1])
+                        rsi_series.append(r_val)
+
+                    if None in rsi_series or len(rsi_series) < 10:
+                        continue
+
+                    current_price = closes[-1]
+                    current_rsi   = rsi_series[-1]
+
+                    # Bearish Divergenz: Preis Higher High, RSI Lower High (letzte 5 Bars)
+                    # Vergleiche letzten 5 Bars mit den 5 Bars davor
+                    ph_recent = max(highs[-5:])
+                    ph_prev   = max(highs[-10:-5])
+                    rh_recent = max(rsi_series[-5:])
+                    rh_prev   = max(rsi_series[-10:-5])
+
+                    # Bullish Divergenz: Preis Lower Low, RSI Higher Low
+                    pl_recent = min(lows[-5:])
+                    pl_prev   = min(lows[-10:-5])
+                    rl_recent = min(rsi_series[-5:])
+                    rl_prev   = min(rsi_series[-10:-5])
+
+                    div_type = None
+
+                    if ph_recent > ph_prev * 1.002 and rh_recent < rh_prev - 2:
+                        div_type = 'BEARISH'   # Preis hoch, RSI schwächer
+                    elif pl_recent < pl_prev * 0.998 and rl_recent > rl_prev + 2:
+                        div_type = 'BULLISH'   # Preis tief, RSI stärker
+
+                    if not div_type:
+                        continue
+
+                    # RSI-Filter: Bearish Div nur wenn RSI > 60; Bullish Div nur wenn RSI < 40
+                    if div_type == 'BEARISH' and current_rsi < 55:
+                        continue
+                    if div_type == 'BULLISH' and current_rsi > 45:
+                        continue
+
+                    # 45-Min Cooldown
+                    prev_s = [s for s in state.get('rsi_div_signals', [])[-30:]
+                              if s['sym'] == sym and s['div_type'] == div_type]
+                    if prev_s and (time.time() - prev_s[-1].get('ts', 0)) < 2700:
+                        continue
+
+                    signal = 'SHORT' if div_type == 'BEARISH' else 'LONG'
+                    entry = {
+                        'sym':      sym,       'div_type':  div_type,
+                        'signal':   signal,    'price':     round(current_price, 2),
+                        'rsi':      current_rsi,
+                        'time':     now_utc.strftime('%H:%M'),
+                        'ts':       time.time(),
+                    }
+                    state['rsi_div_signals'] = ([entry] + state.get('rsi_div_signals', []))[:50]
+
+                    ico = '🔴' if div_type == 'BEARISH' else '🟢'
+                    tg_send(
+                        f'{ico} <b>RSI DIVERGENZ {div_type}: {sym}</b>\n'
+                        f'${current_price:.2f} | RSI {current_rsi:.1f}\n'
+                        f'Preis {"Higher High" if div_type=="BEARISH" else "Lower Low"} aber RSI '
+                        f'{"Lower High" if div_type=="BEARISH" else "Higher Low"} → {signal}',
+                        key=f'rsidiv_{sym}_{div_type}_{now_utc.strftime("%H%M")}'
+                    )
+
+                    if state.get('auto_trade_enabled'):
+                        sig_obj = {
+                            't': sym, 'signal': signal, 'price': current_price,
+                            'score': 12, 'conviction': 0.75,
+                        }
+                        hermes_auto_trade_stock(sig_obj, reason=f'RSI {div_type} Divergenz')
+
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
+        _t.sleep(180)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EMA Cross Scanner (Golden Cross / Death Cross)
+# ─────────────────────────────────────────────────────────────────────────────
+def ema_cross_loop():
+    """
+    EMA Cross Scanner: alle 5 Min auf 15-Min Bars.
+    EMA9/21 Kreuzung (schnell, intraday) + EMA50/200 Cross (stark, täglich).
+    Golden Cross = LONG, Death Cross = SHORT.
+    """
+    import time as _t
+    _t.sleep(250)
+
+    def _ema(prices, period):
+        if len(prices) < period:
+            return None
+        k = 2 / (period + 1)
+        ema_val = sum(prices[:period]) / period
+        for p in prices[period:]:
+            ema_val = p * k + ema_val * (1 - k)
+        return round(ema_val, 4)
+
+    UNIVERSE = ['NVDA','AMD','INTC','META','AAPL','TSLA','MSFT','AMZN','GOOGL',
+                'MU','QQQ','SPY','PLTR','ARM','SMCI','MSTR','COIN','GS','JPM']
+
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            h = now_utc.hour
+            if not (0 <= h < 22):
+                _t.sleep(300)
+                continue
+
+            ctx = ssl.create_default_context()
+            all_syms = list(dict.fromkeys(
+                UNIVERSE + list(state.get('channel_watch', []))[:10]
+            ))
+
+            for sym in all_syms:
+                try:
+                    # 15-Min Bars: 220 Bars ~ 2.75 Handelstage für EMA200
+                    url = (f'https://data.alpaca.markets/v2/stocks/{sym}/bars'
+                           f'?timeframe=15Min&limit=220&feed=iex&adjustment=raw')
+                    req = urllib.request.Request(url, headers={
+                        'APCA-API-KEY-ID':     ALPACA_KEY,
+                        'APCA-API-SECRET-KEY': ALPACA_SECRET,
+                    })
+                    with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+                        bars = json.loads(r.read()).get('bars', [])
+
+                    if len(bars) < 25:
+                        continue
+
+                    closes = [b['c'] for b in bars]
+                    price  = closes[-1]
+
+                    # Schnelles Kreuz (EMA9/21) — intraday relevant
+                    e9_now  = _ema(closes, 9)
+                    e21_now = _ema(closes, 21)
+                    e9_prev = _ema(closes[:-1], 9)
+                    e21_prev= _ema(closes[:-1], 21)
+
+                    cross_type = None
+
+                    if e9_now and e21_now and e9_prev and e21_prev:
+                        if e9_prev < e21_prev and e9_now > e21_now:
+                            cross_type = 'GOLDEN_9_21'
+                        elif e9_prev > e21_prev and e9_now < e21_now:
+                            cross_type = 'DEATH_9_21'
+
+                    # Starkes Kreuz (EMA50/200) — wenn genug Bars
+                    if len(bars) >= 210:
+                        e50_now  = _ema(closes, 50)
+                        e200_now = _ema(closes, 200)
+                        e50_prev = _ema(closes[:-1], 50)
+                        e200_prev= _ema(closes[:-1], 200)
+
+                        if e50_now and e200_now and e50_prev and e200_prev:
+                            if e50_prev < e200_prev and e50_now > e200_now:
+                                cross_type = 'GOLDEN_50_200'
+                            elif e50_prev > e200_prev and e50_now < e200_now:
+                                cross_type = 'DEATH_50_200'
+
+                    if not cross_type:
+                        continue
+
+                    # 2-Stunden Cooldown pro Sym+Cross
+                    prev_c = [s for s in state.get('ema_cross_signals', [])[-30:]
+                              if s['sym'] == sym and s['cross_type'] == cross_type]
+                    if prev_c and (_t.time() - prev_c[-1].get('ts', 0)) < 7200:
+                        continue
+
+                    signal = 'LONG' if 'GOLDEN' in cross_type else 'SHORT'
+                    e_fast = e9_now if '9_21' in cross_type else e50_now
+                    e_slow = e21_now if '9_21' in cross_type else e200_now
+
+                    entry = {
+                        'sym':        sym,       'cross_type':  cross_type,
+                        'signal':     signal,    'price':       round(price, 2),
+                        'ema_fast':   round(e_fast, 2),
+                        'ema_slow':   round(e_slow, 2),
+                        'time':       now_utc.strftime('%H:%M'),
+                        'ts':         _t.time(),
+                    }
+                    state['ema_cross_signals'] = ([entry] + state.get('ema_cross_signals', []))[:50]
+
+                    strength = '⭐⭐⭐' if '50_200' in cross_type else '⭐⭐'
+                    ico = '🟢' if signal == 'LONG' else '🔴'
+                    tg_send(
+                        f'{ico} <b>EMA CROSS {cross_type}: {sym}</b> {strength}\n'
+                        f'${price:.2f} | EMA-Fast ${e_fast:.2f} / EMA-Slow ${e_slow:.2f}\n'
+                        f'→ {signal}',
+                        key=f'emacross_{sym}_{cross_type}_{now_utc.strftime("%H%M")}'
+                    )
+
+                    # Golden/Death Cross 50/200 = starkes Signal → Auto-Trade
+                    if state.get('auto_trade_enabled') and '50_200' in cross_type:
+                        sig_obj = {
+                            't': sym, 'signal': signal, 'price': price,
+                            'score': 14, 'conviction': 0.80,
+                        }
+                        hermes_auto_trade_stock(sig_obj, reason=f'EMA {cross_type}')
+
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
+        _t.sleep(300)
 
 
 def hermes_monitor():
@@ -7374,6 +7885,18 @@ fib_thread.start()
 # Strategy Monitor Pro — alle 5 Strategien aus TradingView (LSOB+GUSS+Dolphin+FIB882+OMS)
 strat_thread = threading.Thread(target=strategy_monitor_loop, daemon=True)
 strat_thread.start()
+
+# ORB (Opening Range Breakout) Scanner
+orb_thread = threading.Thread(target=orb_scanner_loop, daemon=True)
+orb_thread.start()
+
+# RSI Divergenz Scanner
+rsi_div_thread = threading.Thread(target=rsi_divergence_loop, daemon=True)
+rsi_div_thread.start()
+
+# EMA Cross Scanner (Golden Cross / Death Cross)
+ema_cross_thread = threading.Thread(target=ema_cross_loop, daemon=True)
+ema_cross_thread.start()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
