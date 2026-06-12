@@ -3377,7 +3377,7 @@ function renderTab2(data) {
         + ' | ✅' + wins + ' ❌' + losses + ' ⏳' + openTrades.length
         + '</div>';
       bTrades.slice(0,10).forEach(t => {
-        let wonIcon = t.won === true ? '✅' : t.won === false ? '❌' : '⏳';
+        let wonIcon = t.trail_triggered ? '🔒' : (t.won === true ? '✅' : t.won === false ? '❌' : '⏳');
         let sc  = t.signal === 'LONG' ? '#4dff91' : '#ff4d6b';
         let pnlPct = t.pnl_pct || 0;
         let pnlUSD = t.pnl_dollar || 0;
@@ -3385,13 +3385,16 @@ function renderTab2(data) {
         let pnlStr = pnlPct !== 0
           ? (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(1) + '% (' + (pnlUSD >= 0 ? '+' : '') + '$' + pnlUSD.toFixed(0) + ')'
           : 'offen';
+        let trailBadge = t.trail_on
+          ? '<span style="font-size:9px;background:#1a1200;color:#f59e0b;padding:1px 4px;border-radius:3px;margin-left:4px">🔒 TRAIL ' + (t.trail_peak||0).toFixed(1) + '%</span>'
+          : '';
         let typeBadge = t.type === 'STOCK'
           ? '<span style="font-size:9px;background:#0d2a1a;color:#4dff91;padding:1px 4px;border-radius:3px;margin-left:4px">STK</span>'
           : '<span style="font-size:9px;background:#0a0a2a;color:#a78bfa;padding:1px 4px;border-radius:3px;margin-left:4px">OPT</span>';
         html += '<div style="padding:4px 0;border-top:1px solid #1a1a2e;display:flex;justify-content:space-between;align-items:center">'
           + '<div>'
           +   '<span style="color:' + sc + ';font-weight:bold">' + wonIcon + ' ' + t.signal + ' ' + t.sym + '</span>'
-          +   typeBadge
+          +   typeBadge + trailBadge
           +   ' <span style="font-size:10px;color:#64748b">Score:' + t.score + ' ' + Math.round((t.conviction||0)*100) + '%</span>'
           +   (t.qty ? ' <span style="font-size:10px;color:#64748b">×' + t.qty + '</span>' : '')
           +   '<div style="font-size:10px;color:#64748b">' + (t.reason||'').slice(0,50) + ' | ' + (t.time||'') + '</div>'
@@ -3513,41 +3516,54 @@ function renderTab2(data) {
       + '</div>';
   }
 
-  if (vwapSigs.length > 0 || gapSigs.length > 0) {
+  // ── VWAP Reclaim Block (immer sichtbar) ──────────────────────────────────────
+  {
     html += '<div style="margin:8px;background:linear-gradient(135deg,#0d1020,#121830);border:1px solid #60a5fa44;border-radius:10px;padding:12px 14px">'
-      + '<div style="font-size:10px;font-weight:bold;color:#60a5fa;letter-spacing:2px;margin-bottom:8px">⚡ VWAP + PRE-MARKET SIGNALE</div>';
-
-    // VWAP Signale
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+      + '<span style="font-size:10px;font-weight:bold;color:#60a5fa;letter-spacing:2px">⚡ VWAP RECLAIM</span>'
+      + '<span style="font-size:9px;color:#64748b">' + vwapSigs.length + ' Signale heute</span>'
+      + '</div>';
     if (vwapSigs.length > 0) {
-      html += '<div style="font-size:10px;color:#6b8cad;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px">VWAP Kreuzungen</div>';
       vwapSigs.slice(0, 6).forEach(s => {
         let sc  = s.signal === 'LONG' ? '#4dff91' : '#ff4d6b';
         let ico = s.signal === 'LONG' ? '▲' : '▼';
         html += '<div style="display:flex;justify-content:space-between;padding:4px 0;border-top:1px solid #1a2040">'
           + '<div><span style="color:' + sc + ';font-weight:bold">' + ico + ' ' + s.signal + ' <span style="color:#fff">' + s.sym + '</span></span>'
-          +   '<div style="font-size:10px;color:#64748b">$' + s.price + ' vs VWAP $' + s.vwap + ' | Vol ×' + s.vol_ratio + ' | ' + s.time + '</div></div>'
-          + '<span style="font-size:11px;color:' + sc + ';align-self:center">' + (s.signal==='LONG'?'Reclaim':'Break') + '</span>'
+          + '<div style="font-size:10px;color:#64748b">$' + s.price + ' vs VWAP $' + s.vwap + ' | Vol ×' + s.vol_ratio + ' | ' + s.time + '</div></div>'
+          + '<span style="font-size:11px;color:' + sc + ';align-self:center">' + (s.signal==='LONG'?'Reclaim ▲':'Break ▼') + '</span>'
           + '</div>';
       });
+    } else {
+      html += '<div style="color:#475569;font-size:11px;text-align:center;padding:6px">'
+        + '⏳ Aktiv ab 00:00 UTC — kreuzt Aktie VWAP mit Vol ×1.4 → Signal</div>';
     }
+    html += '</div>';
+  }
 
-    // Gap Signale
+  // ── Pre-Market Gap Block (immer sichtbar) ────────────────────────────────────
+  {
+    html += '<div style="margin:8px;background:linear-gradient(135deg,#0d1020,#121830);border:1px solid #a78bfa44;border-radius:10px;padding:12px 14px">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+      + '<span style="font-size:10px;font-weight:bold;color:#a78bfa;letter-spacing:2px">🌅 PRE-MARKET GAPS</span>'
+      + '<span style="font-size:9px;color:#64748b">' + gapSigs.length + ' Gaps heute | >2% Gap = Signal</span>'
+      + '</div>';
     if (gapSigs.length > 0) {
-      html += '<div style="font-size:10px;color:#6b8cad;margin-top:8px;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px">Pre-Market Gaps</div>';
       gapSigs.slice(0, 5).forEach(g => {
-        let gc  = g.gap_pct >= 0 ? '#4dff91' : '#ff4d6b';
-        let ico = g.gap_pct >= 0 ? '📈' : '📉';
+        let gc   = g.gap_pct >= 0 ? '#4dff91' : '#ff4d6b';
+        let ico  = g.gap_pct >= 0 ? '📈' : '📉';
         let fade = Math.abs(g.gap_pct) < 4;
         html += '<div style="display:flex;justify-content:space-between;padding:4px 0;border-top:1px solid #1a2040">'
           + '<div><span style="font-size:12px;font-weight:bold;color:#fff">' + ico + ' ' + g.sym + '</span>'
-          +   ' <span style="color:' + gc + ';font-weight:bold">' + (g.gap_pct >= 0?'+':'') + g.gap_pct + '%</span>'
-          +   '<div style="font-size:10px;color:#64748b">$' + g.prev_close + ' → $' + g.pre_price + ' | ' + g.time
-          +     (fade ? ' | <span style="color:#f59e0b">Fade möglich</span>' : ' | <span style="color:#4dff91">Continuation</span>') + '</div></div>'
+          + ' <span style="color:' + gc + ';font-weight:bold">' + (g.gap_pct>=0?'+':'') + g.gap_pct + '%</span>'
+          + '<div style="font-size:10px;color:#64748b">$' + g.prev_close + ' → $' + g.pre_price + ' | ' + g.time
+          + (fade ? ' | <span style="color:#f59e0b">Fade</span>' : ' | <span style="color:#4dff91">Continuation</span>') + '</div></div>'
           + '<span style="font-size:10px;color:#94a3b8;align-self:center">' + g.signal + '</span>'
           + '</div>';
       });
+    } else {
+      html += '<div style="color:#475569;font-size:11px;text-align:center;padding:6px">'
+        + '⏳ Aktiv 08:00–13:30 UTC — Aktien mit Gap >2% vor US-Open</div>';
     }
-
     html += '</div>';
   }
 
