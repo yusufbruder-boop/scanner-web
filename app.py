@@ -4922,8 +4922,10 @@ def channel_bounce_loop():
     while True:
         try:
             now_utc = datetime.now(timezone.utc)
-            # Nur während Marktzeiten 13:30-20:00 UTC (9:30-16:00 ET)
-            if not (13 <= now_utc.hour < 20 or (now_utc.hour == 13 and now_utc.minute >= 30)):
+            h = now_utc.hour
+            # Asia: 00-09 UTC | EU: 07-16 UTC | US+AfterHours: 13-22 UTC
+            # Pause nur 22:00-00:00 UTC (kein Markt aktiv)
+            if not (h < 22):
                 _t.sleep(60)
                 continue
 
