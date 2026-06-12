@@ -3241,8 +3241,18 @@ function renderTab2(data) {
       let allTickers = (v.tickers||[]).sort((a,b)=>b.chg-a.chg);
       let tickerChips = allTickers.map(t => {
         let tc = t.chg >= 3 ? '#4dff91' : (t.chg >= 1 ? '#a0d070' : (t.chg >= 0 ? '#5a7a5a' : (t.chg >= -2 ? '#aa6644' : '#ff4d6b')));
+        let optStr = '';
+        if (t.call_oi || t.put_oi) {
+          let pc = t.pc || 0;
+          let sentC = pc < 0.7 ? '#4dff91' : (pc > 1.3 ? '#ff4d6b' : '#ffd700');
+          let cStr = t.call_oi >= 1000 ? (t.call_oi/1000).toFixed(0)+'k' : (t.call_oi||0);
+          let pStr = t.put_oi  >= 1000 ? (t.put_oi /1000).toFixed(0)+'k' : (t.put_oi ||0);
+          optStr = '<span style="color:#4dff91;font-size:8px"> C:'+cStr+'</span>'
+                 + '<span style="color:#ff6677;font-size:8px"> P:'+pStr+'</span>'
+                 + '<span style="color:'+sentC+';font-size:8px"> '+pc.toFixed(1)+'</span>';
+        }
         return '<span style="background:#070d18;border:1px solid ' + tc + '55;border-radius:4px;padding:1px 5px;font-size:9px;color:' + tc + ';white-space:nowrap">'
-          + t.sym + ' <b>' + (t.chg>=0?'+':'') + t.chg + '%</b></span>';
+          + t.sym + ' <b>' + (t.chg>=0?'+':'') + t.chg + '%</b>' + optStr + '</span>';
       }).join(' ');
       html += '<div style="padding:5px 0;border-top:1px solid #1a1a30">'
         + '<div style="display:flex;justify-content:space-between;align-items:center">'
@@ -3650,6 +3660,23 @@ function fibCard(r, isTraded) {
       '</div>';
   }
 
+  // Options OI Block (wenn vorhanden)
+  let optsBlock = '';
+  if (r.opts) {
+    const o       = r.opts;
+    const sentC   = o.sentiment === 'BULLISH' ? '#4dff91' : (o.sentiment === 'BEARISH' ? '#ff4d6b' : '#ffd700');
+    const cStr    = o.call_oi >= 1000 ? (o.call_oi/1000).toFixed(0)+'k' : o.call_oi;
+    const pStr    = o.put_oi  >= 1000 ? (o.put_oi /1000).toFixed(0)+'k' : o.put_oi;
+    optsBlock = '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:5px;padding:5px 6px;background:#05080f;border-radius:4px;font-size:10px;border:1px solid #1a2030">'
+      + '<span style="color:#4a6a9a;font-weight:bold">📊 OPTIONEN:</span>'
+      + '<span style="color:#4dff91">Calls: <b>' + cStr + '</b> OI</span>'
+      + '<span style="color:#ff6677">Puts: <b>' + pStr + '</b> OI</span>'
+      + '<span style="color:' + sentC + '">P/C: <b>' + (o.pc||0).toFixed(2) + '</b> ' + (o.sentiment||'') + '</span>'
+      + '<span style="color:#ff4d6b;font-size:9px">🧱 Wall: $' + (o.call_wall||0).toFixed(0) + '</span>'
+      + '<span style="color:#4dff91;font-size:9px">🛡 Floor: $' + (o.put_floor||0).toFixed(0) + '</span>'
+      + '</div>';
+  }
+
   return '<div class="fib-card ' + cardCls + '" style="border-left:3px solid ' + setupColor + ';background:' + setupBg + '">' +
     '<div style="display:flex;justify-content:space-between;align-items:center">' +
       '<div style="display:flex;align-items:center;gap:6px">' +
@@ -3667,6 +3694,7 @@ function fibCard(r, isTraded) {
       (reject  ? '<span style="color:#ff4444;font-size:11px">⬇ REJECTION</span>' : '') +
     '</div>' +
     tradeBlock +
+    optsBlock +
     '<div class="fib-bar" style="margin-top:6px">' +
       '<div class="fib-bar-fill" style="width:' + fillPct.toFixed(1) + '%;background:' + setupColor + '"></div>' +
       markers +
@@ -5013,6 +5041,35 @@ def hermes_monitor():
                                 if chgs:
                                     avg = round(sum(x['chg'] for x in chgs)/len(chgs),2)
                                     rotation[sektor] = {'avg':avg,'tickers':chgs}
+                            # Options OI für SPACE-Sektor nachladen
+                            if 'SPACE' in rotation:
+                                from collections import defaultdict as _dd
+                                for t in rotation['SPACE']['tickers']:
+                                    try:
+                                        oi_url = (f'https://api.polygon.io/v3/snapshot/options/{t["sym"]}'
+                                                  f'?limit=250&apiKey={POLY_KEY}')
+                                        oi_req = _ur.Request(oi_url, headers={'User-Agent':'Mozilla/5.0'})
+                                        with _ur.urlopen(oi_req, context=_ctx, timeout=6) as ir:
+                                            id_ = _js.loads(ir.read())
+                                        strikes = _dd(lambda: {'c': 0, 'p': 0})
+                                        for opt in id_.get('results', []):
+                                            det  = opt.get('details', {})
+                                            oi   = opt.get('open_interest', 0) or 0
+                                            stk  = det.get('strike_price', 0)
+                                            otyp = det.get('contract_type', '')
+                                            if stk <= 0 or oi <= 0: continue
+                                            if otyp == 'call': strikes[stk]['c'] += oi
+                                            elif otyp == 'put': strikes[stk]['p']  += oi
+                                        tc = sum(v['c'] for v in strikes.values())
+                                        tp = sum(v['p'] for v in strikes.values())
+                                        if tc + tp > 0:
+                                            t['call_oi']   = tc
+                                            t['put_oi']    = tp
+                                            t['pc']        = round(tp/tc, 2) if tc > 0 else 0
+                                            t['call_wall'] = max(strikes, key=lambda k: strikes[k]['c']) if strikes else 0
+                                            t['put_floor'] = max(strikes, key=lambda k: strikes[k]['p']) if strikes else 0
+                                    except Exception:
+                                        pass
 
                             state['sector_rotation'] = {
                                 'ts': datetime.now().strftime('%H:%M'),

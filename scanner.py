@@ -3493,6 +3493,51 @@ def _fib_for_ticker(sym, lookback_days=45):
         return None
 
 
+def _options_oi_for_ticker(sym):
+    """Holt aggregierte Options-OI für einen Ticker via Polygon."""
+    try:
+        import urllib.request as _ur, json as _js, ssl as _sl
+        from collections import defaultdict
+        _ctx = _sl.create_default_context()
+        _ctx.check_hostname = False
+        _ctx.verify_mode = _sl.CERT_NONE
+        url = (f'https://api.polygon.io/v3/snapshot/options/{sym}'
+               f'?limit=250&apiKey={API}')
+        req = _ur.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with _ur.urlopen(req, context=_ctx, timeout=6) as r:
+            d = _js.loads(r.read())
+        opts = d.get('results', [])
+        if not opts:
+            return None
+        strikes = defaultdict(lambda: {'calls': 0, 'puts': 0})
+        for opt in opts:
+            det  = opt.get('details', {})
+            oi   = opt.get('open_interest', 0) or 0
+            stk  = det.get('strike_price', 0)
+            otyp = det.get('contract_type', '')
+            if stk <= 0 or oi <= 0:
+                continue
+            if otyp == 'call':   strikes[stk]['calls'] += oi
+            elif otyp == 'put':  strikes[stk]['puts']  += oi
+        if not strikes:
+            return None
+        total_c   = sum(v['calls'] for v in strikes.values())
+        total_p   = sum(v['puts']  for v in strikes.values())
+        call_wall = max(strikes, key=lambda k: strikes[k]['calls'])
+        put_floor = max(strikes, key=lambda k: strikes[k]['puts'])
+        pc        = round(total_p / total_c, 2) if total_c > 0 else 0
+        return {
+            'call_oi':   total_c,
+            'put_oi':    total_p,
+            'pc':        pc,
+            'call_wall': call_wall,
+            'put_floor': put_floor,
+            'sentiment': ('BULLISH' if pc < 0.7 else 'BEARISH' if pc > 1.3 else 'NEUTRAL'),
+        }
+    except Exception:
+        return None
+
+
 def fibonacci_scan(max_workers=4):
     results = []
     # max_workers=4 statt 10: verhindert Polygon Rate-Limit (429) bei parallelen Requests
@@ -3504,9 +3549,21 @@ def fibonacci_scan(max_workers=4):
                 results.append(r)
 
     # Sortierung: AT_LEVEL zuerst, dann KEY_LEVEL, dann Distanz
-    priority = {'AT_882': 0, 'AT_618': 1, 'AT_786': 2,
-                'NEAR_882': 3, 'NEAR_KEY': 4, 'NEAR_382': 5, 'MONITORING': 6}
+    priority = {'AT_HIGH': 0, 'AT_882': 1, 'AT_618': 2, 'AT_786': 3,
+                'NEAR_HIGH': 4, 'NEAR_882': 5, 'NEAR_KEY': 6, 'NEAR_382': 7, 'MONITORING': 8}
     results.sort(key=lambda x: (priority.get(x['signal'], 9), x['nearest_dist']))
+
+    # Options OI für Top-Signale nachladen (nur LONG/SHORT Kandidaten)
+    top_signals = {'AT_HIGH', 'NEAR_HIGH', 'AT_882', 'NEAR_882', 'AT_786'}
+    candidates  = [r for r in results if r.get('signal') in top_signals]
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        oi_futures = {ex.submit(_options_oi_for_ticker, r['sym']): r for r in candidates}
+        for fut in as_completed(oi_futures):
+            row = oi_futures[fut]
+            oi  = fut.result()
+            if oi:
+                row['opts'] = oi
+
     return results
 
 
