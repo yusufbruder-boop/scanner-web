@@ -3479,12 +3479,15 @@ const FIB_COLORS = {'88.2':'badge-882','78.6':'badge-786','61.8':'badge-618',
 const FIB_NAMES  = {'88.2':'88.2%','78.6':'78.6%','61.8':'61.8% (Golden)',
                     '50.0':'50.0%','38.2':'38.2%','23.6':'23.6%'};
 const SIG_LABELS = {
-  'AT_882':   ['AT 88.2%',   '#ff6b35'],
-  'AT_618':   ['AT 61.8%',   '#ffd700'],
-  'AT_786':   ['AT 78.6%',   '#ff9500'],
-  'NEAR_KEY': ['KEY LEVEL',  '#4dffaa'],
-  'NEAR_382': ['NEAR 38.2%', '#4db8ff'],
-  'MONITORING':['MONITORING','#4a6a8a'],
+  'AT_HIGH':   ['AT HIGH 📉',  '#ff2244'],
+  'NEAR_HIGH': ['NEAR HIGH',   '#ff6677'],
+  'AT_882':    ['AT 88.2% 📈', '#ff6b35'],
+  'AT_786':    ['AT 78.6%',    '#ff9500'],
+  'AT_618':    ['AT 61.8%',    '#ffd700'],
+  'NEAR_882':  ['NEAR 88.2%',  '#ff9966'],
+  'NEAR_KEY':  ['KEY LEVEL',   '#4dffaa'],
+  'NEAR_382':  ['NEAR 38.2%',  '#4db8ff'],
+  'MONITORING':['MONITORING',  '#4a6a8a'],
 };
 
 function renderFibResults(results, latestData) {
@@ -3494,20 +3497,27 @@ function renderFibResults(results, latestData) {
   const fibTrades = (latestData && latestData.fib_trades) ? latestData.fib_trades : [];
   const fibTraded = new Set(fibTrades.map(t => t.sym));
 
-  // Gruppen
-  const at882   = results.filter(r => r.signal === 'AT_882');
-  const near882 = results.filter(r => r.signal === 'NEAR_882');
-  const at618   = results.filter(r => r.signal === 'AT_618');
-  const at786   = results.filter(r => r.signal === 'AT_786');
-  const nearKey = results.filter(r => r.signal === 'NEAR_KEY');
-  const others  = results.filter(r => !['AT_882','NEAR_882','AT_618','AT_786','NEAR_KEY'].includes(r.signal));
+  // Gruppen nach Trade-Richtung
+  const shortHot  = results.filter(r => r.signal === 'AT_HIGH');
+  const shortWarm = results.filter(r => r.signal === 'NEAR_HIGH');
+  const longHot   = results.filter(r => ['AT_882','NEAR_882'].includes(r.signal));
+  const longWarm  = results.filter(r => ['AT_786','AT_618'].includes(r.signal));
+  const neutral   = results.filter(r => ['NEAR_KEY','NEAR_382'].includes(r.signal));
+  const others    = results.filter(r => r.signal === 'MONITORING');
 
   let html = '';
+
+  // Legende
+  html += '<div style="margin:8px 8px 4px;display:flex;gap:10px;flex-wrap:wrap;font-size:10px">'
+    + '<span style="color:#ff2244">📉 ROT = SHORT (nahe Hoch)</span>'
+    + '<span style="color:#4dff91">📈 GRÜN = LONG (nahe Tief/0.882)</span>'
+    + '<span style="color:#ffd700">🟡 GELB = NEUTRAL (Mid-Range)</span>'
+    + '</div>';
 
   // Fib-Trades Übersicht falls vorhanden
   if (fibTrades.length > 0) {
     html += '<div style="margin:8px;background:#0a1a0a;border:1px solid #2d9e5744;border-radius:8px;padding:10px 12px">';
-    html += '<div style="font-size:10px;font-weight:bold;color:#4dff91;letter-spacing:2px;margin-bottom:6px">🤖 FIB 88.2% AUTO-TRADES HEUTE (' + fibTrades.length + ')</div>';
+    html += '<div style="font-size:10px;font-weight:bold;color:#4dff91;letter-spacing:2px;margin-bottom:6px">🤖 FIB AUTO-TRADES HEUTE (' + fibTrades.length + ')</div>';
     fibTrades.slice(0,6).forEach(t => {
       let sc = t.signal === 'LONG' ? '#4dff91' : '#ff4d6b';
       html += '<div style="display:flex;justify-content:space-between;padding:3px 0;border-top:1px solid #1a2a1a">'
@@ -3518,19 +3528,19 @@ function renderFibResults(results, latestData) {
     html += '</div>';
   }
 
-  function cardGroup(title, items, color) {
+  function cardGroup(title, items, color, bg) {
     if (!items.length) return '';
-    let h = '<div class="fib-section-title" style="color:' + color + '">' + title + ' (' + items.length + ')</div>';
+    let h = '<div class="fib-section-title" style="color:' + color + ';background:' + (bg||'transparent') + ';padding:4px 8px;border-radius:4px;margin:8px 0 2px">' + title + ' (' + items.length + ')</div>';
     items.forEach(r => { h += fibCard(r, fibTraded.has(r.sym)); });
     return h;
   }
 
-  html += cardGroup('AT 88.2% — DEEP RETRACE 🎯 AUTO-TRADE', at882, '#ff6b35');
-  html += cardGroup('NEAR 88.2% — APPROACHING LEVEL', near882, '#ff9500');
-  html += cardGroup('AT 61.8% — GOLDEN RATIO', at618, '#ffd700');
-  html += cardGroup('AT 78.6% — STRONG RETRACE', at786, '#ff9500');
-  html += cardGroup('NEAR KEY LEVEL (61.8 / 78.6 / 88.2)', nearKey, '#4dffaa');
-  html += cardGroup('ALLE ANDEREN', others, '#4a6a8a');
+  html += cardGroup('📉 SHORT KANDIDATEN — Nahe Swing-High', shortHot,  '#ff2244', '#1a020a');
+  html += cardGroup('⚠️ SHORT WATCHLIST — Approaching High',  shortWarm, '#ff6677', '#150208');
+  html += cardGroup('📈 LONG KANDIDATEN — 88.2% / 78.6%',   longHot,   '#4dff91', '#021a08');
+  html += cardGroup('🟡 LONG WATCHLIST — Key Level',         longWarm,  '#ffd700', '#141200');
+  html += cardGroup('⚪ NEUTRAL — Mid Range',                 neutral,   '#94a3b8', '#0a0a0a');
+  html += cardGroup('🔍 MONITORING',                          others,    '#4a6a8a', 'transparent');
 
   return html;
 }
@@ -3568,31 +3578,65 @@ function fibCard(r, isTraded) {
     ? ' <span style="font-size:9px;background:#0a2a0a;border:1px solid #4dff91;color:#4dff91;padding:1px 5px;border-radius:3px;font-weight:700">✅ TRADED</span>'
     : '';
 
-  return '<div class="fib-card ' + cardCls + '">' +
+  // Trade-Richtung bestimmen
+  const setup      = r.trade_setup || (r.near_high || r.at_high ? 'SHORT' : (r.near_882 ? 'LONG' : 'NEUTRAL'));
+  const isLong     = setup === 'LONG';
+  const isShort    = setup === 'SHORT';
+  const setupColor = isLong ? '#4dff91' : (isShort ? '#ff2244' : '#ffd700');
+  const setupBg    = isLong ? '#021a08' : (isShort ? '#1a0208' : '#141200');
+  const setupLabel = isLong ? '📈 LONG'  : (isShort ? '📉 SHORT' : '⚪ NEUTRAL');
+  const posPct     = r.position_pct != null ? r.position_pct.toFixed(0) : fillPct.toFixed(0);
+  const posColor   = posPct >= 80 ? '#ff2244' : (posPct <= 20 ? '#4dff91' : '#ffd700');
+
+  // Trade-Daten je nach Setup
+  let tradeBlock = '';
+  if (isLong) {
+    tradeBlock =
+      '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:5px;font-size:10px">' +
+        '<span style="background:#0a2010;border:1px solid #4dff9144;padding:1px 6px;border-radius:3px;color:#4dff91">ENTRY $' + (r.f882_entry||0).toFixed(2) + '</span>' +
+        '<span style="background:#0a1020;border:1px solid #ff440044;padding:1px 6px;border-radius:3px;color:#ff6644">SL $' + (r.sl||0).toFixed(2) + '</span>' +
+        '<span style="background:#0a1020;border:1px solid #4dff9133;padding:1px 6px;border-radius:3px;color:#4db870">TP1 $' + (r.tp1||0).toFixed(2) + '</span>' +
+        '<span style="background:#0a1020;border:1px solid #ffd70033;padding:1px 6px;border-radius:3px;color:#ffd700">TP2 $' + (r.tp2||0).toFixed(2) + '</span>' +
+        '<span style="background:#0a1020;border:1px solid #4db8ff33;padding:1px 6px;border-radius:3px;color:#4db8ff">TP3 $' + (r.tp3||0).toFixed(2) + '</span>' +
+        '<span style="color:#4a6a8a;align-self:center">R:R ' + (r.rr||'?') + '</span>' +
+      '</div>';
+  } else if (isShort) {
+    tradeBlock =
+      '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:5px;font-size:10px">' +
+        '<span style="background:#1a0208;border:1px solid #ff224444;padding:1px 6px;border-radius:3px;color:#ff2244">ENTRY $' + (r.price||0).toFixed(2) + '</span>' +
+        '<span style="background:#0a1020;border:1px solid #ff440044;padding:1px 6px;border-radius:3px;color:#ff6644">SL $' + (r.sh_sl||0).toFixed(2) + '</span>' +
+        '<span style="background:#0a1020;border:1px solid #ff224433;padding:1px 6px;border-radius:3px;color:#ff6677">TP1 $' + (r.sh_tp1||0).toFixed(2) + '</span>' +
+        '<span style="background:#0a1020;border:1px solid #ffd70033;padding:1px 6px;border-radius:3px;color:#ffd700">TP2 $' + (r.sh_tp2||0).toFixed(2) + '</span>' +
+        '<span style="background:#0a1020;border:1px solid #4db8ff33;padding:1px 6px;border-radius:3px;color:#4db8ff">TP3 $' + (r.sh_tp3||0).toFixed(2) + '</span>' +
+        '<span style="color:#4a6a8a;align-self:center">R:R ' + (r.sh_rr||'?') + '</span>' +
+      '</div>';
+  }
+
+  return '<div class="fib-card ' + cardCls + '" style="border-left:3px solid ' + setupColor + ';background:' + setupBg + '">' +
     '<div style="display:flex;justify-content:space-between;align-items:center">' +
-      '<span class="fib-sym">' + r.sym + tradedBadge + '</span>' +
-      '<span style="font-size:11px;background:' + sigInfo[1] + ';color:' + (sig==='AT_618'||sig==='AT_786'?'#000':'#fff') + ';padding:2px 7px;border-radius:4px;font-weight:700">' + sigInfo[0] + '</span>' +
+      '<div style="display:flex;align-items:center;gap:6px">' +
+        '<span class="fib-sym">' + r.sym + tradedBadge + '</span>' +
+        '<span style="font-size:12px;font-weight:900;color:' + setupColor + '">' + setupLabel + '</span>' +
+      '</div>' +
+      '<span style="font-size:10px;background:' + sigInfo[1] + ';color:#fff;padding:2px 7px;border-radius:4px;font-weight:700">' + sigInfo[0] + '</span>' +
     '</div>' +
     '<div style="display:flex;align-items:center;gap:10px;margin:4px 0">' +
       '<span class="fib-price">$' + (r.price||0).toFixed(2) + '</span>' +
       '<span class="' + chgCls + '" style="font-size:12px">' + chgStr + '</span>' +
+      '<span style="font-size:10px;color:' + posColor + ';font-weight:bold">Pos: ' + posPct + '%</span>' +
       (volStr ? '<span style="color:#ff9500;font-size:11px">' + volStr + '</span>' : '') +
-      (bounce  ? '<span style="color:#4dff88;font-size:11px">BOUNCE</span>'   : '') +
-      (reject  ? '<span style="color:#ff4444;font-size:11px">REJECTION</span>' : '') +
+      (bounce  ? '<span style="color:#4dff88;font-size:11px">⬆ BOUNCE</span>'    : '') +
+      (reject  ? '<span style="color:#ff4444;font-size:11px">⬇ REJECTION</span>' : '') +
     '</div>' +
-    '<div style="margin:4px 0">' +
-      '<span class="fib-level-badge ' + nearBadge + '">' + nearName + '</span>' +
-      '<span style="color:' + distCol + ';font-size:11px">Abstand: ' + dist + '%</span>' +
-      '<span style="color:#4a6a8a;font-size:10px;margin-left:8px">' + (r.nearest_dir||'') + '</span>' +
-    '</div>' +
-    '<div class="fib-bar">' +
-      '<div class="fib-bar-fill" style="width:' + fillPct.toFixed(1) + '%"></div>' +
+    tradeBlock +
+    '<div class="fib-bar" style="margin-top:6px">' +
+      '<div class="fib-bar-fill" style="width:' + fillPct.toFixed(1) + '%;background:' + setupColor + '"></div>' +
       markers +
     '</div>' +
-    '<div style="display:flex;justify-content:space-between;font-size:10px;color:#2a4a3a">' +
-      '<span>LOW ' + (r.swing_low||0).toFixed(2) + '</span>' +
-      '<span style="color:#4a6a8a">Range: ' + (r.range||0).toFixed(2) + '</span>' +
-      '<span>HIGH ' + (r.swing_high||0).toFixed(2) + '</span>' +
+    '<div style="display:flex;justify-content:space-between;font-size:10px;color:#3a4a5a;margin-top:2px">' +
+      '<span>🟢 LOW $' + (r.swing_low||0).toFixed(2) + '</span>' +
+      '<span style="color:' + posColor + '">' + posPct + '% in Range</span>' +
+      '<span>🔴 HIGH $' + (r.swing_high||0).toFixed(2) + '</span>' +
     '</div>' +
   '</div>';
 }

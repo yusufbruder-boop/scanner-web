@@ -3409,18 +3409,37 @@ def _fib_for_ticker(sym, lookback_days=45):
         bounce    = (chg_pct > 0.2 or bull_pattern) and (at_level or near_882)
         rejection = (chg_pct < -0.2 or bear_pattern) and (at_level or near_882)
 
-        # ── FIB 0.882 Sniper TP/SL (nach PDF-Strategie) ─────────────────────
-        # LONG Setup: Preis retraciert auf 0.882, TP in Richtung Swing-Hoch
+        # ── Position im Range (0% = Swing-Low, 100% = Swing-High) ────────────
+        position_pct = round((current - swing_low) / rng * 100, 1)
+
+        # ── LONG Setup: Preis retraciert auf 0.882, TP in Richtung Swing-Hoch ──
         f882_price = levels['88.2']['retrace']
         tp1 = round(swing_high - rng * 0.786, 4)   # TP1 @ 0.786 (20%)
         tp2 = round(swing_high - rng * 0.650, 4)   # TP2 @ 0.65  (50%)
         tp3 = round(swing_high - rng * 0.500, 4)   # TP3 @ 0.5   (25%)
         sl  = round(swing_low  * 0.998,        4)   # SL leicht unter Swing-Low
-
-        # Risk/Reward bei Einstieg am 0.882 Level
         risk   = max(0.0001, f882_price - sl)
         reward = max(0.0001, tp2 - f882_price)
         rr     = round(reward / risk, 2)
+
+        # ── SHORT Setup: Preis nahe Swing-Hoch, TP in Richtung Swing-Tief ─────
+        sh_tp1  = round(swing_high - rng * 0.382, 4)  # TP1 @ 38.2%
+        sh_tp2  = round(swing_high - rng * 0.618, 4)  # TP2 @ Golden Pocket
+        sh_tp3  = round(swing_high - rng * 0.882, 4)  # TP3 @ 88.2% (tief)
+        sh_sl   = round(swing_high * 1.005, 4)          # SL 0.5% über Swing-High
+        sh_risk = max(0.0001, sh_sl - current)
+        sh_rwd  = max(0.0001, current - sh_tp2)
+        sh_rr   = round(sh_rwd / sh_risk, 2)
+
+        # ── Trade-Setup bestimmen ─────────────────────────────────────────────
+        near_high = position_pct >= 78    # Obere 22% der Range = SHORT Zone
+        near_low  = position_pct <= 22    # Untere 22% der Range = LONG Zone
+        at_high   = position_pct >= 88 or (nearest_name in ('23.6',) and nearest_dist < 1.5)
+        trade_setup = (
+            'SHORT'   if (near_high or at_high) else
+            'LONG'    if (near_low or near_882) else
+            'NEUTRAL'
+        )
 
         return {
             'sym':            sym,
@@ -3429,6 +3448,8 @@ def _fib_for_ticker(sym, lookback_days=45):
             'swing_high':     round(swing_high, 4),
             'swing_low':      round(swing_low, 4),
             'range':          round(rng, 4),
+            'position_pct':   position_pct,
+            'trade_setup':    trade_setup,
             'nearest_fib':    nearest_name,
             'nearest_price':  round(nearest_price, 4),
             'nearest_dist':   round(nearest_dist, 3),
@@ -3438,20 +3459,30 @@ def _fib_for_ticker(sym, lookback_days=45):
             'at_level':       at_level,
             'near_key':       near_key,
             'near_882':       near_882,
+            'near_high':      near_high,
+            'at_high':        at_high,
             'bounce':         bounce,
             'rejection':      rejection,
             'candle':         candle_pattern,
-            # 0.882 Sniper TP/SL
+            # LONG 0.882 Setup
             'f882_entry':     round(f882_price, 4),
             'tp1':            tp1,
             'tp2':            tp2,
             'tp3':            tp3,
             'sl':             sl,
             'rr':             rr,
+            # SHORT Setup
+            'sh_tp1':         sh_tp1,
+            'sh_tp2':         sh_tp2,
+            'sh_tp3':         sh_tp3,
+            'sh_sl':          sh_sl,
+            'sh_rr':          sh_rr,
             'signal': (
+                'AT_HIGH'  if at_high else
                 'AT_882'   if nearest_name == '88.2' and at_level else
                 'AT_618'   if nearest_name == '61.8' and at_level else
                 'AT_786'   if nearest_name == '78.6' and at_level else
+                'NEAR_HIGH'if near_high else
                 'NEAR_882' if near_882 else
                 'NEAR_KEY' if near_key else
                 'NEAR_382' if nearest_name == '38.2' and nearest_dist < 1.5 else
