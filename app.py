@@ -2801,6 +2801,70 @@ function renderResults(data, isNew) {
     : fallbackShorts.slice(0,5).map(a => enrichWithIbkr(alertToCard(a,'SHORT')));
   const usingFallback = trueLongsFromSrv.length === 0;
 
+  // ── Markt P/C Ratio Banner (SPY + QQQ Aggregat) ──────────────────────────
+  (function() {
+    const mpData = (data.max_pain || {}).data || [];
+    const spy = mpData.find(x => x.sym === 'SPY');
+    const qqq = mpData.find(x => x.sym === 'QQQ');
+    if (!spy && !qqq) return;
+    // Gewichtetes Aggregat: SPY (70%) + QQQ (30%)
+    let totalC = 0, totalP = 0;
+    if (spy) { totalC += (spy.total_call_oi || 0) * 0.7; totalP += (spy.total_put_oi || 0) * 0.7; }
+    if (qqq) { totalC += (qqq.total_call_oi || 0) * 0.3; totalP += (qqq.total_put_oi || 0) * 0.3; }
+    const pc = totalC > 0 ? (totalP / totalC).toFixed(2) : null;
+    if (!pc) return;
+    const sentiment = pc < 0.7 ? {label:'BULLISH', color:'#4dff91', bg:'#001a0a'} :
+                      pc > 1.3 ? {label:'BEARISH', color:'#ff2244', bg:'#1a0000'} :
+                                 {label:'NEUTRAL', color:'#ffd700', bg:'#1a1400'};
+    const spyPc  = spy ? ' SPY P/C: ' + (spy.pc_ratio||'?') : '';
+    const qqqPc  = qqq ? ' | QQQ P/C: ' + (qqq.pc_ratio||'?') : '';
+    html += '<div style="margin:6px 0;padding:8px 14px;background:' + sentiment.bg + ';border:1px solid ' + sentiment.color + ';border-radius:6px;display:flex;align-items:center;gap:12px;font-size:12px">'
+      + '<span style="color:' + sentiment.color + ';font-weight:700;font-size:13px">📊 MARKT P/C: ' + pc + ' — ' + sentiment.label + '</span>'
+      + '<span style="color:#4a6a8a">' + spyPc + qqqPc + '</span>'
+      + '<span style="color:#4a6a8a;font-size:11px">P/C < 0.7 = BULL &nbsp;|&nbsp; > 1.3 = BEAR</span>'
+      + '</div>';
+  })();
+
+  // ── 💰 BIG MONEY BETS — Institutionelle OTM Options ──────────────────────
+  (function() {
+    const bm = data.big_money_bets || {};
+    const bets = bm.data || [];
+    if (bets.length === 0) return;
+    const calls = bets.filter(b => b.ctype === 'CALL').slice(0, 4);
+    const puts  = bets.filter(b => b.ctype === 'PUT').slice(0,  2);
+    const show  = calls.concat(puts).slice(0, 5);
+    if (show.length === 0) return;
+    html += '<div class="section" style="border-color:#ffd700">';
+    html += '<div class="section-title" style="color:#ffd700;border-left:3px solid #ffd700">💰 BIG MONEY BETS — Institutionelle OTM-Wetten <span style="font-size:10px;color:#4a6a8a">Follow mit 1 Kontrakt = kleines Kapital, großes Potential</span>';
+    if (bm.ts) html += ' <span style="font-size:10px;color:#4a6a8a">@ ' + bm.ts + '</span>';
+    html += '</div>';
+    show.forEach(b => {
+      const isCall = b.ctype === 'CALL';
+      const col    = isCall ? '#4dff91' : '#ff4d6b';
+      const bg     = isCall ? '#001508' : '#150000';
+      const ratioCol = b.ratio >= 20 ? '#ff2244' : (b.ratio >= 10 ? '#ff6600' : '#ffd700');
+      html += '<div style="padding:10px 14px;border-bottom:1px solid #0a1f30;background:' + bg + '">'
+        + '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
+        + '<span style="font-size:16px;font-weight:700;color:' + col + '">' + b.sym + '</span>'
+        + '<span style="background:#0a1628;color:' + col + ';padding:2px 8px;border-radius:4px;font-size:12px;font-weight:700">'
+        +   b.ctype + ' $' + b.strike + '</span>'
+        + '<span style="color:#64748b;font-size:11px">Spot: $' + b.spot + '</span>'
+        + '<span style="background:' + (b.ratio >= 10 ? '#1a0800' : '#0a1000') + ';color:' + ratioCol + ';padding:2px 7px;border-radius:3px;font-size:11px;font-weight:700">'
+        +   b.label + ' x' + b.ratio + '</span>'
+        + '<span style="color:#94a3b8;font-size:11px">Exp: ' + b.exp + '</span>'
+        + '</div>'
+        + '<div style="display:flex;gap:12px;margin-top:6px;flex-wrap:wrap">'
+        + '<span style="font-size:12px;color:#4dff91">1 Kontrakt: $' + b['1lot_cost'] + '</span>'
+        + '<span style="font-size:12px;color:#94a3b8">Premium: $' + b.prem + '/Kontrakt</span>'
+        + '<span style="font-size:12px;color:#ffd700">Vol: ' + b.vol.toLocaleString() + ' | OI: ' + b.oi.toLocaleString() + '</span>'
+        + '<span style="font-size:12px;color:#60a5fa">$' + (b.dollar_vol/1000).toFixed(0) + 'k bewegt</span>'
+        + '<span style="font-size:11px;color:#ff9944">Braucht ' + (isCall ? '+' : '-') + b.needed_pct + '% Move</span>'
+        + '</div>'
+        + '</div>';
+    });
+    html += '</div>';
+  })();
+
   html += '<div class="section"><div class="section-title long">▲ TOP LONG — Options Flow + Katalysator'
     + (usingFallback ? hermBadge : ahBadge) + '</div>';
   if (displayLongs.length === 0) {
@@ -2878,6 +2942,14 @@ function renderResults(data, isNew) {
         + '</div>'
         + '<div style="flex:1">'
         +   '<div style="font-size:15px;font-weight:bold;color:#fff">' + a.ticker + ' <span style="color:#6b8cad;font-size:12px">' + px + '</span>' + dp + '</div>';
+      // UOA Badge
+      if (a.uoa_ratio && a.uoa_ratio >= 2) {
+        const uoaCol = a.uoa_ratio >= 10 ? '#ff2244' : (a.uoa_ratio >= 5 ? '#ff6600' : '#ffd700');
+        const uoaBg  = a.uoa_ratio >= 10 ? '#2a0008' : (a.uoa_ratio >= 5 ? '#1a0f00' : '#1a1500');
+        const uoaLbl = a.uoa_ratio >= 10 ? '🔥 EXTREME' : (a.uoa_ratio >= 5 ? '⚡ UNUSUAL' : '📊 Erhöht');
+        html += '<div style="display:inline-block;margin-top:4px;padding:3px 8px;background:' + uoaBg + ';border:1px solid ' + uoaCol + ';border-radius:4px;font-size:11px;font-weight:700;color:' + uoaCol + '">'
+          + uoaLbl + ' ' + a.uoa_dir + ' OPTIONS x' + a.uoa_ratio + '</div>';
+      }
       (a.reasons||[]).forEach(r => { html += '<div style="font-size:11px;color:#94a3b8;margin-top:2px">• ' + r + '</div>'; });
       // Social Trending Info
       if (a.social) {
@@ -3989,6 +4061,7 @@ def results():
             out['fib_results']             = state.get('fib_results', [])
             out['fib_trades']              = state.get('fib_trades', [])
             out['fib_last_scan']           = state.get('fib_last_scan')
+            out['big_money_bets']          = state.get('big_money_bets', {})
         return jsonify(_to_json_safe(out))
     except Exception as e:
         return jsonify({'error': f'Server Fehler: {str(e)[:120]}'})
@@ -5178,6 +5251,30 @@ def hermes_monitor():
                         except Exception:
                             pass
                     threading.Thread(target=_bg_max_pain, daemon=True).start()
+
+                    # Big Money Bets — yfinance OTM Options Sweep (alle 15 Min, da langsam)
+                    def _bg_big_money():
+                        try:
+                            from scanner import find_big_money_bets
+                            bets = find_big_money_bets()
+                            if bets:
+                                state['big_money_bets'] = {
+                                    'ts': datetime.now().strftime('%H:%M'),
+                                    'data': bets,
+                                }
+                        except Exception:
+                            pass
+                    _bm_ts = state.get('big_money_bets', {}).get('ts', '')
+                    _bm_age = 9999
+                    if _bm_ts:
+                        try:
+                            _bm_h, _bm_m = map(int, _bm_ts.split(':'))
+                            _now = datetime.now()
+                            _bm_age = (_now.hour*60+_now.minute) - (_bm_h*60+_bm_m)
+                        except Exception:
+                            pass
+                    if _bm_age > 15:
+                        threading.Thread(target=_bg_big_money, daemon=True).start()
 
                     # 1) Alpaca Portfolio + Memory P&L — im Hintergrund (nicht blockieren)
                     def _bg_alpaca_mem():

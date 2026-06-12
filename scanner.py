@@ -1768,38 +1768,76 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
             score += 5 if m_val >= 10 else (4 if m_val >= 5 else (3 if m_val >= 1 else 1))
             reasons.append(f'Dark Pool ${m_val:.1f}M ({dp["dp_count"]} Prints)')
 
-        # 2) Options Sweep (Polygon Snapshot)
+        # 2) Options Flow + Unusual Activity (Yahoo Finance via yfinance — kostenlos)
         price_from_opt = 0
-        call_sweeps_n = 0
-        put_sweeps_n  = 0
-        pc_ratio      = None
+        call_sweeps_n  = 0
+        put_sweeps_n   = 0
+        pc_ratio       = None
+        uoa_ratio      = 0.0
+        uoa_direction  = ''
         try:
-            opt = {'results': []}  # Options-API deaktiviert
-            res = opt.get('results', [])
-            if res:
-                price_from_opt = res[0].get('underlying_asset', {}).get('price', 0)
-                calls  = [r for r in res if r['details']['contract_type'] == 'call']
-                puts   = [r for r in res if r['details']['contract_type'] == 'put']
-                cv     = sum(r['day'].get('volume', 0) for r in calls)
-                pv     = sum(r['day'].get('volume', 0) for r in puts)
-                oi_tot = sum(max(r.get('open_interest', 0) or 1, 1) for r in calls)
+            import yfinance as _yf
+            _tk   = _yf.Ticker(ticker)
+            _exps = _tk.options
+            if _exps:
+                _chain = _tk.option_chain(_exps[0])
+                _calls = _chain.calls
+                _puts  = _chain.puts
+                # Gesamtvolumen und OI
+                cv    = int(_calls['volume'].fillna(0).sum())
+                pv    = int(_puts['volume'].fillna(0).sum())
+                c_oi  = max(int(_calls['openInterest'].fillna(0).sum()), 1)
+                p_oi  = max(int(_puts['openInterest'].fillna(0).sum()), 1)
                 if cv > 0:
                     pc_ratio = round(pv / cv, 2)
-                sw     = get_options_sweep(res)
-                call_sweeps_n = sw.get('sweeps_call', 0)
-                put_sweeps_n  = sw.get('sweeps_put', 0)
-                if oi_tot and cv > oi_tot * 2 and cv > 200:
-                    score += 3
-                    reasons.append(f'Call Sweep Vol:{cv:,} vs OI:{oi_tot:,}')
+                # Unusual Options Activity: Vol >> OI = institutionelle Aktivität
+                c_rvol = round(cv / c_oi, 2) if c_oi > 0 else 0
+                p_rvol = round(pv / p_oi, 2) if p_oi > 0 else 0
+                if c_rvol >= p_rvol and c_rvol >= 2.0 and cv >= 200:
+                    uoa_ratio, uoa_direction = c_rvol, 'CALL'
+                elif p_rvol > c_rvol and p_rvol >= 2.0 and pv >= 200:
+                    uoa_ratio, uoa_direction = p_rvol, 'PUT'
+                if uoa_ratio >= 10:
+                    score += 6
+                    reasons.append(f'🔥 UNUSUAL {uoa_direction} x{uoa_ratio:.0f} — Institutionell!')
+                elif uoa_ratio >= 5:
+                    score += 4
+                    reasons.append(f'⚡ Unusual {uoa_direction} Options x{uoa_ratio:.0f}')
+                elif uoa_ratio >= 2:
+                    score += 2
+                    reasons.append(f'Erhöhte {uoa_direction} Activity x{uoa_ratio:.1f}')
+                # Sweep Detection: einzelne Contracts mit Vol >> OI
+                _top_call_dollar = _top_put_dollar = 0.0
+                for _, row in _calls.iterrows():
+                    _v = int(row.get('volume') or 0)
+                    _o = max(int(row.get('openInterest') or 1), 1)
+                    _p = float(row.get('lastPrice') or 0)
+                    _d = _v * _p * 100
+                    if _v > _o * 2 and _v > 50:
+                        call_sweeps_n += 1
+                    if _d > _top_call_dollar:
+                        _top_call_dollar = _d
+                for _, row in _puts.iterrows():
+                    _v = int(row.get('volume') or 0)
+                    _o = max(int(row.get('openInterest') or 1), 1)
+                    _p = float(row.get('lastPrice') or 0)
+                    _d = _v * _p * 100
+                    if _v > _o * 2 and _v > 50:
+                        put_sweeps_n += 1
+                    if _d > _top_put_dollar:
+                        _top_put_dollar = _d
                 if call_sweeps_n >= 2:
                     score += 2
-                    reasons.append(f'{call_sweeps_n} Call-Sweeps erkannt')
+                    reasons.append(f'{call_sweeps_n}x Call-Sweep ({cv:,} Vol)')
                 if put_sweeps_n >= 2:
                     score += 1
-                    reasons.append(f'{put_sweeps_n} Put-Sweeps erkannt')
-                if sw['top_call_dollar'] >= 500_000:
+                    reasons.append(f'{put_sweeps_n}x Put-Sweep')
+                if _top_call_dollar >= 500_000:
                     score += 1
-                    reasons.append(f'Block Call ${sw["top_call_dollar"]/1e6:.1f}M')
+                    reasons.append(f'Block Call ${_top_call_dollar/1e6:.1f}M')
+                if _top_put_dollar >= 500_000:
+                    score += 1
+                    reasons.append(f'Block Put ${_top_put_dollar/1e6:.1f}M')
         except Exception:
             pass
 
@@ -1948,6 +1986,8 @@ def hermes_hunt(current_longs: list, current_shorts: list) -> list:
                 'trend':         trend_10d,
                 'pc':            pc_ratio,
                 'drop_high':     drop_high,
+                'uoa_ratio':     round(uoa_ratio, 1) if uoa_ratio else None,
+                'uoa_dir':       uoa_direction if uoa_direction else None,
             }
             if social_info:
                 out['social'] = {
@@ -3536,6 +3576,100 @@ def _options_oi_for_ticker(sym):
         }
     except Exception:
         return None
+
+
+def find_big_money_bets(tickers=None) -> list:
+    """
+    Findet OTM-Strikes wo Institutionen heute grosse Bets platziert haben.
+    Vol/OI >> 1 bei OTM = frischer institutioneller Einstieg.
+    Retail kann mit kleinem Kapital denselben Trade kopieren.
+    """
+    import yfinance as _yf
+
+    if tickers is None:
+        tickers = ['META','AAPL','MSFT','NVDA','AMZN','GOOGL','TSLA','COIN',
+                   'PLTR','AMD','NFLX','RKLB','ASTS','LUNR','QQQ','SPY']
+
+    results = []
+
+    def _scan_one(sym):
+        try:
+            tk    = _yf.Ticker(sym)
+            exps  = tk.options
+            if not exps:
+                return
+            spot = None
+            try:
+                hist = tk.fast_info
+                spot = hist.get('last_price') or hist.get('regularMarketPrice')
+            except Exception:
+                pass
+            # erste 2 Expirations scannen (nahe Contracts = maximale Hebelwirkung)
+            for exp in exps[:2]:
+                chain  = tk.option_chain(exp)
+                for ctype, df in [('CALL', chain.calls), ('PUT', chain.puts)]:
+                    if df.empty:
+                        continue
+                    # Nur OTM Strikes filtern
+                    if spot and ctype == 'CALL':
+                        df = df[df['strike'] > spot * 1.01]
+                    elif spot and ctype == 'PUT':
+                        df = df[df['strike'] < spot * 0.99]
+
+                    # Suche Strikes mit extremem Vol/OI
+                    for _, row in df.iterrows():
+                        vol = int(row.get('volume') or 0)
+                        oi  = max(int(row.get('openInterest') or 1), 1)
+                        prem = float(row.get('lastPrice') or row.get('ask') or 0)
+                        if vol < 50 or prem < 0.05:
+                            continue
+                        ratio = vol / oi
+                        if ratio < 3.0:
+                            continue
+                        strike      = float(row['strike'])
+                        dollar_vol  = vol * prem * 100
+                        if dollar_vol < 50_000:
+                            continue
+                        needed_move = round(((strike - spot) / spot * 100), 1) if spot and ctype == 'CALL' else (
+                                      round(((spot - strike) / spot * 100), 1) if spot and ctype == 'PUT' else 0)
+                        # Score: hoher Ratio + hoher Dollar-Wert = starkes Signal
+                        score = 0
+                        if ratio >= 20:   score += 5
+                        elif ratio >= 10: score += 4
+                        elif ratio >= 5:  score += 3
+                        else:             score += 2
+                        if dollar_vol >= 1_000_000: score += 3
+                        elif dollar_vol >= 500_000: score += 2
+                        elif dollar_vol >= 200_000: score += 1
+                        if needed_move <= 5:  score += 2  # nah am Geld = realistischer
+                        elif needed_move <= 10: score += 1
+                        label = ('🔥 EXTREME' if ratio >= 20 else
+                                 '⚡ STARK'   if ratio >= 10 else
+                                 '📊 Ungewöhnlich')
+                        results.append({
+                            'sym':        sym,
+                            'ctype':      ctype,
+                            'strike':     strike,
+                            'exp':        exp,
+                            'spot':       round(spot, 2) if spot else 0,
+                            'prem':       round(prem, 2),
+                            'vol':        vol,
+                            'oi':         oi,
+                            'ratio':      round(ratio, 1),
+                            'dollar_vol': int(dollar_vol),
+                            'needed_pct': needed_move,
+                            'score':      score,
+                            'label':      label,
+                            '1lot_cost':  round(prem * 100, 0),
+                        })
+        except Exception:
+            pass
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        list(ex.map(_scan_one, tickers))
+
+    results.sort(key=lambda x: x['score'], reverse=True)
+    return results[:15]
 
 
 def fibonacci_scan(max_workers=4):
