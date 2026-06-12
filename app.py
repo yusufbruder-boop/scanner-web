@@ -3256,6 +3256,44 @@ function renderTab2(data) {
     html += '</div>';
   }
 
+  // ── MAX PAIN — OpEx Pin-Zonen ───────────────────────────────────────────────
+  const mp = data.max_pain || {};
+  if (mp.data && mp.data.length > 0) {
+    html += '<div style="margin:8px;background:linear-gradient(135deg,#0d0a1e,#120a28);border:1px solid #6040bb44;border-radius:10px;padding:12px 14px">';
+    html += '<div style="font-size:10px;font-weight:bold;color:#b060ff;letter-spacing:2px;margin-bottom:8px">⚡ MAX PAIN — OPEX PIN-ZONEN ' + (mp.ts||'') + '</div>';
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:6px">';
+    mp.data.forEach(t => {
+      const stCol   = t.status === 'AT_PIN'     ? '#4dff91' :
+                      t.status === 'ABOVE_PAIN' ? '#ff9944' : '#4db8ff';
+      const stLabel = t.status === 'AT_PIN'     ? '📌 AM PIN' :
+                      t.status === 'ABOVE_PAIN' ? '⬆ ÜBER PAIN' : '⬇ UNTER PAIN';
+      const sentCol = t.sentiment === 'BULLISH' ? '#4dff91' :
+                      t.sentiment === 'BEARISH' ? '#ff4d6b' : '#ffd700';
+      const diffStr = (t.diff >= 0 ? '+' : '') + (t.diff||0).toFixed(2)
+                    + ' (' + (t.diff_pct >= 0 ? '+' : '') + (t.diff_pct||0).toFixed(1) + '%)';
+      html += '<div style="background:#0a0818;border:1px solid ' + stCol + '33;border-radius:8px;padding:8px 10px">'
+        + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">'
+        +   '<span style="font-size:13px;font-weight:bold;color:#e0d0ff">' + t.sym + '</span>'
+        +   '<span style="font-size:9px;color:' + stCol + ';font-weight:bold">' + stLabel + '</span>'
+        + '</div>'
+        + '<div style="font-size:12px;color:#c0a0ff">Kurs: <b>$' + (t.price||0).toFixed(2) + '</b>'
+        +   ' <span style="color:' + stCol + ';font-size:10px">' + diffStr + '</span></div>'
+        + '<div style="font-size:11px;margin-top:3px">'
+        +   '<span style="color:#b060ff">Max Pain: </span><b style="color:#ffd700">$' + (t.max_pain||0).toFixed(2) + '</b>'
+        + '</div>'
+        + '<div style="display:flex;gap:8px;margin-top:4px;font-size:10px">'
+        +   '<span style="color:#4dff91">🛡 Floor: $' + (t.put_floor||0).toFixed(0) + '</span>'
+        +   '<span style="color:#ff4d6b">🧱 Wall: $' + (t.call_wall||0).toFixed(0) + '</span>'
+        + '</div>'
+        + '<div style="display:flex;gap:8px;margin-top:3px;font-size:10px">'
+        +   '<span style="color:' + sentCol + '">P/C: ' + (t.pc_ratio||0).toFixed(2) + ' ' + t.sentiment + '</span>'
+        +   '<span style="color:#4a5a8a">Pin: $' + (t.pin_zone||[0,0])[0].toFixed(0) + '–$' + (t.pin_zone||[0,0])[1].toFixed(0) + '</span>'
+        + '</div>'
+        + '</div>';
+    });
+    html += '</div></div>';
+  }
+
   // ── Hermes Learning — Selbst-Optimierung ────────────────────────────────────
   const lrn = data.hermes_learning || {};
   const lw  = lrn.weights || {};
@@ -3895,6 +3933,7 @@ def results():
             out['market_context']      = state.get('market_context', {})
             out['mt5_status']          = state.get('mt5_status', {})
             out['sector_rotation']     = state.get('sector_rotation', {})
+            out['max_pain']            = state.get('max_pain', {})
             out['live_feed']           = state.get('live_feed', [])
             out['hermes_picks']        = state.get('hermes_picks', [])
             out['hermes_ts']           = state.get('hermes_ts', '')
@@ -4998,6 +5037,90 @@ def hermes_monitor():
                         except Exception:
                             pass
                     threading.Thread(target=_bg_sector_rotation, daemon=True).start()
+
+                    # 0d) MAX PAIN — OpEx Pin-Zonen für High-OI Tickers
+                    def _bg_max_pain():
+                        try:
+                            import urllib.request as _ur, json as _js, ssl as _sl
+                            from collections import defaultdict
+                            _ctx = _sl.create_default_context()
+                            _ctx.check_hostname = False
+                            _ctx.verify_mode = _sl.CERT_NONE
+                            TODAY = datetime.now().strftime('%Y-%m-%d')
+                            MP_TICKERS = ['SPY','QQQ','AAPL','TSLA','MSFT','AMD',
+                                          'META','AMZN','GOOGL','COIN','PLTR','TSM']
+                            results = []
+                            for sym in MP_TICKERS:
+                                try:
+                                    url = (f'https://api.polygon.io/v3/snapshot/options/{sym}'
+                                           f'?expiration_date={TODAY}&limit=250&apiKey={POLY_KEY}')
+                                    req = _ur.Request(url, headers={'User-Agent':'Mozilla/5.0'})
+                                    with _ur.urlopen(req, context=_ctx, timeout=8) as r:
+                                        d = _js.loads(r.read())
+                                    opts = d.get('results', [])
+                                    if not opts:
+                                        continue
+                                    # Aktuellen Preis holen
+                                    price_url = (f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}'
+                                                 f'?interval=1d&range=3d')
+                                    preq = _ur.Request(price_url, headers={'User-Agent':'Mozilla/5.0'})
+                                    with _ur.urlopen(preq, context=_ctx, timeout=6) as pr:
+                                        pd = _js.loads(pr.read())
+                                    cur_price = float(pd['chart']['result'][0]['meta'].get('regularMarketPrice', 0))
+                                    # OI nach Strike sammeln
+                                    strikes = defaultdict(lambda: {'calls': 0, 'puts': 0})
+                                    for opt in opts:
+                                        det  = opt.get('details', {})
+                                        oi   = opt.get('open_interest', 0) or 0
+                                        stk  = det.get('strike_price', 0)
+                                        otyp = det.get('contract_type', '')
+                                        if stk <= 0 or oi <= 0: continue
+                                        if otyp == 'call': strikes[stk]['calls'] += oi
+                                        elif otyp == 'put': strikes[stk]['puts']  += oi
+                                    if len(strikes) < 3:
+                                        continue
+                                    # Max Pain berechnen
+                                    pain = {}
+                                    for s in strikes:
+                                        p = 0
+                                        for k, v in strikes.items():
+                                            if k < s: p += (s - k) * v['calls']
+                                            if k > s: p += (k - s) * v['puts']
+                                        pain[s] = p
+                                    mp = min(pain, key=pain.get)
+                                    # Top Call Wall + Put Floor
+                                    call_wall  = max(strikes, key=lambda k: strikes[k]['calls'])
+                                    put_floor  = max(strikes, key=lambda k: strikes[k]['puts'])
+                                    total_c    = sum(v['calls'] for v in strikes.values())
+                                    total_p    = sum(v['puts']  for v in strikes.values())
+                                    pc         = round(total_p / total_c, 2) if total_c > 0 else 0
+                                    diff       = round(cur_price - mp, 2)
+                                    diff_pct   = round(diff / mp * 100, 2) if mp else 0
+                                    # Pin Zone: 3 Strikes mit geringstem Pain
+                                    pin_strikes = sorted(pain, key=pain.get)[:3]
+                                    status = ('AT_PIN'      if abs(diff_pct) < 1.0 else
+                                              'ABOVE_PAIN'  if diff > 0 else 'BELOW_PAIN')
+                                    sentiment = ('BULLISH' if pc < 0.7 else
+                                                 'BEARISH' if pc > 1.3 else 'NEUTRAL')
+                                    results.append({
+                                        'sym': sym, 'price': round(cur_price, 2),
+                                        'max_pain': mp, 'diff': diff, 'diff_pct': diff_pct,
+                                        'call_wall': call_wall, 'put_floor': put_floor,
+                                        'pin_zone': [min(pin_strikes), max(pin_strikes)],
+                                        'pc_ratio': pc, 'total_call_oi': total_c,
+                                        'total_put_oi': total_p,
+                                        'sentiment': sentiment, 'status': status,
+                                    })
+                                except Exception:
+                                    pass
+                            if results:
+                                state['max_pain'] = {
+                                    'ts': datetime.now().strftime('%H:%M'),
+                                    'data': results,
+                                }
+                        except Exception:
+                            pass
+                    threading.Thread(target=_bg_max_pain, daemon=True).start()
 
                     # 1) Alpaca Portfolio + Memory P&L — im Hintergrund (nicht blockieren)
                     def _bg_alpaca_mem():
