@@ -4067,20 +4067,33 @@ function fibCard(r, isTraded) {
   // Trade-Daten je nach Setup
   let tradeBlock = '';
   if (isLong) {
+    // Entry = aktueller Marktpreis (nicht f882_entry = Fib-Zone)
+    // SL muss unter aktuellem Preis liegen — sonst ungültig
+    let longEntry = (r.price||0);
+    let longSL    = (r.sl||0);
+    let slValid   = longSL < longEntry;
+    let slColor   = slValid ? '#ff6644' : '#ff2244';
+    let slLabel   = slValid ? ('SL $' + longSL.toFixed(2)) : ('⚠️ SL $' + longSL.toFixed(2) + ' UNGÜLTIG');
     tradeBlock =
       '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:5px;font-size:10px">' +
-        '<span style="background:#0a2010;border:1px solid #4dff9144;padding:1px 6px;border-radius:3px;color:#4dff91">ENTRY $' + (r.f882_entry||0).toFixed(2) + '</span>' +
-        '<span style="background:#0a1020;border:1px solid #ff440044;padding:1px 6px;border-radius:3px;color:#ff6644">SL $' + (r.sl||0).toFixed(2) + '</span>' +
+        '<span style="background:#0a2010;border:1px solid #4dff9144;padding:1px 6px;border-radius:3px;color:#4dff91">ENTRY $' + longEntry.toFixed(2) + '</span>' +
+        '<span style="background:#0d1520;border:1px solid #6366f144;padding:1px 6px;border-radius:3px;color:#818cf8">Fib 88.2% $' + (r.f882_entry||0).toFixed(2) + '</span>' +
+        '<span style="background:#0a1020;border:1px solid #ff440044;padding:1px 6px;border-radius:3px;color:' + slColor + '">' + slLabel + '</span>' +
         '<span style="background:#0a1020;border:1px solid #4dff9133;padding:1px 6px;border-radius:3px;color:#4db870">TP1 $' + (r.tp1||0).toFixed(2) + '</span>' +
         '<span style="background:#0a1020;border:1px solid #ffd70033;padding:1px 6px;border-radius:3px;color:#ffd700">TP2 $' + (r.tp2||0).toFixed(2) + '</span>' +
         '<span style="background:#0a1020;border:1px solid #4db8ff33;padding:1px 6px;border-radius:3px;color:#4db8ff">TP3 $' + (r.tp3||0).toFixed(2) + '</span>' +
         '<span style="color:#4a6a8a;align-self:center">R:R ' + (r.rr||'?') + '</span>' +
       '</div>';
   } else if (isShort) {
+    let shortEntry = (r.price||0);
+    let shortSL    = (r.sh_sl||0);
+    let slValid    = shortSL > shortEntry;
+    let slColor    = slValid ? '#ff6644' : '#ff2244';
+    let slLabel    = slValid ? ('SL $' + shortSL.toFixed(2)) : ('⚠️ SL $' + shortSL.toFixed(2) + ' UNGÜLTIG');
     tradeBlock =
       '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:5px;font-size:10px">' +
-        '<span style="background:#1a0208;border:1px solid #ff224444;padding:1px 6px;border-radius:3px;color:#ff2244">ENTRY $' + (r.price||0).toFixed(2) + '</span>' +
-        '<span style="background:#0a1020;border:1px solid #ff440044;padding:1px 6px;border-radius:3px;color:#ff6644">SL $' + (r.sh_sl||0).toFixed(2) + '</span>' +
+        '<span style="background:#1a0208;border:1px solid #ff224444;padding:1px 6px;border-radius:3px;color:#ff2244">ENTRY $' + shortEntry.toFixed(2) + '</span>' +
+        '<span style="background:#0a1020;border:1px solid #ff440044;padding:1px 6px;border-radius:3px;color:' + slColor + '">' + slLabel + '</span>' +
         '<span style="background:#0a1020;border:1px solid #ff224433;padding:1px 6px;border-radius:3px;color:#ff6677">TP1 $' + (r.sh_tp1||0).toFixed(2) + '</span>' +
         '<span style="background:#0a1020;border:1px solid #ffd70033;padding:1px 6px;border-radius:3px;color:#ffd700">TP2 $' + (r.sh_tp2||0).toFixed(2) + '</span>' +
         '<span style="background:#0a1020;border:1px solid #4db8ff33;padding:1px 6px;border-radius:3px;color:#4db8ff">TP3 $' + (r.sh_tp3||0).toFixed(2) + '</span>' +

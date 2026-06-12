@@ -3590,6 +3590,12 @@ def _fib_for_ticker(sym, lookback_days=45):
             'LONG'    if (near_low or near_882) else
             'NEUTRAL'
         )
+        # Invalidiere LONG wenn Preis bereits unter SL (Swing-Low bereits gebrochen)
+        if trade_setup == 'LONG' and current < sl:
+            trade_setup = 'NEUTRAL'
+        # Invalidiere SHORT wenn Preis bereits über SL (Swing-High bereits gebrochen)
+        if trade_setup == 'SHORT' and current > sh_sl:
+            trade_setup = 'NEUTRAL'
 
         return {
             'sym':            sym,
