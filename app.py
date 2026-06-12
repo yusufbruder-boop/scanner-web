@@ -197,6 +197,12 @@ state = {
     'channel_watch':   ['NVDA','AMD','INTC','META','AAPL','TSLA','MSFT','AMZN','GOOGL','MU'],
     'channel_signals': [],          # [{sym, signal, price, support, resistance, sl, tp, rr, ts}]
     'channel_active':  [],          # Aktien die gerade im Kanal sind (mit Levels)
+    # VWAP Reclaim Scanner
+    'vwap_signals':    [],          # [{sym, signal, price, vwap, vol_ratio, time}]
+    # Pre-Market Gap Scanner
+    'gap_signals':     [],          # [{sym, gap_pct, prev_close, pre_price, signal, time}]
+    # Trading Blackout (Fed/CPI/NFP)
+    'trading_blackout': False,
 }
 _hermes_lock = threading.Lock()
 _scan_lock   = threading.Lock()   # verhindert gleichzeitige Scans
@@ -435,6 +441,33 @@ def hermes_auto_trade_stock(signal_result: dict, reason: str = ''):
     except Exception:
         pass
 
+    # ── Quality Filters ──────────────────────────────────────────────────────
+    if _is_blackout():
+        return
+
+    vol_ratio = _get_volume_ratio(sym)
+    if vol_ratio < 1.2:
+        return  # zu wenig Volumen = Fake-Signal
+
+    sector_chg = _get_sector_chg(sym)
+    if signal == 'LONG'  and sector_chg < -1.5:
+        return  # Sektor zu schwach für Long
+    if signal == 'SHORT' and sector_chg >  1.5:
+        return  # Sektor zu stark gegen Short
+
+    bull_tf, bear_tf = _get_mtf_bias(sym)
+    if signal == 'LONG'  and bull_tf < 2:
+        return  # weniger als 2 von 3 Timeframes bullisch
+    if signal == 'SHORT' and bear_tf < 2:
+        return  # weniger als 2 von 3 Timeframes bärisch
+
+    # Conviction Boost bei starken Filtern
+    if vol_ratio >= 2.0 and bull_tf == 3 and signal == 'LONG':
+        conv = min(conv + 0.10, 1.0)
+    if vol_ratio >= 2.0 and bear_tf == 3 and signal == 'SHORT':
+        conv = min(conv + 0.10, 1.0)
+    # ─────────────────────────────────────────────────────────────────────────
+
     side = 'buy' if signal == 'LONG' else 'sell'
     qty  = max(1, int(AUTO_TRADE_AMOUNT / price))
     cost = round(qty * price, 2)
@@ -488,6 +521,115 @@ def hermes_auto_trade_stock(signal_result: dict, reason: str = ''):
     return ok
 
 
+# ── Trading-Intelligenz Helpers ──────────────────────────────────────────────
+
+_bar_cache = {}   # {sym+tf: (timestamp, bars)} — 45s TTL
+
+def _fetch_bars(sym, timeframe='5Min', limit=25):
+    """Alpaca Bars mit 45s Cache."""
+    key = f'{sym}_{timeframe}_{limit}'
+    cached = _bar_cache.get(key)
+    if cached and (time.time() - cached[0]) < 45:
+        return cached[1]
+    try:
+        ctx = ssl.create_default_context()
+        url = (f'https://data.alpaca.markets/v2/stocks/{sym}/bars'
+               f'?timeframe={timeframe}&limit={limit}&feed=iex&adjustment=raw')
+        req = urllib.request.Request(url, headers={
+            'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET,
+        })
+        with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+            bars = json.loads(r.read()).get('bars', [])
+        _bar_cache[key] = (time.time(), bars)
+        if len(_bar_cache) > 300:
+            oldest = sorted(_bar_cache, key=lambda k: _bar_cache[k][0])[:100]
+            for k in oldest:
+                _bar_cache.pop(k, None)
+        return bars
+    except Exception:
+        return []
+
+def _get_volume_ratio(sym, bars=None):
+    """Aktuelles Volumen / Durchschnitt (letzte 20 Bars). > 1.5 = stark."""
+    if bars is None:
+        bars = _fetch_bars(sym, '5Min', 22)
+    if len(bars) < 4:
+        return 1.5  # Kein Daten → neutral (kein Block)
+    vols = [b['v'] for b in bars]
+    avg  = sum(vols[:-1]) / max(len(vols) - 1, 1)
+    return round(vols[-1] / max(avg, 1), 2)
+
+def _get_vwap(sym, bars=None):
+    """VWAP aus heutigen 5-Min Bars."""
+    if bars is None:
+        bars = _fetch_bars(sym, '5Min', 80)
+    if not bars:
+        return 0.0
+    today = datetime.now().strftime('%Y-%m-%d')
+    tb    = [b for b in bars if b.get('t', '').startswith(today)] or bars[-20:]
+    tp_v  = sum(((b['h'] + b['l'] + b['c']) / 3) * b['v'] for b in tb)
+    tot_v = sum(b['v'] for b in tb)
+    return round(tp_v / max(tot_v, 1), 2)
+
+_SECTOR_ETF = {
+    'NVDA':'XLK','AMD':'XLK','INTC':'XLK','MSFT':'XLK','AAPL':'XLK',
+    'QCOM':'XLK','AVGO':'XLK','MU':'XLK','SNDK':'XLK','MRVL':'XLK',
+    'META':'XLC','GOOGL':'XLC','GOOG':'XLC','NFLX':'XLC',
+    'AMZN':'XLY','TSLA':'XLY','HD':'XLY',
+    'GS':'XLF','JPM':'XLF','BAC':'XLF','MS':'XLF',
+    'XOM':'XLE','CVX':'XLE','OXY':'XLE',
+    'ARKK':'QQQ','DIA':'QQQ','SPY':'QQQ',
+}
+
+def _get_sector_chg(sym):
+    """Sektor-ETF Tagesänderung % — positiv = Sektor stark."""
+    etf = _SECTOR_ETF.get(sym, 'QQQ')
+    try:
+        bars = _fetch_bars(etf, '1Day', 2)
+        if bars:
+            o, c = bars[-1].get('o', 0), bars[-1].get('c', 0)
+            if o > 0:
+                return round((c - o) / o * 100, 2)
+    except Exception:
+        pass
+    return 0.0
+
+def _get_mtf_bias(sym):
+    """Multi-Timeframe Bias: (bull_count, bear_count) über 5Min/15Min/1Hour.
+    Verwendet EMA10 Vergleich mit Close."""
+    bull, bear = 0, 0
+    for tf, lim in [('5Min', 12), ('15Min', 12), ('1Hour', 12)]:
+        bars = _fetch_bars(sym, tf, lim)
+        if len(bars) < 6:
+            bull += 1  # keine Daten → neutral zählt als bull (fail-open)
+            continue
+        closes = [b['c'] for b in bars]
+        ema = closes[0]
+        for c in closes[1:]:
+            ema = ema * 0.83 + c * 0.17  # EMA10 approx
+        if closes[-1] > ema:
+            bull += 1
+        else:
+            bear += 1
+    return bull, bear
+
+def _is_blackout():
+    """True wenn wichtige Wirtschaftsdaten in < 30 Min erwartet oder gerade veröffentlicht."""
+    if state.get('trading_blackout'):
+        return True
+    # Brain-News Check: frische Makro-News → Pause
+    now_ts = time.time()
+    for n in state.get('brain_news', [])[:8]:
+        age = now_ts - n.get('_ts', now_ts - 9999)
+        if age < 600:  # letzte 10 Minuten
+            hl = (n.get('headline', '') + n.get('reason', '')).lower()
+            if any(w in hl for w in ('federal reserve','fomc','cpi report',
+                                      'inflation data','nonfarm','jobs report',
+                                      'payroll','interest rate decision')):
+                return True
+    return False
+
+
 def hermes_update_brain_trade_pnl():
     """Aktualisiert P&L aller offenen brain_trades aus Alpaca Positionen."""
     trades = state.get('brain_trades', [])
@@ -506,12 +648,41 @@ def hermes_update_brain_trade_pnl():
             sym = t.get('sym', '')
             p = pos_map.get(sym)
             if p:
-                cur = float(p.get('current_price', t['price_entry']))
-                pnl_pct = float(p.get('unrealized_plpc', 0)) * 100
+                cur        = float(p.get('current_price', t['price_entry']))
+                pnl_pct    = float(p.get('unrealized_plpc', 0)) * 100
                 pnl_dollar = float(p.get('unrealized_pl', 0))
                 t = dict(t, price_current=round(cur, 2),
                          pnl_pct=round(pnl_pct, 2),
                          pnl_dollar=round(pnl_dollar, 2))
+
+                # ── Trailing Stop ─────────────────────────────────────────
+                # Aktiviert wenn Gewinn > 1.5% — schließt wenn 1.2% vom Hoch zurück
+                if pnl_pct > 1.5 and not t.get('trail_on'):
+                    t = dict(t, trail_on=True, trail_peak=pnl_pct)
+                if t.get('trail_on'):
+                    peak = max(t.get('trail_peak', pnl_pct), pnl_pct)
+                    t    = dict(t, trail_peak=peak)
+                    if peak - pnl_pct >= 1.2:
+                        # Trailing Stop ausgelöst → Position schliessen
+                        signal   = t.get('signal', 'LONG')
+                        close_s  = 'sell' if signal == 'LONG' else 'buy'
+                        qty_raw  = p.get('qty', '1')
+                        qty_int  = max(1, int(abs(float(qty_raw))))
+                        result   = _alpaca('/v2/orders', method='POST', body={
+                            'symbol': sym, 'qty': str(qty_int), 'side': close_s,
+                            'type': 'market', 'time_in_force': 'day',
+                            'client_order_id': f'hermes-trail-{sym}-{int(time.time())}',
+                        })
+                        if 'id' in result:
+                            t = dict(t, won=pnl_pct >= 0, trail_triggered=True)
+                            tg_send(
+                                f'🔒 <b>TRAILING STOP: {sym}</b>\n'
+                                f'Peak {peak:.1f}% → jetzt {pnl_pct:.1f}% — Rückgang {peak-pnl_pct:.1f}%\n'
+                                f'P&L: {pnl_dollar:+.0f}$',
+                                key=f'trail_{sym}'
+                            )
+                # ──────────────────────────────────────────────────────────
+
             updated.append(t)
         state['brain_trades'] = updated
     except Exception:
@@ -3309,6 +3480,55 @@ function renderTab2(data) {
     html += '</div>';
   }
 
+  // ── VWAP Reclaim Signale ─────────────────────────────────────────────────────
+  const vwapSigs = data.vwap_signals || [];
+  const gapSigs  = data.gap_signals  || [];
+  const blackout = data.trading_blackout || false;
+
+  if (blackout) {
+    html += '<div style="margin:8px;background:#1a0000;border:2px solid #ff4d6b;border-radius:8px;padding:8px 14px;text-align:center">'
+      + '<span style="color:#ff4d6b;font-weight:bold;font-size:12px">🚫 TRADING BLACKOUT — Makro-Event aktiv (Fed/CPI/NFP) — kein Auto-Trade</span>'
+      + '</div>';
+  }
+
+  if (vwapSigs.length > 0 || gapSigs.length > 0) {
+    html += '<div style="margin:8px;background:linear-gradient(135deg,#0d1020,#121830);border:1px solid #60a5fa44;border-radius:10px;padding:12px 14px">'
+      + '<div style="font-size:10px;font-weight:bold;color:#60a5fa;letter-spacing:2px;margin-bottom:8px">⚡ VWAP + PRE-MARKET SIGNALE</div>';
+
+    // VWAP Signale
+    if (vwapSigs.length > 0) {
+      html += '<div style="font-size:10px;color:#6b8cad;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px">VWAP Kreuzungen</div>';
+      vwapSigs.slice(0, 6).forEach(s => {
+        let sc  = s.signal === 'LONG' ? '#4dff91' : '#ff4d6b';
+        let ico = s.signal === 'LONG' ? '▲' : '▼';
+        html += '<div style="display:flex;justify-content:space-between;padding:4px 0;border-top:1px solid #1a2040">'
+          + '<div><span style="color:' + sc + ';font-weight:bold">' + ico + ' ' + s.signal + ' <span style="color:#fff">' + s.sym + '</span></span>'
+          +   '<div style="font-size:10px;color:#64748b">$' + s.price + ' vs VWAP $' + s.vwap + ' | Vol ×' + s.vol_ratio + ' | ' + s.time + '</div></div>'
+          + '<span style="font-size:11px;color:' + sc + ';align-self:center">' + (s.signal==='LONG'?'Reclaim':'Break') + '</span>'
+          + '</div>';
+      });
+    }
+
+    // Gap Signale
+    if (gapSigs.length > 0) {
+      html += '<div style="font-size:10px;color:#6b8cad;margin-top:8px;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px">Pre-Market Gaps</div>';
+      gapSigs.slice(0, 5).forEach(g => {
+        let gc  = g.gap_pct >= 0 ? '#4dff91' : '#ff4d6b';
+        let ico = g.gap_pct >= 0 ? '📈' : '📉';
+        let fade = Math.abs(g.gap_pct) < 4;
+        html += '<div style="display:flex;justify-content:space-between;padding:4px 0;border-top:1px solid #1a2040">'
+          + '<div><span style="font-size:12px;font-weight:bold;color:#fff">' + ico + ' ' + g.sym + '</span>'
+          +   ' <span style="color:' + gc + ';font-weight:bold">' + (g.gap_pct >= 0?'+':'') + g.gap_pct + '%</span>'
+          +   '<div style="font-size:10px;color:#64748b">$' + g.prev_close + ' → $' + g.pre_price + ' | ' + g.time
+          +     (fade ? ' | <span style="color:#f59e0b">Fade möglich</span>' : ' | <span style="color:#4dff91">Continuation</span>') + '</div></div>'
+          + '<span style="font-size:10px;color:#94a3b8;align-self:center">' + g.signal + '</span>'
+          + '</div>';
+      });
+    }
+
+    html += '</div>';
+  }
+
   // ── Alpaca Portfolio ─────────────────────────────────────────────────────────
   const ap = data.alpaca_portfolio || {};
   if (ap.equity) {
@@ -4186,6 +4406,9 @@ def results():
             out['brain_news']              = state.get('brain_news', [])
             out['channel_active']          = state.get('channel_active', [])
             out['channel_signals']         = state.get('channel_signals', [])[:20]
+            out['vwap_signals']            = state.get('vwap_signals', [])[:10]
+            out['gap_signals']             = state.get('gap_signals', [])[:10]
+            out['trading_blackout']        = state.get('trading_blackout', False)
             out['claude_ibkr']             = state.get('claude_ibkr', {})
             out['claude_movers']           = state.get('claude_movers', {})
             out['fib_results']             = state.get('fib_results', [])
@@ -4831,8 +5054,15 @@ def hermes_brain_loop():
                         'action':   action, 'strength': strength,
                         'headline': headline[:80], 'tickers': symbols,
                         'reason':   reason, 'ai': decision.get('ai', False),
+                        '_ts':      time.time(),   # für Blackout-Check
                     }
                     state['brain_news'] = ([brain_entry] + state.get('brain_news', []))[:20]
+                    # Blackout aktivieren bei hochriskanten Makro-Events
+                    hl_low = headline.lower()
+                    if any(w in hl_low for w in ('federal reserve','fomc','cpi report',
+                                                  'nonfarm payroll','interest rate decision')):
+                        state['trading_blackout'] = True
+                        threading.Timer(1800, lambda: state.update({'trading_blackout': False})).start()
 
                     # Sofort-Alert
                     tg_send(
@@ -4907,6 +5137,187 @@ def hermes_brain_loop():
             state['brain_active'] = False
 
         time.sleep(90)
+
+
+def vwap_reclaim_loop():
+    """
+    VWAP Reclaim/Break Scanner — alle 2 Min.
+    LONG wenn Preis VWAP von unten kreuzt (Reclaim) mit Volumen.
+    SHORT wenn Preis VWAP von oben bricht (Break) mit Volumen.
+    """
+    import time as _t
+    _t.sleep(160)
+    _prev_above = {}  # sym → bool: war letztes Mal über VWAP?
+
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            if now_utc.hour >= 22:
+                _t.sleep(120)
+                continue
+
+            watch = list(state.get('channel_watch', []))[:15]
+            ctx   = ssl.create_default_context()
+
+            for sym in watch:
+                try:
+                    bars  = _fetch_bars(sym, '5Min', 80)
+                    if len(bars) < 5:
+                        continue
+                    vwap  = _get_vwap(sym, bars)
+                    if vwap <= 0:
+                        continue
+
+                    price = bars[-1]['c']
+                    above = price > vwap
+                    was   = _prev_above.get(sym)
+                    _prev_above[sym] = above
+
+                    if was is None:
+                        continue
+
+                    signal = None
+                    if not was and above:
+                        signal = 'LONG'   # Reclaim von unten
+                    elif was and not above:
+                        signal = 'SHORT'  # Break von oben
+
+                    if not signal:
+                        continue
+
+                    vol_ratio = _get_volume_ratio(sym, bars)
+                    if vol_ratio < 1.4:
+                        continue  # zu wenig Volumen = kein echter Kreuzung
+
+                    # 20-Min Cooldown pro Sym
+                    prev_v = [s for s in state.get('vwap_signals', [])[-30:]
+                              if s['sym'] == sym and s['signal'] == signal]
+                    if prev_v and (_t.time() - prev_v[-1].get('ts', 0)) < 1200:
+                        continue
+
+                    entry = {
+                        'sym':       sym, 'signal':    signal,
+                        'price':     round(price, 2), 'vwap': round(vwap, 2),
+                        'vol_ratio': vol_ratio,
+                        'time':      datetime.now().strftime('%H:%M'),
+                        'ts':        _t.time(),
+                    }
+                    state['vwap_signals'] = ([entry] + state.get('vwap_signals', []))[:40]
+
+                    ico = '🟢' if signal == 'LONG' else '🔴'
+                    tg_send(
+                        f'{ico} <b>VWAP {signal}: {sym}</b>\n'
+                        f'${price:.2f} {"über" if signal == "LONG" else "unter"} VWAP ${vwap:.2f}\n'
+                        f'Volumen {vol_ratio:.1f}× Durchschnitt',
+                        key=f'vwap_{sym}_{signal}_{datetime.now().strftime("%H%M")}'
+                    )
+
+                    if state.get('auto_trade_enabled') and not _is_blackout():
+                        bull_tf, bear_tf = _get_mtf_bias(sym)
+                        ok_long  = signal == 'LONG'  and bull_tf >= 2
+                        ok_short = signal == 'SHORT' and bear_tf >= 2
+                        if ok_long or ok_short:
+                            hermes_auto_trade_stock(
+                                {'t': sym, 'signal': signal, 'price': price,
+                                 'score': 13, 'conviction': 0.78},
+                                reason=f'VWAP {signal} Vol×{vol_ratio}'
+                            )
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+        _t.sleep(120)
+
+
+def premarket_gap_loop():
+    """
+    Pre-Market Gap Scanner — 08:00-13:30 UTC (4-9:30 ET).
+    Findet Aktien die >2% vorbörslich gappen.
+    Gap UP mit News → Continuation LONG.
+    Gap DOWN mit News → Continuation SHORT.
+    Gap ohne klare News → Fade (gegen Gap traden).
+    """
+    import time as _t
+    _t.sleep(240)
+    _gapped_today = set()
+    _last_date    = ''
+
+    while True:
+        try:
+            now_utc  = datetime.now(timezone.utc)
+            h, m     = now_utc.hour, now_utc.minute
+            today    = datetime.now().strftime('%Y-%m-%d')
+
+            if today != _last_date:
+                _gapped_today.clear()
+                _last_date = today
+
+            # Pre-market: 08:00-13:30 UTC
+            in_premarket = (8 <= h < 13) or (h == 13 and m < 30)
+            if not in_premarket:
+                _t.sleep(300)
+                continue
+
+            watch = list(state.get('channel_watch', []))
+
+            for sym in watch:
+                if sym in _gapped_today:
+                    continue
+                try:
+                    bars_d = _fetch_bars(sym, '1Day', 3)
+                    if len(bars_d) < 2:
+                        continue
+                    prev_close = bars_d[-2]['c']
+                    if prev_close <= 0:
+                        continue
+
+                    # Pre-market Preis via Snapshot
+                    ctx = ssl.create_default_context()
+                    url = f'https://data.alpaca.markets/v2/stocks/snapshots?symbols={sym}&feed=iex'
+                    req = urllib.request.Request(url, headers={
+                        'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET,
+                    })
+                    with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+                        snap = json.loads(r.read())
+                    pre_price = float((snap.get(sym, {}).get('latestTrade') or {}).get('p', 0))
+                    if pre_price <= 0:
+                        continue
+
+                    gap_pct = (pre_price - prev_close) / prev_close * 100
+
+                    if abs(gap_pct) < 2.0:
+                        continue
+
+                    _gapped_today.add(sym)
+                    direction = 'LONG' if gap_pct > 0 else 'SHORT'
+                    abs_gap   = abs(gap_pct)
+
+                    entry = {
+                        'sym':        sym, 'gap_pct':   round(gap_pct, 2),
+                        'prev_close': round(prev_close, 2),
+                        'pre_price':  round(pre_price, 2),
+                        'signal':     direction,
+                        'time':       datetime.now().strftime('%H:%M'),
+                        'ts':         _t.time(),
+                    }
+                    state['gap_signals'] = ([entry] + state.get('gap_signals', []))[:30]
+
+                    ico  = '🟢' if direction == 'LONG' else '🔴'
+                    fade = abs_gap < 4.0  # kleine Gaps füllen sich oft → Fade
+                    tg_send(
+                        f'{ico} <b>PRE-MARKET GAP {direction}: {sym}</b>\n'
+                        f'{gap_pct:+.1f}% | Gestern Close ${prev_close:.2f} → Heute ${pre_price:.2f}\n'
+                        f'{"📍 Fade möglich (Gap < 4%)" if fade else "🚀 Continuation wahrscheinlich"}',
+                        key=f'gap_{sym}_{today}'
+                    )
+
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+        _t.sleep(180)
 
 
 def channel_bounce_loop():
@@ -6893,6 +7304,14 @@ brain_thread.start()
 # Kanal-Pattern Scanner — Ping-Pong Erkennung
 channel_thread = threading.Thread(target=channel_bounce_loop, daemon=True)
 channel_thread.start()
+
+# VWAP Reclaim Scanner
+vwap_thread = threading.Thread(target=vwap_reclaim_loop, daemon=True)
+vwap_thread.start()
+
+# Pre-Market Gap Scanner
+gap_thread = threading.Thread(target=premarket_gap_loop, daemon=True)
+gap_thread.start()
 
 # Squeeze Scanner Monitor starten
 squeeze_thread = threading.Thread(target=squeeze_monitor, daemon=True)
