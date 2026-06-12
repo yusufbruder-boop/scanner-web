@@ -3238,11 +3238,19 @@ function renderTab2(data) {
       let col = avg >= 2 ? '#4dff91' : (avg >= 0.5 ? '#a0c0ff' : (avg >= -1 ? '#6b8cad' : '#ff4d6b'));
       let bar = avg >= 0 ? '▲'.repeat(Math.min(Math.floor(avg*2),8)) : '▼'.repeat(Math.min(Math.floor(Math.abs(avg)*2),8));
       let label = avg >= 2 ? ' ← ROTATION ZIEL' : (avg <= -3 ? ' ← AUSVERKAUF' : '');
-      let topT = (v.tickers||[]).sort((a,b)=>b.chg-a.chg).slice(0,2)
-        .map(t => `${t.sym} ${t.chg >= 0?'+':''}${t.chg}%`).join(' · ');
-      html += '<div style="display:flex;justify-content:space-between;padding:3px 0;border-top:1px solid #1a1a30">'
-        + '<div style="font-size:11px;color:' + col + '">' + bar + ' ' + sektor + '<span style="font-size:9px;color:#4a5a8a"> ' + topT + '</span>' + label + '</div>'
+      let allTickers = (v.tickers||[]).sort((a,b)=>b.chg-a.chg);
+      let tickerChips = allTickers.map(t => {
+        let tc = t.chg >= 3 ? '#4dff91' : (t.chg >= 1 ? '#a0d070' : (t.chg >= 0 ? '#5a7a5a' : (t.chg >= -2 ? '#aa6644' : '#ff4d6b')));
+        return '<span style="background:#070d18;border:1px solid ' + tc + '55;border-radius:4px;padding:1px 5px;font-size:9px;color:' + tc + ';white-space:nowrap">'
+          + t.sym + ' <b>' + (t.chg>=0?'+':'') + t.chg + '%</b></span>';
+      }).join(' ');
+      html += '<div style="padding:5px 0;border-top:1px solid #1a1a30">'
+        + '<div style="display:flex;justify-content:space-between;align-items:center">'
+        + '<div style="font-size:11px;color:' + col + '">' + bar + ' <b>' + sektor + '</b>'
+        + (label ? '<span style="font-size:9px;color:#ffd700"> ' + label + '</span>' : '') + '</div>'
         + '<div style="font-size:12px;font-weight:bold;color:' + col + '">' + (avg>=0?'+':'') + avg + '%</div>'
+        + '</div>'
+        + '<div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:4px">' + tickerChips + '</div>'
         + '</div>';
     });
     html += '</div>';
@@ -4891,15 +4899,17 @@ def hermes_monitor():
                             _ctx.check_hostname = False
                             _ctx.verify_mode = _sl.CERT_NONE
                             SEKTOREN = {
-                                'AI_CHIPS':   ['NVDA','AVGO','AMD','MRVL','SMH'],
-                                'SOFTWARE':   ['MSFT','SNOW','NOW','DDOG','CRM','PLTR'],
-                                'HEALTHCARE': ['XLV','LLY','UNH','ABBV'],
-                                'ENERGIE':    ['XLE','XOM','CVX','USO'],
-                                'FINANZEN':   ['XLF','JPM','GS','BAC'],
-                                'DEFENSIV':   ['XLP','WMT','KO','PG'],
-                                'GOLD':       ['GLD','GDX','SLV'],
-                                'DEFENSE':    ['LMT','RTX','NOC'],
-                                'MARKT':      ['QQQ','SPY','IWM'],
+                                'AI_CHIPS':   ['NVDA','AVGO','AMD','MRVL','SMH','TSM','QCOM','ARM','ALAB','INTC'],
+                                'SOFTWARE':   ['MSFT','SNOW','NOW','DDOG','CRM','PLTR','ORCL','WDAY','ADBE','TEAM'],
+                                'SPACE':      ['RKLB','ASTS','LUNR','RDW','BKSY','KTOS','GSAT','IRDM','MNTS','VSAT'],
+                                'HEALTHCARE': ['XLV','LLY','UNH','ABBV','JNJ','PFE','MRK','AMGN'],
+                                'ENERGIE':    ['XLE','XOM','CVX','USO','COP','SLB','MPC','VLO'],
+                                'FINANZEN':   ['XLF','JPM','GS','BAC','MS','WFC','BLK','C'],
+                                'DEFENSIV':   ['XLP','WMT','KO','PG','COST','MDLZ','CL'],
+                                'GOLD':       ['GLD','GDX','SLV','NEM','AEM','WPM'],
+                                'DEFENSE':    ['LMT','RTX','NOC','GD','BA','HII'],
+                                'CRYPTO':     ['COIN','MSTR','HOOD','CLSK','RIOT'],
+                                'MARKT':      ['QQQ','SPY','IWM','DIA','XLK'],
                             }
                             rotation = {}
                             for sektor, tickers in SEKTOREN.items():
@@ -4938,7 +4948,7 @@ def hermes_monitor():
                                     lines.append('Profiteure:')
                                     for s, v in winners[:3]:
                                         top_t = sorted(v["tickers"], key=lambda x:-x["chg"])
-                                        t_str = ', '.join(f'{x["sym"]} {x["chg"]:+.1f}%' for x in top_t[:2])
+                                        t_str = ', '.join(f'{x["sym"]} {x["chg"]:+.1f}%' for x in top_t[:4])
                                         lines.append(f'  {s}: {v["avg"]:+.1f}% ({t_str})')
                                     tg_send('\n'.join(lines))
                         except Exception:
