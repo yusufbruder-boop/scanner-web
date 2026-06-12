@@ -3313,6 +3313,7 @@ function renderResults(data, isNew) {
 }
 
 function renderTab2(data) {
+  if (!data) return '<div class="empty" style="padding:20px;text-align:center;color:#475569">Warte auf ersten Scan…</div>';
   let html = '';
 
   // ── Hermes Brain — autonomer KI-Agent Status ──────────────────────────────
@@ -4236,10 +4237,8 @@ function loadResults(isNew) {
     _lastData = data;
     // Tab 1: Scanner
     document.getElementById('content').innerHTML = renderResults(data, isNew);
-    // Tab 2: Intel (nur wenn aktiv)
-    if (document.getElementById('tab2').style.display !== 'none') {
-      document.getElementById('intel-content').innerHTML = renderTab2(data) || '<div class="empty">Keine Intel-Daten.</div>';
-    }
+    // Tab 2: Intel — immer rendern (Kanal/VWAP/Gap laufen 24/7)
+    document.getElementById('intel-content').innerHTML = renderTab2(data) || '<div class="empty">Keine Intel-Daten.</div>';
   });
 }
 
