@@ -193,6 +193,10 @@ state = {
     # Strategy Monitor Pro — 5 Strategien aus TradingView
     'strategy_monitor': [],         # [{sym, direction, score, strats_long/short, ...}]
     'strategy_monitor_ts': None,    # Zeitstempel letzter Scan
+    # Kanal-Pattern Scanner — erkennt Ping-Pong Aktien automatisch
+    'channel_watch':   ['NVDA','AMD','INTC','META','AAPL','TSLA','MSFT','AMZN','GOOGL','MU'],
+    'channel_signals': [],          # [{sym, signal, price, support, resistance, sl, tp, rr, ts}]
+    'channel_active':  [],          # Aktien die gerade im Kanal sind (mit Levels)
 }
 _hermes_lock = threading.Lock()
 _scan_lock   = threading.Lock()   # verhindert gleichzeitige Scans
@@ -3229,6 +3233,82 @@ function renderTab2(data) {
     html += '</div>';
   }
 
+  // ── Kanal-Pattern Scanner ────────────────────────────────────────────────────
+  const chActive  = data.channel_active  || [];
+  const chSignals = data.channel_signals || [];
+  if (chActive.length > 0 || chSignals.length > 0) {
+    html += '<div style="margin:8px;background:linear-gradient(135deg,#0a1218,#0d1a24);border:1px solid #f59e0b44;border-radius:10px;padding:12px 14px">'
+      + '<div style="font-size:10px;font-weight:bold;color:#f59e0b;letter-spacing:2px;margin-bottom:8px">📊 KANAL-MUSTER — PING-PONG AKTIEN</div>';
+
+    // Aktive Kanäle (Aktien die gerade im Muster sind)
+    if (chActive.length > 0) {
+      html += '<div style="font-size:10px;color:#6b8cad;margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Aktive Kanäle (' + chActive.length + ')</div>';
+      chActive.forEach(c => {
+        let pricePct = Math.max(0, Math.min(100, ((c.price - c.support) / (c.resistance - c.support)) * 100));
+        let atTop    = pricePct >= 75;
+        let atBot    = pricePct <= 25;
+        let posColor = atTop ? '#ff4d6b' : atBot ? '#4dff91' : '#f59e0b';
+        html += '<div style="padding:6px 0;border-top:1px solid #1a2030">'
+          // Symbol + Range
+          + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">'
+          +   '<span style="font-size:13px;font-weight:bold;color:#fff">' + c.sym + '</span>'
+          +   '<span style="font-size:11px;color:#94a3b8">Range ' + c.range_pct + '% | ↑' + c.touches_top + 'x ↓' + c.touches_bot + 'x</span>'
+          + '</div>'
+          // Preisbalken: Support ←→ Resistance
+          + '<div style="position:relative;height:18px;background:#0d1520;border-radius:4px;margin-bottom:3px;overflow:visible">'
+          +   '<div style="position:absolute;left:0;top:0;height:100%;width:' + pricePct + '%;background:linear-gradient(90deg,#1e3a5f,' + posColor + '33);border-radius:4px"></div>'
+          +   '<div style="position:absolute;left:' + pricePct + '%;top:-3px;transform:translateX(-50%);width:3px;height:24px;background:' + posColor + ';border-radius:2px"></div>'
+          +   '<div style="position:absolute;left:2px;top:2px;font-size:9px;color:#4dff91;font-weight:bold">SUP $' + c.support + '</div>'
+          +   '<div style="position:absolute;right:2px;top:2px;font-size:9px;color:#ff4d6b;font-weight:bold">RES $' + c.resistance + '</div>'
+          + '</div>'
+          // Preis + Status
+          + '<div style="display:flex;justify-content:space-between">'
+          +   '<span style="font-size:10px;color:#64748b">' + c.updated + '</span>'
+          +   '<span style="font-size:11px;font-weight:bold;color:' + posColor + '">$' + c.price + (atTop ? ' → SHORT?' : atBot ? ' → LONG?' : ' ↔ Mitte') + '</span>'
+          + '</div>'
+          + '</div>';
+      });
+    }
+
+    // Letzte Signale
+    if (chSignals.length > 0) {
+      html += '<div style="font-size:10px;color:#6b8cad;margin-top:10px;margin-bottom:5px;text-transform:uppercase;letter-spacing:1px">Letzte Signale</div>';
+      chSignals.slice(0, 8).forEach(s => {
+        let sc      = s.signal === 'LONG' ? '#4dff91' : '#ff4d6b';
+        let icon    = s.signal === 'LONG' ? '🟢' : '🔴';
+        let pricePct = Math.max(0, Math.min(100, ((s.price - s.support) / (s.resistance - s.support)) * 100));
+        // Mini-Balken mit Entry, TP, SL markiert
+        let tpPct   = Math.max(0, Math.min(100, ((s.tp - s.support) / (s.resistance - s.support)) * 100));
+        let slPct   = Math.max(0, Math.min(100, ((s.sl - s.support) / (s.resistance - s.support)) * 100));
+        html += '<div style="padding:6px 0;border-top:1px solid #1a2030">'
+          + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">'
+          +   '<span style="font-size:12px;font-weight:bold;color:' + sc + '">' + icon + ' ' + s.signal + ' <span style="color:#fff">' + s.sym + '</span></span>'
+          +   '<span style="font-size:10px;color:#64748b">' + s.time + ' | R/R ' + s.rr + ':1</span>'
+          + '</div>'
+          // Visueller Kanal mit Entry/TP/SL
+          + '<div style="position:relative;height:16px;background:#0d1520;border-radius:4px;margin-bottom:3px">'
+          // TP Marker
+          +   '<div style="position:absolute;left:' + tpPct + '%;top:0;width:2px;height:100%;background:#4dff91;opacity:0.7"></div>'
+          // Entry Marker (Preis)
+          +   '<div style="position:absolute;left:' + pricePct + '%;top:-2px;transform:translateX(-50%);width:3px;height:20px;background:' + sc + ';border-radius:1px"></div>'
+          // SL Marker
+          +   '<div style="position:absolute;left:' + slPct + '%;top:0;width:2px;height:100%;background:#ff4d6b;opacity:0.7"></div>'
+          +   '<div style="position:absolute;left:2px;top:1px;font-size:8px;color:#4dff91">$' + s.support + '</div>'
+          +   '<div style="position:absolute;right:2px;top:1px;font-size:8px;color:#ff4d6b">$' + s.resistance + '</div>'
+          + '</div>'
+          + '<div style="display:flex;gap:12px;font-size:9px;color:#64748b">'
+          +   '<span>Entry <b style="color:#fff">$' + s.price + '</b></span>'
+          +   '<span>TP <b style="color:#4dff91">$' + s.tp + '</b></span>'
+          +   '<span>SL <b style="color:#ff4d6b">$' + s.sl + '</b></span>'
+          +   '<span>↑' + s.touches_top + 'x ↓' + s.touches_bot + 'x</span>'
+          + '</div>'
+          + '</div>';
+      });
+    }
+
+    html += '</div>';
+  }
+
   // ── Alpaca Portfolio ─────────────────────────────────────────────────────────
   const ap = data.alpaca_portfolio || {};
   if (ap.equity) {
@@ -4104,6 +4184,8 @@ def results():
             out['brain_worldview']         = state.get('brain_worldview', {})
             out['brain_trades']            = state.get('brain_trades', [])
             out['brain_news']              = state.get('brain_news', [])
+            out['channel_active']          = state.get('channel_active', [])
+            out['channel_signals']         = state.get('channel_signals', [])[:20]
             out['claude_ibkr']             = state.get('claude_ibkr', {})
             out['claude_movers']           = state.get('claude_movers', {})
             out['fib_results']             = state.get('fib_results', [])
@@ -4825,6 +4907,159 @@ def hermes_brain_loop():
             state['brain_active'] = False
 
         time.sleep(90)
+
+
+def channel_bounce_loop():
+    """
+    Kanal-Pattern Scanner — läuft alle 60s.
+    Scannt alle Symbole in channel_watch auf Ping-Pong Muster.
+    Erkennt automatisch Support/Resistance aus Preishistorie.
+    Signal bei Berührung der Kanalgrenze → SHORT oben, LONG unten.
+    """
+    import time as _t
+    _t.sleep(150)
+
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            # Nur während Marktzeiten 13:30-20:00 UTC (9:30-16:00 ET)
+            if not (13 <= now_utc.hour < 20 or (now_utc.hour == 13 and now_utc.minute >= 30)):
+                _t.sleep(60)
+                continue
+
+            symbols = list(state.get('channel_watch', []))
+            # Zusätzlich: aktuelle Hermes-Universe mit einbeziehen (top 30)
+            universe = list(state.get('hermes_universe', set()))[:30]
+            all_syms = list(dict.fromkeys(symbols + universe))  # dedupliziert, Reihenfolge bleibt
+
+            ctx = ssl.create_default_context()
+            active_channels = []
+
+            for sym in all_syms:
+                try:
+                    # 40 Bars à 5 Minuten = ~3.3 Stunden Preishistorie
+                    url = (f'https://data.alpaca.markets/v2/stocks/{sym}/bars'
+                           f'?timeframe=5Min&limit=40&feed=iex&adjustment=raw')
+                    req = urllib.request.Request(url, headers={
+                        'APCA-API-KEY-ID':     ALPACA_KEY,
+                        'APCA-API-SECRET-KEY': ALPACA_SECRET,
+                    })
+                    with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+                        bars = json.loads(r.read()).get('bars', [])
+
+                    if len(bars) < 15:
+                        continue
+
+                    highs  = [b['h'] for b in bars]
+                    lows   = [b['l'] for b in bars]
+                    n      = len(bars)
+
+                    # Resistance = 90. Percentil der Hochs, Support = 10. Percentil der Tiefs
+                    highs_s    = sorted(highs)
+                    lows_s     = sorted(lows)
+                    resistance = highs_s[int(n * 0.90)]
+                    support    = lows_s[int(n * 0.10)]
+                    mid        = (resistance + support) / 2
+                    rng_pct    = (resistance - support) / mid
+
+                    # Kanal gültig: Range zwischen 0.3% und 3.5%
+                    if not (0.003 <= rng_pct <= 0.035):
+                        continue
+
+                    # Mindestens 2x Berührung oben UND 2x unten — sonst kein Muster
+                    tol         = mid * 0.005
+                    touches_top = sum(1 for h in highs if h >= resistance - tol)
+                    touches_bot = sum(1 for l in lows  if l <= support + tol)
+
+                    if touches_top < 2 or touches_bot < 2:
+                        continue
+
+                    # Aktuellen Preis holen
+                    snap_url = (f'https://data.alpaca.markets/v2/stocks/snapshots'
+                                f'?symbols={sym}&feed=iex')
+                    snap_req = urllib.request.Request(snap_url, headers={
+                        'APCA-API-KEY-ID':     ALPACA_KEY,
+                        'APCA-API-SECRET-KEY': ALPACA_SECRET,
+                    })
+                    with urllib.request.urlopen(snap_req, context=ctx, timeout=8) as r:
+                        snap  = json.loads(r.read())
+                    price = float((snap.get(sym, {}).get('latestTrade') or {}).get('p', 0))
+                    if price <= 0:
+                        continue
+
+                    channel_entry = {
+                        'sym':         sym,
+                        'support':     round(support, 2),
+                        'resistance':  round(resistance, 2),
+                        'price':       round(price, 2),
+                        'range_pct':   round(rng_pct * 100, 2),
+                        'touches_top': touches_top,
+                        'touches_bot': touches_bot,
+                        'updated':     datetime.now().strftime('%H:%M'),
+                    }
+                    active_channels.append(channel_entry)
+
+                    # Signal wenn Preis nahe Grenze (innerhalb 0.35%)
+                    dist_top = (resistance - price) / price
+                    dist_bot = (price - support)    / price
+                    signal   = None
+
+                    if dist_top <= 0.0035:
+                        signal   = 'SHORT'
+                        sl       = round(resistance * 1.006, 2)
+                        tp       = round(support    + (resistance - support) * 0.15, 2)
+                    elif dist_bot <= 0.0035:
+                        signal   = 'LONG'
+                        sl       = round(support    * 0.994, 2)
+                        tp       = round(resistance - (resistance - support) * 0.15, 2)
+
+                    if not signal:
+                        continue
+
+                    # 15-Minuten Cooldown pro Symbol+Richtung
+                    prev = [s for s in state.get('channel_signals', [])[-40:]
+                            if s['sym'] == sym and s['signal'] == signal]
+                    if prev and (_t.time() - prev[-1].get('ts', 0)) < 900:
+                        continue
+
+                    rr    = round(abs(tp - price) / max(abs(sl - price), 0.01), 1)
+                    entry = {
+                        'sym':        sym,        'signal':     signal,
+                        'price':      price,      'support':    round(support, 2),
+                        'resistance': round(resistance, 2),
+                        'sl':         sl,         'tp':         tp,
+                        'rr':         rr,         'range_pct':  round(rng_pct * 100, 2),
+                        'touches_top':touches_top,'touches_bot':touches_bot,
+                        'time':       datetime.now().strftime('%H:%M'),
+                        'ts':         _t.time(),
+                    }
+                    state['channel_signals'] = ([entry] + state.get('channel_signals', []))[:60]
+
+                    ico = '🔴' if signal == 'SHORT' else '🟢'
+                    tg_send(
+                        f'{ico} <b>KANAL {signal}: {sym}</b>\n'
+                        f'${price:.2f} | Support ${support:.2f} ↔ Resistance ${resistance:.2f}\n'
+                        f'Range {rng_pct:.1%} | Top {touches_top}x Bot {touches_bot}x\n'
+                        f'SL ${sl:.2f} | TP ${tp:.2f} | R/R {rr}:1',
+                        key=f'ch_{sym}_{signal}_{datetime.now().strftime("%H%M")}'
+                    )
+
+                    if state.get('auto_trade_enabled'):
+                        sig_obj = {
+                            't': sym, 'signal': signal, 'price': price,
+                            'score': 14, 'conviction': 0.82,
+                        }
+                        hermes_auto_trade_stock(sig_obj, reason=f'Kanal {signal} ${support:.2f}-${resistance:.2f}')
+
+                except Exception:
+                    pass
+
+            state['channel_active'] = active_channels
+
+        except Exception:
+            pass
+
+        _t.sleep(60)
 
 
 def hermes_monitor():
@@ -6235,6 +6470,28 @@ def hermes_autotrade_status():
         'trades':    trades[-20:],
     })
 
+@app.route('/hermes/channels')
+def hermes_channels():
+    """Zeigt alle Aktien im Kanal-Muster + letzte Signale."""
+    return jsonify({
+        'active':  state.get('channel_active', []),
+        'signals': state.get('channel_signals', [])[:20],
+        'watch':   state.get('channel_watch', []),
+    })
+
+@app.route('/hermes/channels/add', methods=['POST'])
+def hermes_channel_add():
+    sym = (request.json or {}).get('sym', '').upper().strip()
+    if sym and sym not in state.get('channel_watch', []):
+        state.setdefault('channel_watch', []).insert(0, sym)
+    return jsonify({'ok': True, 'watch': state.get('channel_watch', [])})
+
+@app.route('/hermes/channels/remove', methods=['POST'])
+def hermes_channel_remove():
+    sym = (request.json or {}).get('sym', '').upper().strip()
+    state['channel_watch'] = [s for s in state.get('channel_watch', []) if s != sym]
+    return jsonify({'ok': True, 'watch': state.get('channel_watch', [])})
+
 @app.route('/hermes/close-trades', methods=['POST'])
 def hermes_close_trades_api():
     """Schließt alle offenen Stock-Positionen manuell."""
@@ -6630,6 +6887,10 @@ hermes_thread.start()
 # Hermes Brain — autonomer KI-Agent (läuft unabhängig, denkt selbst)
 brain_thread = threading.Thread(target=hermes_brain_loop, daemon=True)
 brain_thread.start()
+
+# Kanal-Pattern Scanner — Ping-Pong Erkennung
+channel_thread = threading.Thread(target=channel_bounce_loop, daemon=True)
+channel_thread.start()
 
 # Squeeze Scanner Monitor starten
 squeeze_thread = threading.Thread(target=squeeze_monitor, daemon=True)
