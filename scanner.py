@@ -634,14 +634,14 @@ def get_cached_influencers() -> list:
 
 UNIVERSE = [
     'NVDA','AMD','META','AAPL','MSFT','AMZN','GOOGL','TSLA','NFLX',
-    'MU','INTC','AVGO','QCOM','MRVL','SMCI','ARM','AMAT',
+    'MU','INTC','AVGO','QCOM','MRVL','SMCI','ARM','AMAT','WDC','AXTI','LITE','SWKS','MCHP','ON',
     'PLTR','CRWD','NET','DDOG','SOUN',
     'IONQ','RGTI','IREN','WULF','DELL','HPE',
     # Finanzwerte + Rotation
     'GS','JPM','BAC','C','WFC','MS','V','MA','AXP','BX','KRE','XLF',
     # Defensive + Rotation
     'XLV','XLP','XLU','XLE','XLI',
-    'ASTS','LUNR','RKLB',
+    'ASTS','LUNR','RKLB','SPCX','ARKX','RDW','SPCE','ATRO',
     'GLD','SLV','USO','AAL','DAL',
     'MSTR','COIN','HOOD','SOFI','ORCL','NOW',
     'XOM','CVX','LMT','RTX',
@@ -772,7 +772,7 @@ def get_market_context() -> dict:
     }
 
     try:
-        url = 'https://data.alpaca.markets/v2/stocks/snapshots?symbols=QQQ,SPY,VXX,TLT,XLV,XLP,XLF,XLE'
+        url = 'https://data.alpaca.markets/v2/stocks/snapshots?symbols=QQQ,SPY,VXX,TLT,XLV,XLP,XLF,XLE,SMH,SPCX,ARKX'
         req = urllib.request.Request(url, headers={
             'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET})
         with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
@@ -795,6 +795,9 @@ def get_market_context() -> dict:
         xlp_chg, _, _       = _sym('XLP')
         xlf_chg, _, _       = _sym('XLF')
         xle_chg, _, _       = _sym('XLE')
+        smh_chg, _, _       = _sym('SMH')
+        spcx_chg, _, _      = _sym('SPCX')
+        arkx_chg, _, _      = _sym('ARKX')
 
         result.update({'qqq_chg': qqq_chg, 'qqq_gap': qqq_gap,
                        'spy_chg': spy_chg, 'vxx_chg': vxx_chg,
@@ -835,7 +838,23 @@ def get_market_context() -> dict:
             bear += 1; sigs.append(f'Rotation → Energie XLE {xle_chg:+.1f}% (Inflation)'); rotation = 'ENERGY/INFLATION'
         if xlf_chg > xlv_chg and xlf_chg > 0.5 and qqq_chg > 0:
             bull += 1; sigs.append(f'Rotation → Financials XLF {xlf_chg:+.1f}% (Risk-On)'); rotation = 'RISK_ON'
+        # Halbleiter-Boom: SMH steigt → INTC/MU/AMD/AVGO folgen 15-30min später
+        if smh_chg >= 2.0:
+            bull += 3; sigs.append(f'SEMI-BOOM SMH {smh_chg:+.1f}% — INTC/MU/AMD/AVGO/LITE/WDC kaufen'); rotation = 'SEMI_BOOM'
+        elif smh_chg >= 1.0:
+            bull += 1; sigs.append(f'Semis stark SMH {smh_chg:+.1f}% — INTC/MU/AMD watch'); rotation = 'SEMI_WATCH'
+        elif smh_chg <= -2.0:
+            bear += 2; sigs.append(f'Semis Abverkauf SMH {smh_chg:+.1f}% — Vorsicht Tech')
+        # Space-Sektor: SPCX/ARKX fallend = Momentum dreht
+        space_avg = (spcx_chg + arkx_chg) / 2 if spcx_chg and arkx_chg else (spcx_chg or arkx_chg)
+        if space_avg <= -1.5:
+            bear += 1; sigs.append(f'Space-Sektor SPCX {spcx_chg:+.1f}%/ARKX {arkx_chg:+.1f}% — Momentum bricht'); rotation = rotation or 'SPACE_DECLINE'
+        elif space_avg >= 2.0:
+            bull += 1; sigs.append(f'Space-Rally SPCX {spcx_chg:+.1f}%/ARKX {arkx_chg:+.1f}%')
         result['sector_rotation'] = rotation
+        result['smh_chg']   = smh_chg
+        result['spcx_chg']  = spcx_chg
+        result['arkx_chg']  = arkx_chg
 
         # Bias bestimmen
         net = bear - bull

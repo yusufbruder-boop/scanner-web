@@ -2537,7 +2537,11 @@ function renderResults(data, isNew) {
       + '<span style="color:#94a3b8">VXX: <b style="color:' + (mc.vxx_chg>0?'#ff4d6b':'#4dff91') + '">' + (mc.vxx_chg>=0?'+':'') + (mc.vxx_chg||0).toFixed(1) + '%</b></span>'
       + '<span style="color:#94a3b8">TLT: <b style="color:' + (mc.tlt_chg>=0?'#4dff91':'#ff4d6b') + '">' + (mc.tlt_chg>=0?'+':'') + (mc.tlt_chg||0).toFixed(1) + '%</b></span>'
       + (mc.sector_rotation ? '<span style="color:#ffd700">' + mc.sector_rotation + '</span>' : '')
+      + (mc.smh_chg != null ? '<span style="color:#94a3b8">SMH: <b style="color:' + (mc.smh_chg>=0?'#4dff91':'#ff4d6b') + '">' + (mc.smh_chg>=0?'+':'') + (mc.smh_chg||0).toFixed(1) + '%</b></span>' : '')
+      + (mc.spcx_chg != null ? '<span style="color:#94a3b8">SPCX: <b style="color:' + (mc.spcx_chg>=0?'#4dff91':'#ff4d6b') + '">' + (mc.spcx_chg>=0?'+':'') + (mc.spcx_chg||0).toFixed(1) + '%</b></span>' : '')
       + '</div>'
+      + (mc.sector_rotation === 'SEMI_BOOM' ? '<div style="margin-top:5px;font-size:11px;color:#ffe066;font-weight:bold">SEMI-BOOM — INTC MU AMD WDC AXTI LITE sofort prüfen!</div>' : '')
+      + (mc.sector_rotation === 'SPACE_DECLINE' ? '<div style="margin-top:5px;font-size:11px;color:#ff6644;font-weight:bold">SPACE-SELL — RKLB ASTS LUNR SPCX Momentum bricht</div>' : '')
       + (mc.macro_event ? '<div style="margin-top:6px;font-size:11px;color:#ff9944;font-weight:bold">⚡ MAKRO: ' + mc.macro_event + '</div>' : '')
       + (mc.signals && mc.signals.length ? '<div style="margin-top:5px;font-size:10px;color:#6a7a9a">' + mc.signals.slice(0,3).join(' &nbsp;|&nbsp; ') + '</div>' : '')
       + '</div>';
