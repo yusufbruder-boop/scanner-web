@@ -3600,10 +3600,17 @@ def find_big_money_bets(tickers=None) -> list:
                 return
             spot = None
             try:
-                hist = tk.fast_info
-                spot = hist.get('last_price') or hist.get('regularMarketPrice')
+                fi = tk.fast_info
+                spot = getattr(fi, 'last_price', None) or getattr(fi, 'regular_market_price', None)
             except Exception:
                 pass
+            if not spot:
+                try:
+                    _h = tk.history(period='1d')
+                    if not _h.empty:
+                        spot = float(_h['Close'].iloc[-1])
+                except Exception:
+                    pass
             # erste 2 Expirations scannen (nahe Contracts = maximale Hebelwirkung)
             for exp in exps[:2]:
                 chain  = tk.option_chain(exp)

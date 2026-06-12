@@ -4025,6 +4025,30 @@ def results():
         }
         if state.get('followup'):
             out['followup'] = state['followup']
+        # Big Money Bets — läuft alle 15 Min unabhängig vom Scan
+        _bm_ts2 = state.get('big_money_bets', {}).get('ts', '')
+        _bm_stale = True
+        if _bm_ts2:
+            try:
+                _h2, _m2 = map(int, _bm_ts2.split(':'))
+                _now2 = __import__('datetime').datetime.now()
+                _bm_stale = (_now2.hour*60+_now2.minute) - (_h2*60+_m2) > 15
+            except Exception:
+                pass
+        if _bm_stale and not state.get('_bm_running'):
+            state['_bm_running'] = True
+            def _auto_bm():
+                try:
+                    from scanner import find_big_money_bets
+                    bets = find_big_money_bets()
+                    if bets:
+                        state['big_money_bets'] = {
+                            'ts': __import__('datetime').datetime.now().strftime('%H:%M'),
+                            'data': bets,
+                        }
+                finally:
+                    state['_bm_running'] = False
+            threading.Thread(target=_auto_bm, daemon=True).start()
         with _hermes_lock:
             out['hermes_alerts']       = state.get('hermes_alerts', [])
             out['hermes_running']      = state.get('hermes_running', False)
